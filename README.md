@@ -82,7 +82,7 @@ Select the DXVK backend in CrossOver. D3DMetal does not implement this mod's D3D
 -oldgameui -enabledxvk -novid -dev +developer 0 +exec bmvr_performance.cfg +snd_mix_async 0 +snd_async_fullyasync 0
 ```
 
-Do not add `-nohmd` or `-forcestartupmenu`. The classic menu is required; the beta's replacement game menu is not supported. `-dev` prevents the background 3D map from loading. It does not remove gameplay maps.
+The classic menu is required; the beta's replacement game menu is not supported. `-dev` prevents the background 3D map from loading. It does not remove gameplay maps.
 
 The CrossOver/Wine launch environment should include:
 
