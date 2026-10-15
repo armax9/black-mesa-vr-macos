@@ -2,7 +2,7 @@
 
 Black Mesa VR on Apple Silicon through CrossOver, DXVK and MoltenVR.
 
-On an M3 Max, our tested Office Complex scene runs at approximately **72 FPS** with **2144×2304 rendered pixels per eye** and deferred shadows disabled. This is a measured scene result, not a minimum across the campaign. The headset used is Quest 3 over USB. The user's streaming preference is HEVC at 200 Mbps; stream resolution and actual game render resolution are separate settings.
+On an M3 Max, our tested Office Complex scene runs at approximately **72 FPS** with **2144×2304 rendered pixels per eye** and deferred shadows disabled. This is a measured scene result, not a minimum across the campaign. The headset used is Quest 3 over USB. Streaming was configured for HEVC at 200 Mbps; stream resolution and actual game render resolution are separate settings.
 
 The same mod DLL contains compatibility profiles for the main Black Mesa build **19042901** and public beta **25844216**, with the upstream experimental gameplay changes integrated into both profiles. Both game profiles have rendered through this universal implementation. Campaign-wide compatibility and arbitrary later game updates are not claimed.
 
@@ -35,9 +35,11 @@ This is a macOS compatibility fork of [Black Mesa VR](https://github.com/Hochges
 
 Apple Silicon M3 Max, Quest 3 over USB, CrossOver Preview, custom Black Mesa VR DXVK DLL and MoltenVK 1.4.2. Approximately 72 FPS in the measured Office Complex scene at **2144×2304 rendered per eye**, with deferred shadows disabled. Performance varies with scene and settings.
 
-User streaming preference: HEVC, 200 Mbps. 2368×2560 per eye is a separate headset/stream target discussed during setup, not the resolution used for the cited 72 FPS measurement. Configure resolution in MoltenVR; verify the game's effective render resolution rather than assuming stream dimensions equal source pixels.
+Streaming: HEVC, 200 Mbps. The cited 72 FPS measurement uses the render resolution above. Configure resolution in MoltenVR; verify the game's effective render resolution rather than assuming stream dimensions equal source pixels.
 
 ### 1. MoltenVR and CrossOver
+
+CrossOver Preview is not a requirement of this guide. Testing was performed with Preview; regular CrossOver is expected to work with the same setup, but has not yet been tested. Use the paths for the CrossOver application you actually have installed.
 
 Install [MoltenVR](https://github.com/MoltenVR/MoltenVR-Preview) using its current setup guide and headset client. It provides the macOS OpenXR runtime and headset streaming. Connect Quest 3 and verify the MoltenVR session works.
 
@@ -47,14 +49,14 @@ Install Windows Steam and Black Mesa inside the CrossOver bottle you will actual
 
 Use [MoltenVK 1.4.2](https://github.com/KhronosGroup/MoltenVK/releases/tag/v1.4.2). This is the Vulkan-to-Metal layer, separate from MoltenVR's OpenXR runtime/streaming.
 
-Quit all applications using the CrossOver engine before replacing its libraries. Back up the original dylibs. In our tested CrossOver Preview installation, the upstream universal macOS `libMoltenVK.dylib` was installed at BOTH:
+Quit all applications using the CrossOver engine before replacing its libraries. Back up the original dylibs. The upstream universal macOS `libMoltenVK.dylib` goes in BOTH architecture directories inside your installed CrossOver app. For regular CrossOver:
 
 ```
-CrossOver Preview.app/Contents/SharedSupport/CrossOver/lib/x86_64/libMoltenVK.dylib
-CrossOver Preview.app/Contents/SharedSupport/CrossOver/lib/aarch64/libMoltenVK.dylib
+CrossOver.app/Contents/SharedSupport/CrossOver/lib/x86_64/libMoltenVK.dylib
+CrossOver.app/Contents/SharedSupport/CrossOver/lib/aarch64/libMoltenVK.dylib
 ```
 
-Paths may differ in other CrossOver distributions. Do not replace unrelated GStreamer framework libraries. A CrossOver update can restore its original graphics libraries. The mod DLL also contains DXVK compatibility changes; replacing MoltenVK alone is insufficient.
+For Preview, substitute `CrossOver Preview.app` for `CrossOver.app`. Paths may differ in other CrossOver distributions. A CrossOver update can restore its original graphics libraries. The mod DLL also contains DXVK compatibility changes; replacing MoltenVK alone is insufficient.
 
 ### 3. Mod files
 
@@ -102,7 +104,7 @@ BMVR_SHADER_CACHE_PATH=VR/cache
 DXVK_STATE_CACHE_PATH=VR/cache
 ```
 
-These are environment variables, not console commands to paste into Steam's launch-options box. Use the supplied CrossOver launch script for the prepared environment. No NotProton modification is required or supplied by this guide.
+These are environment variables, not console commands to paste into Steam's launch-options box. Use the supplied CrossOver launch script for the prepared environment. The v70 script defaults to `/Applications/CrossOver Preview.app`; for regular CrossOver, set its CrossOver application path to `/Applications/CrossOver.app` before using it. Use your actual bottle name as well. No NotProton modification is required or supplied by this guide.
 
 Install `bmvr_performance.cfg` in `bms/cfg/`, not only `VR/`. It sets `nr_shadow_active 1`, `mat_vsync 0`, `fps_max 0` and `engine_no_focus_sleep 0`. Deferred shadows off is part of the cited performance profile. Keep `FSR=false` and MSAA/FXAA off for the baseline; optional FSR can be enabled in `VR/config.txt` after restarting.
 
