@@ -1,6 +1,7 @@
 #pragma once
 #include <Windows.h>
 #include <cstdint>
+#include <string>
 
 // Crash-sticky retries of L4D2VR mechanisms the old OpenXR prototype banned.
 // If Black Mesa dies mid-attempt, the in-progress flag remains on disk and
@@ -17,20 +18,13 @@ namespace bmvr
     void Log(const char* fmt, ...);
     void SetStage(const char* stage);
 
-    bool TryHmdSwapchain();
     bool TryHmdFramebuffer();
     bool TryHmdNative();
     bool TryNamedRenderTargets();
-    bool TryNamedStereoWrap();
     bool TryStereoRenderView();
-    bool TryWaitDeviceIdle();
-    bool TryAbsoluteHmdView();
     bool TryMenuCompositor();
     bool TryRelativeHmdLook();
-    bool TryStereoCopy();
-    bool TryStereoFov();
     bool TryMatQueue();
-    bool TrySteamVrEyeRt();
     bool TryOffscreenHmd();
     // LITERAL FullFrame/G-buffer at SteamVR rec. The 2026-08-26 miss
     // (worldMatch+redirect drew HWND 2560x1440 into 2544x2480) is explained:
@@ -55,7 +49,6 @@ namespace bmvr
 
     void DisableNamedRenderTargets(const char* reason);
     void DisableStereoRenderView(const char* reason);
-    void DisableStereoFov(const char* reason);
     void PersistSkip(const char* name, const char* reason);
 
     void BeginRisky(const wchar_t* name);
@@ -112,14 +105,15 @@ namespace bmvr
     };
 
     // L4D2VR/Portal2: G-buffer = OpenVR recommended size. Window-fit is only
-    // the fallback if recommended size crash-stickies. ApplyHmdAspectBackbuffer
-    // rewrites the windowed D3D backbuffer to that size. GetScreenSize must
+    // the fallback if recommended size crash-stickies. GetScreenSize must
     // return the same values or HUD composite uses 16:9 CViewSetup on HMD RTs.
     void ComputeHmdFramebufferSize(uint32_t recW, uint32_t recH, uint32_t winW, uint32_t winH, float projAspect);
     void FitHmdAspectInWindow(uint32_t winW, uint32_t winH, float aspect, uint32_t& eyeW, uint32_t& eyeH);
     // GMod/L4D2VR: OpenVR recommended * RenderScale, 16-aligned, cap 4096.
     // Independent of HWND. False if offscreen path is skipped or rec is unknown.
     bool ComputeOffscreenEyeSize(uint32_t& width, uint32_t& height);
+    // Why OffscreenWorldMatchesEyes() is true or false, for the render-path log.
+    void DescribeWorldRtMatch(char* buf, size_t size);
     // `_rt_FullFrameFB*` target size. False unless WorldRtGrowActive.
     bool ComputeGrownWorldFramebuffer(uint32_t& width, uint32_t& height);
     // `_rt_gb*` target size. Additionally requires FullFrame to already be at
@@ -138,7 +132,6 @@ namespace bmvr
     HWND GameWindow();
     // Client size of GameWindow(), cached for a few ms. Thread-safe.
     bool QueryWindowClientSize(uint32_t& width, uint32_t& height);
-    bool ApplyHmdAspectBackbuffer(uint32_t& width, uint32_t& height);
     void InstallEarlyFramebufferHook();
     void SetGameplayWorldRts(bool gameplayMap);
 
@@ -168,6 +161,9 @@ namespace bmvr
     extern float g_ControllerPitchTiltTouch;
     extern float g_ControllerPitchTiltIndex;
     extern float g_ControllerPitchTiltVive;
+    // Player's extra gun pitch in degrees on top of the per-family tilt
+    // (GunPitchOffset in config.txt, bmvr_gun_pitch / Options -> Game).
+    extern float g_GunPitchOffset;
     float EffectiveControllerPitchTilt(uint32_t controllerFamily);
     // Trim applied to the firing pitch only, in degrees, positive = shoot
     // higher. Leaves the viewmodel alone, so it corrects a grip that aims low
@@ -198,6 +194,10 @@ namespace bmvr
     extern bool g_DisableViewBob;
     extern bool g_LeftHanded;
     extern bool g_RecenterResetsYaw;
+    // AutoRecenterOnResume (default true): closing the pause menu (GameUI) in
+    // a map recenters the head position (not the turn direction), so a walk
+    // away from the play spot while paused does not leave the eye in walls.
+    extern bool g_AutoRecenterOnResume;
     extern bool g_HideLocalPlayerModel;
     // Hybrid VR hands: hide FP `arms` bodypart by zeroing studiohdr nummeshes
     // (not MATERIAL_VAR_NO_DRAW). Opposite of L4D2VR NativeViewmodelHandsOnly.
@@ -221,6 +221,121 @@ namespace bmvr
     // Reticle size multiplier, for players who want it smaller or bolder.
     extern float g_VrCrosshairScale;
     extern int g_VrCrosshairEye; // 0=both, 1=left, 2=right
+    // Reticle drawn as a red laser dot instead of the amber ticks.
+    extern bool g_VrCrosshairDot;
+    // Thin red beam from the gun along the firing ray to where it lands.
+    extern bool g_VrLaserBeam;
+    // Beam half width in game units (1 unit ~ 2.5 cm).
+    extern float g_VrLaserWidth;
+    // Moves the beam start along the barrel (game units, + = forward).
+    extern float g_VrLaserStartForward;
+    // AimDebug=true: per shot, log the server bullet origin/direction and its
+    // traced hit next to the reticle ray and hit (bmvr_log "AimDebug").
+    extern bool g_AimDebug;
+    // OffCenterTest=true (flat only, diagnostic): while VR/offcenter_test_on
+    // exists, the main view renders the PSVR2 left-eye off-centre subrect
+    // (left 0, right 0.758 of the frustum) to check the engine's off-centre
+    // projection path (deferred lights, sky, water, viewmodel) on the desktop.
+    extern bool g_OffCenterTest;
+    // OffCenterEyes=true: each eye renders only its own asymmetric HMD
+    // frustum (CViewSetup m_bOffCenter) instead of the symmetric union, and
+    // is submitted at the runtime's per-eye FOV. PSVR2: ~54 % -> 100 % of
+    // the rendered pixels reach the eye.
+    extern bool g_OffCenterEyes;
+    bool OffCenterTestActive();
+    // Headless tests. BMVR_TESTDIR (a Windows path) stands in for the game
+    // folder for VR\config.txt, the logs, heartbeat, skip and crash-sticky
+    // flag files, so a test never reads or writes the player's files.
+    const std::wstring& TestDir();
+    // "<TestDir>\VR\<leaf>" when BMVR_TESTDIR is set, else "VR\<leaf>"
+    // (relative to the game folder, as before).
+    std::string VrFilePath(const char* leaf);
+    // VRRuntimeBackend=fake: the OpenXR helper path with an in-process fake
+    // helper (scripted poses/buttons from VR\fake.txt, PSVR2 projection, no
+    // SteamVR). See vr_fake_helper.cpp.
+    extern bool g_FakeRuntime;
+    // MirrorBothEyes=true: the desktop window shows both eye images side by
+    // side, each whole eye texture stretched into one half (tests take
+    // screenshots of it).
+    extern bool g_MirrorBothEyes;
+    // VrShotOriginFix=true (default): bullets fired through server player
+    // vtable +0x474 leave from the controller ray (TryGetVrShootOrigin), not
+    // the head. false = old behaviour (tests compare both).
+    extern bool g_VrShotOriginFix;
+    // Shots start at the muzzle attachment (not slid onto the controller axis).
+    extern bool g_VrShootFromMuzzle;
+    // Fixes, default on (a config key can turn each off):
+    extern bool g_TwoHandHoldWhileGrip;  // long guns stay two-handed while the grip is held
+    extern bool g_TwoHandGripToggle;     // support grip latches: squeeze on the gun = on, squeeze again = off
+    extern float g_DebugBlankEye;        // VR panel debug row: 1 = blank the left eye, 2 = the right (not saved)
+    extern bool g_PauseMenuColourFromFrame; // pause-menu layer colour from the presented desktop frame (VR repaint stacks windows wrongly)
+    extern float g_PauseMenuAlphaPasses; // pause-menu layer: N passes of a -> a + a(1-a), i.e. 1-(1-a)^(2^N); 0 = off
+    extern bool g_FlashlightLeftHand;    // flashlight from the left hand (along the gun while two-handed)
+    extern float g_FrameCapMode;         // fps_max: 0 = game's own, 1 = headset rate + 10, 2 = 2x headset rate
+    extern bool g_VrHandThrow;           // frag leaves the hand at the hand's speed (Lambda1VR-style throw)
+    extern float g_ThrowScale;           // hand speed x 2/3 x this, capped at 1000 u/s (Lambda1VR vr_throw_scale)
+    extern bool g_VrSkipMotionBlur;      // skip the engine motion blur pass in VR
+    extern bool g_VrSkipScreenEffects;   // skip env_screeneffect overlays (stun / intro blur) in VR
+    // EnvmapScaleWorld / EnvmapScaleModels (0..1, default 1): cubemap reflection
+    // strength ($envmaptint) of brush materials / model materials in VR.
+    // models/weapons/* (view models, hands) are never scaled.
+    extern float g_EnvmapScaleWorld;
+    extern float g_EnvmapScaleModels;
+    extern bool g_StereoEnginePost;      // run engine_post (tonemap / colour correction / FXAA) on eyes, bloom zeroed
+    // MaxEyeSize (default 4096, 2048..8192): largest eye RT side. Both axes
+    // shrink by one factor when RenderScale asks for more. MulticoreMode also
+    // caps the height at 5456 (ring = 3 eye heights, DXVK max 16384).
+    extern uint32_t g_MaxEyeSize;
+    // ReflectionRtScale (default 0.5; 0 = engine 1024x1024; 0.25..1 = fraction
+    // of the eye size): grow _rt_Water*, *Reflect*/*Refract* and _rt_PowerOfTwoFB.
+    // At 1024 mirrored floors / refract glass shimmered at the edges; 0.5 fixes
+    // that at an acceptable cost in the headset (2026-10-30).
+    extern float g_ReflectionRtScale;
+    // RefractCopyRtScale (default -1 = same as ReflectionRtScale; 0 = engine
+    // 1024x1024; 0.25..1 = fraction of the eye size): _rt_PowerOfTwoFB only,
+    // the screen copy refract materials (shiny floors, wired glass) sample.
+    // It is a copy, not a scene render, so it is cheap to grow on its own.
+    extern float g_RefractCopyRtScale;
+    float RefractCopyRtScale();
+    // Size _rt_PowerOfTwoFB was grown to (0 = not grown).
+    extern int g_RefractCopyRtW;
+    extern int g_RefractCopyRtH;
+    // w x h is the grown reflection set or the grown refract copy.
+    bool GrownAuxRtSized(int w, int h);
+    // Size the reflection set was grown to (0 = not grown). Set by the
+    // CreateNamedRT hook; read by the viewport/scissor/clear/constant hooks.
+    extern int g_ReflectionRtW;
+    // GpuPassTiming (default false): log
+    // GPU ms per frame for eye-sized RTs, the reflection set and refract
+    // copies, per eye, every ~5 s (D3D timestamp queries, no stalls).
+    extern bool g_GpuPassTiming;
+    extern int g_ReflectionRtH;
+    // Test aid: frames left to log every render pass (VR/trace.txt, headless runs only).
+    extern int g_PassTraceFrames;
+    extern bool g_SprintAimedPose;       // sprint animations show the aimed idle pose
+    // Optional features, default off:
+    extern bool g_ShoulderGestures;      // hand behind shoulder + grip: left quick save, right crowbar
+    extern bool g_SettingsTriangleHold;  // Triangle/Y hold opens the VR settings panel, tap pauses on release
+    extern bool g_WeaponMenuSettingsGear; // VR gear slot in the weapon menu (always shown without SettingsTriangleHold)
+    extern bool g_WeaponMenuTilt;        // weapon menu opened low tilts back to face the eye
+    // CrouchStickHold=true: right stick down crouches only while held
+    // (default false = each push toggles crouch).
+    extern bool g_CrouchStickHold;
+    // StickJumpCrouchThreshold: how far (0..1) the right stick must go up/down
+    // for jump/crouch (default 0.8); it also has to point within 30 degrees
+    // of straight up/down.
+    extern float g_StickJumpCrouchThreshold;
+    // TurnBlocksJumpCrouch=true: after the right stick went sideways (turn),
+    // no stick jump/crouch until it returns near the centre.
+    extern bool g_TurnBlocksJumpCrouch;
+    // SprintToggle=true: one sprint click (left stick click) keeps sprinting
+    // until the left stick returns to centre or sprint is clicked again
+    // (default false = hold the click).
+    extern bool g_SprintToggle;
+    // VR settings panel pauses the game while open (setpause / unpause).
+    extern bool g_VrSettingsPause;
+    // Logs (and resets) the access-violation count since the last call.
+    void LogFaultStats();
     // Hide HEV gloves and wrist HUD until the HEV suit is picked up. Bare-hand
     // GLBs still draw on the intro tram. Depends on a scanned m_bWearingSuit
     // offset; set false if the scan ever misfires.
@@ -232,6 +347,65 @@ namespace bmvr
     // zoomed. Compositor / OpenXR submit keep the real HMD FOV, so the
     // narrower render is magnified in the lenses. 0.28 ≈ 3.5× (HL2 20/75).
     extern float g_ScopeZoomFovScale;
+    // Eye the scoped crossbow bolt starts from (1 left, 2 right = default,
+    // 0 = between the eyes). A scope is one-eyed: from the head centre the
+    // bolt hit half an IPD beside the reticle in both eyes (2026-11-03).
+    extern int g_ScopeEye;
+    // LeftEyeCullPad (default 0 = off since 2026-10-30, max 0.25): the left eye's right
+    // edge is pushed out by this fraction of the half-FOV tangent (off-centre
+    // CViewSetup) and submitted at that FOV (OpenXR explicit tangents, OpenVR
+    // texture bounds). Black Mesa culls props for the right eye with what it
+    // computed for the left eye; the right eye sees ~IPD/z further right, so
+    // near props popped in late at the far right (HMD 2026-10-17; a widened
+    // left eye fixed it). 0.05 covers props from ~0.7 m at 64 mm IPD (PSVR2).
+    // Works with and without OffCenterEyes. Same RT size, so the left eye
+    // loses ~2.5 % horizontal sharpness at 0.05; no extra pixels.
+    // The late props were the occlusion tracker reusing the first eye's
+    // results (OcclusionTrackerPerEye fixes that at the source), so the pad is
+    // off by default: it also made the left eye off-centre with OffCenterEyes
+    // off, which exposed off-centre bugs (mirror views) on default settings.
+    extern float g_LeftEyeCullPad;
+    // MenuCursorHook (default true): GetCursorPos reports the VR menu pointer
+    // while it is on a menu panel. false = real cursor (A/B test aid).
+    extern bool g_MenuCursorHook;
+    // DebugDumps (default false): poll VR/dump.txt and VR/trace.txt in a
+    // normal session too (else headless tests only), so a headset session
+    // can write full uncropped eye images plus the head pose of that frame.
+    extern bool g_DebugDumps;
+    // RightEyeFirst (default false, test aid, MulticoreMode only): record the
+    // right eye's RenderView before the left one.
+    extern bool g_RightEyeFirst;
+    // OcclusionTrackerPerEye (default true): Black Mesa's occlusion tracker
+    // (r_occlusion_tracker_enabled) keys its results by view id, and both
+    // eyes render as the same main view, so objects hidden from the first
+    // eye were culled in the second too (pop-in at the far right and behind
+    // doorways). The right eye's views get their own id, so they get their
+    // own queries against their own depth. false = stock (A/B aid).
+    extern bool g_OcclusionTrackerPerEye;
+    // PixelVisPerEye (default true, cvar bmvr_pixelvis_per_eye): glows (light
+    // halos, sprites, monitors) fade by a GPU visible-pixel query kept per view
+    // id. Both eyes are the main view, so the right eye's query replaced the
+    // left eye's and a glow outside one eye dropped out in both (flicker while
+    // the head moves). The right eye gets its own queries for all its views
+    // (incl. floor/water reflections). false = stock (A/B aid).
+    extern bool g_PixelVisPerEye;
+    // GlowHold (seconds, default 0 = off, cvar bmvr_glow_hold): a glow
+    // that dims keeps its brightest recent value this long, then fades over
+    // the same time, so partial occlusion (dirty glass, the edge of an eye's
+    // view, small head movements) no longer flickers it. Brightening is
+    // immediate. Per glow, per eye and view.
+    extern float g_GlowHold;
+    // FollowScriptedCamera (default true, cvar bmvr_follow_scripted_camera):
+    // while a cutscene camera drives the view (fall + drag scene, tram), the
+    // view takes its orientation with the head turning relative to it.
+    extern bool g_FollowScriptedCamera;
+    // OccluderViewPerEye (default true): the engine's occluder system
+    // (r_occlusion, map func_occluder) takes its view in Push3DView, but the
+    // client tests renderables against it before pushing the view. Flat, that
+    // is the previous frame's view; in stereo the right eye was tested from the
+    // left eye's position (static props pop in/out behind occluders). Each eye
+    // now gets its own previous-frame occluder view. false = stock (A/B aid).
+    extern bool g_OccluderViewPerEye;
     // Exponential smoothing time (seconds) applied to HMD pitch/yaw while
     // scoped. Magnification otherwise turns every micro-movement into shake.
     extern float g_ScopeZoomSmoothSec;
@@ -283,10 +457,6 @@ namespace bmvr
     // Old stereo vis workaround: r_portalsopenall + r_occlusion 0. Default
     // off — that pair draws the whole map and tanks open/complex areas.
     extern bool g_ForceOpenVis;
-    // Hidden-area mesh early-Z after D3DCLEAR_ZBUFFER. Verified miss
-    // 2026-09-05: OpenXR visibility-mask draw was a black overlay, no FPS
-    // gain. Persist-skipped (hl2vr_ham). HiddenAreaMesh=true does not retry.
-    extern bool g_HiddenAreaMesh;
     // Dummy-draw materials after LevelInit. Verified miss 2026-09-05:
     // DrawScreenSpaceRectangle null-called shaderapidx9 (C0000005 eip=0)
     // and leftover hmd_offscreen dropped the next launch onto HWND gbmatch.
@@ -322,13 +492,17 @@ namespace bmvr
     // 2D GameUI in the HMD: fraction of the full-width letterbox (1 = glued to
     // the view). ~0.70 is a closer monitor; lower = farther / smaller.
     extern float g_MenuPanelScale;
-    // HL2VR hlvr_menu_forward / overlay width, in metres. Defaults match the
-    // OpenXR helper 2D quad (0.65 m × 1.05 m, 2026-09-03). Do not copy
-    // HL2VR's 150 Source-unit (~3.8 m) distance — that was too far here.
+    // HL2VR hlvr_menu_forward / overlay width, in metres (main menu quad and
+    // pause overlay; the game publishes them to the OpenXR helper, bridge v16).
+    // 1.4 m × 1.6 m (~60°) since 2026-10-26: 0.65 m × 1.05 m (~78°, 2026-09-03)
+    // felt too close and made pointer lag obvious next to the hand. Do not
+    // copy HL2VR's 150 Source-unit (~3.8 m) distance — too far here. VR
+    // settings panel: MENU section.
     extern float g_MenuForwardMeters;
     extern float g_MenuWidthMeters;
     extern float g_MenuHeightOffsetMeters;
-    // Seconds of low-pass on the VR menu pointer (hand tremor).
+    // Seconds of low-pass on the VR menu pointer (hand tremor). 0.05 since
+    // 2026-10-26 (0.18 dragged behind slow aiming).
     extern float g_MenuCursorSmoothSec;
     extern float g_MenuPointerSensitivity;
 
@@ -337,16 +511,9 @@ namespace bmvr
     bool TryGameUiActivate();
     bool TryMeleeTrace();
     bool TryFramebufferOverride();
-    bool TryFullFrameStereo();
-    // 47777b5 same-buffer: FullFrame/G-buffer LITERAL at window-capped HMD-fit
-    // (~1584x1440). Independent of ff_stereo (broken grow). Sticky ff_hmdfit.
-    bool TryHmdFitFullFrame();
-    // LITERAL FullFrame AND G-buffer at eye size (1584). Verified miss
-    // 2026-08-22 (died on background04 before stereo). Do not retry.
-    bool TryEyeFitWorldRts();
     // Stereo view stays 2560 (G-buffer size) with HMD fov/aspect/IPD so the
     // deferred flashlight apply runs, then squash-blit into 1584 eyes.
-    // Sticky fl_gbmatch. Not ff_hmdfit / ff_gbfit / 16:9 stereo.
+    // Sticky fl_gbmatch.
     bool TryFlashlightGbMatch();
     // Under gbmatch, skip the leftover 16:9 desktop main (2 renders/frame).
     // Own sticky gb_leftskip; a death falls back to 3-render gbmatch.
@@ -356,23 +523,6 @@ namespace bmvr
     // HL2VR: QueueCall WaitGetPoses onto ICallQueue. Sticky disables queued
     // WGP only — sync WaitGetPoses on the calling thread stays on.
     bool TryHl2vrQueuedWgp();
-    // Write CViewSetup.m_eStereoEye LEFT/RIGHT (1/2). Never a pixel height.
-    bool TryHl2vrStereoEye();
-    // OpenVR GetHiddenAreaMesh early-Z after D3DCLEAR_ZBUFFER (3adc23b2).
-    // Persist-skipped: black overlay, 2026-09-05.
-    bool TryHl2vrHam();
-    // PixelVisibility_EndCurrentView once per stereo pair (26a5fe68).
-    // Persist-skipped: second-eye skip, one-eye 2D skybox miss, 2026-09-05.
-    bool TryHl2vrPixelVis();
-    // CVRViewRender::DrawAllMaterials dummy draw after map load (aeaf3f03).
-    bool TryHl2vrPredraw();
-    // C_BaseVRPlayer::GetRenderBoundsWorldspace ±1000 (feb36883). Off —
-    // leftover cull-opt from 2026-09-05. Do not re-arm.
-    bool TryHl2vrPlayerCull();
-    // Do not zero CViewRender+0x744. That byte is m_rbTakeFreezeFrame
-    // (RenderView cmp + m_flFreezeFrameUntil at +0x748). Persist-skipped:
-    // empty freeze / white void, 2026-09-05.
-    bool TryStereoVisReset();
     // Apply OpenXR/OpenVR controller poses into tracking (viewmodel + gloves).
     bool TryCtrlPose();
     // CalcViewModelView hard-lock to the aim controller.

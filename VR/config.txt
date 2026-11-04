@@ -218,3 +218,30 @@ SeatedMode=false
 # Optional extra height in metres, applied equally to camera and hands.
 SeatedHeightOffsetMeters=0.0
 # Recenter position: hold both thumbstick clicks for 3 seconds.
+
+# Upstream additions through experimental-beta-26234270.6.
+MaxEyeSize=4096
+OpenXRHelperDownsample=
+ReflectionRtScale=0.5
+RefractCopyRtScale=0.5
+EnvmapScaleWorld=1
+EnvmapScaleModels=1
+FollowScriptedCamera=true
+GunPitchOffset=0
+Msaa=0
+OffCenterEyes=false
+VrCrosshairDot=false
+ScopeEye=right
+CrouchStickHold=false
+StickJumpCrouchThreshold=0.8
+TurnBlocksJumpCrouch=true
+SprintToggle=false
+TwoHandGripToggle=false
+VrHandThrow=true
+ThrowScale=3.75
+MenuHeightOffsetMeters=-0.02
+ShoulderGestures=true
+SettingsTriangleHold=false
+WeaponMenuSettingsGear=true
+WeaponMenuTilt=true
+VrSettingsPause=true

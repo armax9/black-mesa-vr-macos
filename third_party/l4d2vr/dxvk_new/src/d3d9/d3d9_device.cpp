@@ -61,7 +61,14 @@ namespace {
 
 }
 
+// BMVR diagnostic: set by hooks.cpp while a pass trace is inside BM's
+// deferred-light pass (_rt_gblightdiff); every draw is logged.
+extern "C" volatile int g_BmvrD3dDrawTrace;
+extern "C" volatile int g_BmvrFlashlightMatrixFix;
+namespace bmvr { void Log(const char* fmt, ...); }
+
 namespace dxvk {
+
 
     namespace {
 
@@ -120,8 +127,6 @@ namespace dxvk {
             D3D9SwapChainEx* swap,
             const D3DPRESENT_PARAMETERS* next)
         {
-            if (bmvr::TryHmdSwapchain())
-                return false;
             if (!swap || !next || !next->Windowed)
                 return false;
             const D3DPRESENT_PARAMETERS* cur = swap->GetPresentParams();
@@ -181,106 +186,6 @@ namespace dxvk {
             }
             params->MultiSampleType = D3DMULTISAMPLE_NONE;
             params->MultiSampleQuality = 0;
-        }
-
-        static void BmvrForceHmdAspectWindowedBackbuffer(D3DPRESENT_PARAMETERS* params)
-        {
-            if (!params)
-                return;
-            // hmd_swap skip: do not resize the windowed swapchain to G-buffer
-            // size. CreateDevice/Reset that to 2384x2160 after bm_c1a0a
-            // (2026-08-18) SetWindowPos'd the HWND, released VR RTs, then
-            // Present died. G-buffers stay HMD-sized via CreateNamedRT.
-            if (!bmvr::TryHmdSwapchain())
-                return;
-            uint32_t w = params->BackBufferWidth;
-            uint32_t h = params->BackBufferHeight;
-            if (!bmvr::ApplyHmdAspectBackbuffer(w, h))
-                return;
-            static int s_log;
-            if (s_log < 6)
-            {
-                Logger::info(str::format(
-                    "BMVR windowed backbuffer ",
-                    params->BackBufferWidth, "x", params->BackBufferHeight,
-                    " -> HMD-aspect ", w, "x", h));
-                ++s_log;
-            }
-            params->Windowed = TRUE;
-            params->BackBufferWidth = w;
-            params->BackBufferHeight = h;
-            params->MultiSampleType = D3DMULTISAMPLE_NONE;
-            params->MultiSampleQuality = 0;
-        }
-
-        // Source copies BackBufferWidth/Height out of Reset into videomode.
-        // Skipping an identical 1576 Reset while the caller still has 2560
-        // leaves GetScreenSize at 2560 and HUD/_rt_Hud mismatched (2026-08-17).
-        // Do not write Windowed back — that Reset-looped.
-        static void BmvrSyncCallerBackbufferSize(
-            D3DPRESENT_PARAMETERS* caller,
-            const D3DPRESENT_PARAMETERS* local)
-        {
-            if (!caller || !local)
-                return;
-            if (!bmvr::TryHmdFramebuffer() || !bmvr::TryHmdSwapchain())
-                return;
-            if (caller->BackBufferWidth == local->BackBufferWidth
-                && caller->BackBufferHeight == local->BackBufferHeight)
-                return;
-            static int s_log;
-            if (s_log < 8)
-            {
-                Logger::info(str::format(
-                    "BMVR Reset caller size ",
-                    caller->BackBufferWidth, "x", caller->BackBufferHeight,
-                    " -> ", local->BackBufferWidth, "x", local->BackBufferHeight));
-                ++s_log;
-            }
-            caller->BackBufferWidth = local->BackBufferWidth;
-            caller->BackBufferHeight = local->BackBufferHeight;
-        }
-
-        static bool VrForceSwapchainBackBufferToEyeSize(
-            VR* vr,
-            D3DPRESENT_PARAMETERS* params,
-            D3DDISPLAYMODEEX* fullscreenMode = nullptr) {
-            // Black Mesa: HMD-sized swapchain blacks the desktop and leaves
-            // SteamVR in the waiting room after Reset. Keep the game's window
-            // size unless the hmd_swap retry is still enabled.
-            if (!bmvr::TryHmdSwapchain())
-                return false;
-            if (!vr || !params || vr->m_RenderWidth == 0 || vr->m_RenderHeight == 0)
-                return false;
-
-            const UINT eyeWidth = static_cast<UINT>(vr->m_RenderWidth);
-            const UINT eyeHeight = static_cast<UINT>(vr->m_RenderHeight);
-            const UINT oldWidth = params->BackBufferWidth;
-            const UINT oldHeight = params->BackBufferHeight;
-            const D3DMULTISAMPLE_TYPE oldMultiSampleType = params->MultiSampleType;
-            const DWORD oldMultiSampleQuality = params->MultiSampleQuality;
-
-            params->BackBufferWidth = eyeWidth;
-            params->BackBufferHeight = eyeHeight;
-            params->MultiSampleType = D3DMULTISAMPLE_NONE;
-            params->MultiSampleQuality = 0;
-
-            if (!params->Windowed && fullscreenMode) {
-                fullscreenMode->Width = eyeWidth;
-                fullscreenMode->Height = eyeHeight;
-            }
-
-            const bool sizeChanged = oldWidth != eyeWidth || oldHeight != eyeHeight;
-            const bool msaaChanged = oldMultiSampleType != D3DMULTISAMPLE_NONE || oldMultiSampleQuality != 0;
-            const bool changed = sizeChanged || msaaChanged;
-            if (changed) {
-                Logger::info(str::format(
-                    "L4D2VR forcing reset backbuffer to VR eye submit-compatible settings: ",
-                    oldWidth, "x", oldHeight, " msaa=", static_cast<UINT>(oldMultiSampleType), "/", oldMultiSampleQuality,
-                    " -> ", eyeWidth, "x", eyeHeight, " msaa=0/0"));
-            }
-
-            return changed;
         }
 
         static void VrAimLineDrawQuad(
@@ -1687,12 +1592,9 @@ namespace dxvk {
     if (unlikely(pPresentationParameters == nullptr))
       return D3DERR_INVALIDCALL;
 
-    D3DPRESENT_PARAMETERS* caller = pPresentationParameters;
     D3DPRESENT_PARAMETERS local = *pPresentationParameters;
     BmvrStripSwapchainMsaa(&local);
     BmvrKeepDesktopWindowed(&local);
-    BmvrForceHmdAspectWindowedBackbuffer(&local);
-    BmvrSyncCallerBackbufferSize(caller, &local);
     // IDirect3DDevice9::Reset resets device state even if dimensions match.
     // Returning success without ResetState leaves menu shaders/blending/streams
     // live while Source assumes defaults. Keep the ordinary Reset path below.
@@ -1702,7 +1604,6 @@ namespace dxvk {
     VR* vr = (static_cast<IDirect3DDevice9*>(this) == g_BmvrSourceDevice9 && g_Game != nullptr) ? g_Game->m_VR : nullptr;
     if (vr) {
       vr->ReleaseVRRenderTargetsForDeviceReset();
-      VrForceSwapchainBackBufferToEyeSize(vr, pPresentationParameters);
     }
 
     D3D9DeviceLock lock = LockDevice();
@@ -4421,6 +4322,67 @@ namespace dxvk {
   }
 
 
+  // Black Mesa's deferred flashlight light draw gets the light position (ps c8, w = range
+  // 1000), its direction (c11) and the world-to-shadow matrix twice (c14-c17 = c18-c21).
+  // In stereo the first-drawn eye gets the matrix of the previous frame while position,
+  // direction and the shadow map are current, so its shadow trails the light while the
+  // flashlight moves (2026-10-30, left eye). Rebuild the matrix from c8/c11, keeping the
+  // projection scale and depth terms of the matrix the game set (roll 0, square frustum).
+  void D3D9DeviceEx::BmvrFixFlashlightShadowMatrix() {
+    if (!g_BmvrFlashlightMatrixFix)
+      return;
+    const auto& c = m_state.psConsts->fConsts;
+    const float* P = c[8].data;
+    const float* F = c[11].data;
+    if (P[3] != 1000.0f)
+      return;
+    for (uint32_t r = 14; r < 18; r++)
+      for (uint32_t k = 0; k < 4; k++)
+        if (c[r].data[k] != c[r + 4].data[k])
+          return;
+    const float* oR = c[14].data;
+    const float* oU = c[15].data;
+    const float* oD = c[16].data;
+    const float* oF = c[17].data;
+    auto dot3 = [](const float* a, const float* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+    const float lenF = std::sqrt(dot3(F, F));
+    const float lenOF = std::sqrt(dot3(oF, oF));
+    const float cot = std::sqrt(dot3(oR, oR));
+    if (std::fabs(lenF - 1.0f) > 0.02f || std::fabs(lenOF - 1.0f) > 0.02f || cot < 0.3f || cot > 5.0f)
+      return;
+    if (std::fabs(oR[2]) > 0.01f * cot || dot3(F, oF) < 0.9f)
+      return;
+    if (std::fabs(-dot3(oF, P) - oF[3]) > 20.0f)
+      return;
+    // Right = forward x world up (roll 0), up = right x forward; signs as in the game's matrix.
+    float R[3] = { F[1], -F[0], 0.0f };
+    const float lenR = std::sqrt(R[0] * R[0] + R[1] * R[1]);
+    if (lenR < 0.05f)
+      return;
+    R[0] /= lenR; R[1] /= lenR;
+    if (dot3(R, oR) < 0.0f) { R[0] = -R[0]; R[1] = -R[1]; }
+    float U[3] = { R[1] * F[2] - R[2] * F[1], R[2] * F[0] - R[0] * F[2], R[0] * F[1] - R[1] * F[0] };
+    if (dot3(U, oU) < 0.0f) { U[0] = -U[0]; U[1] = -U[1]; U[2] = -U[2]; }
+    const float depthScale = std::sqrt(dot3(oD, oD)) / lenOF;
+    const float depthBias = oD[3] - depthScale * oF[3];
+    const float fw = -dot3(F, P);
+    const float rows[8][4] = {
+      { cot * R[0], cot * R[1], cot * R[2], -cot * dot3(R, P) },
+      { cot * U[0], cot * U[1], cot * U[2], -cot * dot3(U, P) },
+      { depthScale * F[0], depthScale * F[1], depthScale * F[2], depthScale * fw + depthBias },
+      { F[0], F[1], F[2], fw },
+      { cot * R[0], cot * R[1], cot * R[2], -cot * dot3(R, P) },
+      { cot * U[0], cot * U[1], cot * U[2], -cot * dot3(U, P) },
+      { depthScale * F[0], depthScale * F[1], depthScale * F[2], depthScale * fw + depthBias },
+      { F[0], F[1], F[2], fw },
+    };
+    if (g_BmvrD3dDrawTrace)
+      bmvr::Log("trace: d3d flashlight matrix c16 %.4f %.4f %.4f %.2f -> %.4f %.4f %.4f %.2f",
+        oD[0], oD[1], oD[2], oD[3], rows[2][0], rows[2][1], rows[2][2], rows[2][3]);
+    SetShaderConstants<DxsoProgramTypes::PixelShader, D3D9ConstantType::Float>(14, &rows[0][0], 8);
+  }
+
+
   HRESULT STDMETHODCALLTYPE D3D9DeviceEx::DrawPrimitive(
           D3DPRIMITIVETYPE PrimitiveType,
           UINT             StartVertex,
@@ -4432,6 +4394,25 @@ namespace dxvk {
 
     if (unlikely(!PrimitiveCount))
       return D3D_OK;
+
+    if (unlikely(g_BmvrD3dDrawTrace)) {
+      const auto& rs = m_state.renderStates;
+      const RECT& sc = m_state.scissorRect;
+      bmvr::Log("trace: d3d %s prim=%u count=%u scissor=%u (%ld,%ld)-(%ld,%ld) stencil=%u ref=%u func=%u z=%u zfunc=%u zwrite=%u cull=%u blend=%u ps=%p vs=%p",
+        "Draw", unsigned(PrimitiveType), unsigned(PrimitiveCount), unsigned(rs[D3DRS_SCISSORTESTENABLE]),
+        long(sc.left), long(sc.top), long(sc.right), long(sc.bottom), unsigned(rs[D3DRS_STENCILENABLE]),
+        unsigned(rs[D3DRS_STENCILREF]), unsigned(rs[D3DRS_STENCILFUNC]), unsigned(rs[D3DRS_ZENABLE]),
+        unsigned(rs[D3DRS_ZFUNC]), unsigned(rs[D3DRS_ZWRITEENABLE]), unsigned(rs[D3DRS_CULLMODE]),
+        unsigned(rs[D3DRS_ALPHABLENDENABLE]), (void*)m_state.pixelShader.ptr(), (void*)m_state.vertexShader.ptr());
+      for (uint32_t r = 0; r < 64; r++) {
+        const float* v = m_state.vsConsts->fConsts[r].data;
+        const float* q = m_state.psConsts->fConsts[r < 32 ? r : 0].data;
+        if (r < 32)
+          bmvr::Log("trace: d3d   c%-2u vs %10.4f %10.4f %10.4f %10.4f | ps %10.4f %10.4f %10.4f %10.4f", r, v[0], v[1], v[2], v[3], q[0], q[1], q[2], q[3]);
+        else
+          bmvr::Log("trace: d3d   c%-2u vs %10.4f %10.4f %10.4f %10.4f", r, v[0], v[1], v[2], v[3]);
+      }
+    }
 
     bool dynamicSysmemVBOs;
     uint32_t firstIndex     = 0;
@@ -4486,6 +4467,27 @@ namespace dxvk {
 
     if (unlikely(!PrimitiveCount || !NumVertices))
       return D3D_OK;
+
+    BmvrFixFlashlightShadowMatrix();
+
+    if (unlikely(g_BmvrD3dDrawTrace)) {
+      const auto& rs = m_state.renderStates;
+      const RECT& sc = m_state.scissorRect;
+      bmvr::Log("trace: d3d %s prim=%u count=%u scissor=%u (%ld,%ld)-(%ld,%ld) stencil=%u ref=%u func=%u z=%u zfunc=%u zwrite=%u cull=%u blend=%u ps=%p vs=%p",
+        "DrawIndexed", unsigned(PrimitiveType), unsigned(PrimitiveCount), unsigned(rs[D3DRS_SCISSORTESTENABLE]),
+        long(sc.left), long(sc.top), long(sc.right), long(sc.bottom), unsigned(rs[D3DRS_STENCILENABLE]),
+        unsigned(rs[D3DRS_STENCILREF]), unsigned(rs[D3DRS_STENCILFUNC]), unsigned(rs[D3DRS_ZENABLE]),
+        unsigned(rs[D3DRS_ZFUNC]), unsigned(rs[D3DRS_ZWRITEENABLE]), unsigned(rs[D3DRS_CULLMODE]),
+        unsigned(rs[D3DRS_ALPHABLENDENABLE]), (void*)m_state.pixelShader.ptr(), (void*)m_state.vertexShader.ptr());
+      for (uint32_t r = 0; r < 64; r++) {
+        const float* v = m_state.vsConsts->fConsts[r].data;
+        const float* q = m_state.psConsts->fConsts[r < 32 ? r : 0].data;
+        if (r < 32)
+          bmvr::Log("trace: d3d   c%-2u vs %10.4f %10.4f %10.4f %10.4f | ps %10.4f %10.4f %10.4f %10.4f", r, v[0], v[1], v[2], v[3], q[0], q[1], q[2], q[3]);
+        else
+          bmvr::Log("trace: d3d   c%-2u vs %10.4f %10.4f %10.4f %10.4f", r, v[0], v[1], v[2], v[3]);
+      }
+    }
 
     bool dynamicSysmemVBOs;
     bool dynamicSysmemIBO;
@@ -6685,12 +6687,9 @@ namespace dxvk {
     if (unlikely(pPresentationParameters == nullptr))
       return D3DERR_INVALIDCALL;
 
-    D3DPRESENT_PARAMETERS* caller = pPresentationParameters;
     D3DPRESENT_PARAMETERS local = *pPresentationParameters;
     BmvrStripSwapchainMsaa(&local);
     BmvrKeepDesktopWindowed(&local);
-    BmvrForceHmdAspectWindowedBackbuffer(&local);
-    BmvrSyncCallerBackbufferSize(caller, &local);
     if (BmvrShouldSkipIdenticalWindowedReset(m_implicitSwapchain.ptr(), &local)
      || BmvrShouldSkipWindowedSizeReset(m_implicitSwapchain.ptr(), &local)) {
       m_deviceLostState = D3D9DeviceLostState::Ok;
@@ -6701,7 +6700,6 @@ namespace dxvk {
     VR* vr = (static_cast<IDirect3DDevice9*>(this) == g_BmvrSourceDevice9 && g_Game != nullptr) ? g_Game->m_VR : nullptr;
     if (vr) {
       vr->ReleaseVRRenderTargetsForDeviceReset();
-      VrForceSwapchainBackBufferToEyeSize(vr, pPresentationParameters, pFullscreenDisplayMode);
     }
 
     D3D9DeviceLock lock = LockDevice();

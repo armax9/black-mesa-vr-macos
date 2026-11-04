@@ -1,7 +1,7 @@
 #pragma once
+#include "bmvr_abi.h"
 #include "sigscanner.h"
 #include "game.h"
-#include "bmvr_abi.h"
 
 // Signatures verified offline against the installed Steam Black Mesa modules.
 // public-beta buildid 25607072 (2026-10-02, "Anomalous Improvements"):
@@ -37,8 +37,16 @@ struct Offset
             this->offset = newOffset;
         if (newOffset == -1)
         {
+            // A jump at the old offset = the mod's own early hook (GetScreenAspectRatio, GetBackBufferDimensions),
+            // not a game update: the bytes were there until MinHook replaced them.
+            const auto* at = reinterpret_cast<const unsigned char*>(GetModuleHandleA(this->moduleName.c_str())) + currentOffset;
+            if (!optional && currentOffset > 0 && *at == 0xE9)
+                return;
             if (!optional)
+            {
                 Game::logMsg("Signature not found in %s: %s", this->moduleName.c_str(), this->signature.c_str());
+                Game::noteMissingOffset((this->moduleName + ": " + this->signature).c_str());
+            }
             return;
         }
         this->address = (int)((uintptr_t)GetModuleHandleA(this->moduleName.c_str()) + this->offset);
@@ -52,34 +60,37 @@ public:
     // CBlackMesaViewRender IViewRender vtable slot 6. 3-arg thiscall
     // (CViewSetup&, nClearFlags, whatToDraw), ret 0xC.
     // 0x207730 matches a nearby helper whose callers push floats — not RenderView.
-    Offset RenderView = bmvr::abi::Beta() ? Offset{ "client.dll", 0x201b10,
+    Offset RenderView = bmvr::abi::Latest() ? Offset{ "client.dll", 0x201DB0,
+        "55 8B EC 81 EC DC 02 00 00 A1 ? ? ? ? 33 C5 89 45 FC 53 8B 5D 08 56" } : (bmvr::abi::Beta() ? Offset{ "client.dll", 0x201b10,
         "55 8B EC 81 EC DC 02 00 00 A1 ? ? ? ? 33 C5 89 45 FC 53 8B 5D 08 56" } : Offset{ "client.dll", 0x20EE40,
-        "55 8B EC 81 EC DC 02 00 00 A1 ? ? ? ? 33 C5 89 45 FC 53 8B 5D 08 56" };
+        "55 8B EC 81 EC DC 02 00 00 A1 ? ? ? ? 33 C5 89 45 FC 53 8B 5D 08 56" });
 
-    Offset g_pClientMode = bmvr::abi::Beta() ? Offset{ "client.dll", 0x15d3f6,
+    Offset g_pClientMode = bmvr::abi::Latest() ? Offset{ "client.dll", 0x15D576,
+        "56 57 8B F9 8B 0D ? ? ? ? 8B 01 FF 50 24", 6 } : (bmvr::abi::Beta() ? Offset{ "client.dll", 0x15d3f6,
         "56 57 8B F9 8B 0D ? ? ? ? 8B 01 FF 50 24", 6 } : Offset{ "client.dll", 0x16AD56,
-        "56 57 8B F9 8B 0D ? ? ? ? 8B 01 FF 50 24", 6 };
+        "56 57 8B F9 8B 0D ? ? ? ? 8B 01 FF 50 24", 6 });
 
-    Offset CreateMove = bmvr::abi::Beta() ? Offset{ "client.dll", 0x102410,
+    Offset CreateMove = bmvr::abi::Latest() ? Offset{ "client.dll", 0x102590,
+        "55 8B EC E8 ? ? ? ? 8B C8 85 C9 75 06 B0 01 5D C2 08 00" } : (bmvr::abi::Beta() ? Offset{ "client.dll", 0x102410,
         "55 8B EC E8 ? ? ? ? 8B C8 85 C9 75 06 B0 01 5D C2 08 00" } : Offset{ "client.dll", 0x110310,
-        "55 8B EC E8 ? ? ? ? 8B C8 85 C9 75 06 B0 01 5D C2 08 00" };
+        "55 8B EC E8 ? ? ? ? 8B C8 85 C9 75 06 B0 01 5D C2 08 00" });
 
     // FindNearbyVguiScreen(eye, angles, team). cdecl. Only caller is
     // C_BasePlayer::DetermineVguiInputMode. Hover (C_VGuiScreen::ClientThink)
     // uses EyePosition/EyeAngles; clicks need m_nButtonState at +0x6B4, which
     // DetermineVguiInputMode skips when ISurface::IsCursorVisible is true.
-    Offset FindNearbyVguiScreen{ "client.dll", 0xFC470,
+    Offset FindNearbyVguiScreen{ "client.dll", 0xEE490,
         "53 8B DC 83 EC 08 83 E4 F0 83 C4 04 55 8B 6B 04 89 6C 24 04 8B EC 81 EC B8 00 00 00" };
-    Offset SetVGuiScreenButtonState{ "client.dll", 0xeec20,
+    Offset SetVGuiScreenButtonState{ "client.dll", 0xEEDA0,
         "55 8B EC 8B 4D 08 85 C9 74 09 8B 45 0C 89 81 B4 06 00 00 5D C3" };
-    Offset IntersectVguiScreenRay{ "client.dll", 0xee8d0,
+    Offset IntersectVguiScreenRay{ "client.dll", 0xEEA50,
         "55 8B EC 83 EC 48 56 8B F1 8B 06 FF 50 24" };
     static constexpr int kC_VGuiScreen_ButtonState = 0x6B4;
     static constexpr int kC_VGuiScreen_PixelWidth = 0x6A0;
     static constexpr int kC_VGuiScreen_PixelHeight = 0x6A4;
     static constexpr int kC_VGuiScreen_PanelPtr = 0x72C;
     // IClientMode* in client.dll .data. C_VGuiScreen::ClientThink 0xFB7F0.
-    static constexpr int kClientModeGlobalRva = 0x6d5b58;
+    static inline int kClientModeGlobalRva() { return bmvr::abi::Latest() ? (0x6D6D00) : (0x6d5b58); } // beta 26234270 (25844216: 0x6D5B58)
     static constexpr int kIClientMode_ActivateInGameVGuiContext = 30;
     // vgui2 VGUI_InputInternal001 as used by ClientThink (no extra GetMouseFocus).
     static constexpr int kVguiVtInternalCursorMoved = 0x108 / 4;
@@ -93,9 +104,10 @@ public:
 
     // Build 25844216 (2026-10-10): C_BlackMesaViewModel vtable slot 230 (0x398).
     // Register allocation changed, so the 25607072 prologue no longer matches.
-    Offset CalcViewModelView = bmvr::abi::Beta() ? Offset{ "client.dll", 0x29BA10,
+    Offset CalcViewModelView = bmvr::abi::Latest() ? Offset{ "client.dll", 0x29CC70,
+        "55 8B EC 83 EC 24 53 56 57 8B 7D 08 8B F1 85 FF" } : (bmvr::abi::Beta() ? Offset{ "client.dll", 0x29BA10,
         "55 8B EC 83 EC 24 53 56 57 8B 7D 08 8B F1 85 FF" } : Offset{ "client.dll", 0x29D930,
-        "55 8B EC 83 EC 24 53 56 8B 75 08 57 8B F9 85 F6" };
+        "55 8B EC 83 EC 24 53 56 8B 75 08 57 8B F9 85 F6" });
 
     // Ghidra client.dll image 0x10000000. FUN_1029d930 (CalcViewModelView)
     // ends in these. FUN_100af720 writes abs origin at this+0x294 and calls
@@ -105,8 +117,8 @@ public:
     // Build 25844216 (2026-10-10): both moved -0xE160 from 25607072. Each
     // compares this+0x294 / this+0x2D0 (ucomiss) before writing; the call
     // site checks those bytes. Field offsets themselves did not move.
-    static inline int kCBaseEntity_SetAbsOrigin() { return bmvr::abi::Beta() ? 0xA1820 : 0xAF720; }
-    static inline int kCBaseEntity_SetAbsAngles() { return bmvr::abi::Beta() ? 0xA1700 : 0xAF600; }
+    static inline int kCBaseEntity_SetAbsOrigin() { return bmvr::abi::Latest() ? 0xA18E0 : (bmvr::abi::Beta() ? 0xA1820 : 0xAF720); } // beta 26234270 (25844216: 0xA1820)
+    static inline int kCBaseEntity_SetAbsAngles() { return bmvr::abi::Latest() ? 0xA17C0 : (bmvr::abi::Beta() ? 0xA1700 : 0xAF600); } // beta 26234270 (25844216: 0xA1700)
     // C_BaseEntity abs origin written by SetAbsOrigin (Ghidra client FUN_100af720).
     static constexpr int kCBaseEntity_AbsOrigin = 0x294;
 
@@ -115,28 +127,38 @@ public:
     // (common/wpn_select.wav at SNDLVL_75dB — a world emit at the player).
     // The weapon wheel plays weapon_*.Draw on the weapon instead, and HUD
     // ticks go through IEngineSound::EmitAmbientSound (2D).
-    static constexpr int kCBaseEntity_EmitSound = 0x1D80D0;
-    static bool kCBaseEntity_EmitSoundVerified() { return !bmvr::abi::Beta(); }
+    static inline int kCBaseEntity_EmitSound() { return bmvr::abi::Latest() ? (0x1D8250) : (0x1D80D0); } // beta 26234270 (25844216: 0x1D80D0); mid-function on both, never called
+    static inline bool kCBaseEntity_EmitSoundVerified() { return !bmvr::abi::Beta(); }
 
     // C_BlackMesaPlayer vtable +0x414. Thunk: call EyePosition (+0x268) and
     // return that vector. Distinct from EyePosition (do not hook +0x268 —
     // that moves the camera). Bytes: 55 8B EC 8B 11 FF 75 08 FF 92 68 02 00 00.
-    static inline int kCBasePlayer_Weapon_ShootPosition() { return bmvr::abi::Beta() ? 0x6E120 : 0x7C030; }
+    static inline int kCBasePlayer_Weapon_ShootPosition() { return bmvr::abi::Latest() ? 0x6E1E0 : (bmvr::abi::Beta() ? 0x6E120 : 0x7C030); } // beta 26234270 (25844216: 0x6E120)
 
     // server.dll CBlackMesaPlayer vtable +0x23C. Same thunk onto EyePosition
     // at +0x230. Bytes: 55 8B EC 8B 11 FF 75 08 FF 92 30 02 00 00.
-    static inline int kCBasePlayer_Weapon_ShootPosition_Server() { return bmvr::abi::Beta() ? 0x11E520 : 0x11E490; }
+    static inline int kCBasePlayer_Weapon_ShootPosition_Server() { return bmvr::abi::Latest() ? 0x11E520 : (bmvr::abi::Beta() ? 0x11E520 : 0x11E490); }
 
     // server.dll CBasePlayer vtable +0x474 = FUN_10077240. CGrabController::
     // UpdateObject (FUN_10470da0) uses this as the hold origin, not +0x23C.
     // Bytes: 55 8B EC 83 EC 24 57 8B F9 8D 4D E8 6A 00 51 6A 00 8B 07 8B CF
     // FF 90 4C 02 00 00. Hold distance is 2*radius + 24 (DAT_105db264).
-    static inline int kCBasePlayer_GrabHoldOrigin_Server() { return bmvr::abi::Beta() ? 0x772D0 : 0x77240; }
+    static inline int kCBasePlayer_GrabHoldOrigin_Server() { return bmvr::abi::Latest() ? 0x772D0 : (bmvr::abi::Beta() ? 0x772D0 : 0x77240); }
+
+    // server.dll CBlackMesaPlayer vtable +0x474: `push [ebp+8]; call <eye
+    // position>; ret 4`. Bullet weapons read their shot origin from this slot.
+    // Beta 25844216: the only thunk at slot +0x474 of the two BM player
+    // vtables (0x1067C7D8, 0x107268F0); stable 19042901 had it at 0x47C810.
+    // Bytes: 55 8B EC FF 75 08 E8 ?? ?? ?? ?? 8B 45 08 5D C2 04 00.
+    static inline int kBlackMesaPlayer_ShootSource_Server() { return bmvr::abi::Latest() ? 0x47D460 : bmvr::abi::Select(0x47C810,0x47D1E0); } // beta 26234270 (25844216: 0x47D1E0)
 
     // server.dll CGrabController::SetTargetPosition FUN_10470990.
     // UpdateObject writes the hold point here after 2*radius+24. Bytes:
     // 55 8B EC 8B 45 08 8B D1 D9 00 D9 5A 04. ret 8.
-    static inline int kCGrabController_SetTargetPosition() { return bmvr::abi::Beta() ? 0x471360 : 0x470990; }
+    // client.dll C_BlackMesaPlayer::GetShootAngles, vtable slot 0x9D (RTTI .?AVC_BlackMesaPlayer@@),
+    // beta 26234270. Was a server-byte pattern scan that never matched the client.
+    static constexpr int kC_BlackMesaPlayer_GetShootAngles = 0x25AC20;
+    static inline int kCGrabController_SetTargetPosition() { return bmvr::abi::Latest() ? 0x4715E0 : (bmvr::abi::Beta() ? 0x471360 : 0x470990); } // beta 26234270 (25844216: 0x471360)
 
     // client.dll DT_BasePlayer RecvTable FUN_100b6a00: m_hUseEntity.
     static constexpr int kCBasePlayer_hUseEntity = 0x1344;
@@ -150,13 +172,36 @@ public:
     // runs after the shot, so the recoil term is exactly what walks sustained
     // fire upward. These are server offsets; the client copies the mod already
     // zeroes live at different addresses and only drive the viewmodel.
-    static inline int kBlackMesaPlayer_GetShootAngles_Server() { return bmvr::abi::Beta() ? 0x47F660 : 0x47EC90; }
+    static inline int kBlackMesaPlayer_GetShootAngles_Server() { return bmvr::abi::Latest() ? 0x47F8E0 : (bmvr::abi::Beta() ? 0x47F660 : 0x47EC90); } // beta 26234270 (25844216: 0x47F660)
+
+    // server.dll grenade spawn, cdecl (type, Vector* velocity, AngularImpulse*,
+    // CBaseEntity* owner, CBaseEntity* thrower, int mode) -> grenade. Type 1 =
+    // frag: CWeapon_Frag's throw (FUN_10487250, vtable 0x10729204) builds
+    // forward*speed + up*lift + 0.x * player velocity from GetShootAngles and
+    // calls this. It places the grenade via kGrenadeThrowPosition_Server, then
+    // DispatchSpawn, then the grenade's SetVelocity (vtable +0x3B4).
+    // mode: 0 = origin at owner EyePosition (vtable +0x230), 1 = halfway
+    // between eye and throw position, else the throw position. The frag
+    // passes 0.
+    // Bytes: 55 8B EC 8B 45 08 83 EC 30 83 F8 15.
+    static constexpr int kGrenadeCreate_Server = 0x379B20; // beta 26234270 (25844216: 0x3798A0)
+    // server.dll throw position, cdecl (grenade, Vector* pos, QAngle* ang,
+    // CBaseEntity* owner) -> bool (false = spawn refused, grenade removed):
+    // owner EyePosition (+0x230) / EyeAngles (+0x234), an offset, then a
+    // trace back to the eye. Bytes: 55 8B EC 81 EC 88 00 00 00.
+    static constexpr int kGrenadeThrowPosition_Server = 0x4832E0; // beta 26234270 (25844216: 0x483060)
     static constexpr int kBlackMesaPlayer_RecoilPunchAngles_Server = 0x14BC;
 
     // C_BaseAnimating IClientRenderable GetAttachment. `this` is entity+4.
     // Vec: FUN_10097a80 (index, Vector*, QAngle*). Matrix: FUN_100979b0.
-    static inline int kCBaseAnimating_GetAttachmentVec() { return bmvr::abi::Beta() ? 0x89B80 : 0x97A80; }
-    static inline int kCBaseAnimating_GetAttachmentMatrix() { return bmvr::abi::Beta() ? 0x89AB0 : 0x979B0; }
+    static inline int kCBaseAnimating_GetAttachmentVec() { return bmvr::abi::Latest() ? 0x89C40 : (bmvr::abi::Beta() ? 0x89B80 : 0x97A80); } // beta 26234270 (25844216: 0x89B80)
+    static inline int kCBaseAnimating_GetAttachmentMatrix() { return bmvr::abi::Latest() ? 0x89B70 : (bmvr::abi::Beta() ? 0x89AB0 : 0x979B0); } // beta 26234270 (25844216: 0x89AB0)
+    // client.dll ::FormatViewModelAttachment(Vector&, bool bInverse), cdecl (FUN_100afab0).
+    // Scales a viewmodel attachment's offset from the player view axis by
+    // tan(fov/2)/tan(fovViewmodel/2) of GetPlayerViewSetup(); called by
+    // C_BaseViewModel::FormatViewModelAttachment (vtable slot 223) when the
+    // attachment cache is built, and by UncorrectViewModelAttachment.
+    static constexpr int kFormatViewModelAttachment = 0xAFAB0; // beta 26234270
 
     // IClientRenderable (entity+4) vtable: LookupAttachment +0x90, GetAttachment
     // origin/angles +0x98. Ghidra TAU Fire02 path (FUN_10234330).
@@ -169,50 +214,52 @@ public:
     // client.dll CTauBeam first-person Fire02 particle path (FUN_10234330).
     // thiscall, 5 stack args, ret 0x14. Arg1 is six floats: start xyz + end xyz.
     // Unique bytes: 55 8B EC 83 EC 60 80 7D 14 00 8B 55 08 56 57 8B
-    static inline int kCTauBeam_ViewMuzzle() { return bmvr::abi::Beta() ? 0x227E40 : 0x234330; }
+    static inline int kCTauBeam_ViewMuzzle() { return bmvr::abi::Latest() ? 0x228090 : (bmvr::abi::Beta() ? 0x227E40 : 0x234330); } // beta 26234270 (25844216: 0x227E40)
 
     // client.dll CTauBeam impact glow (FUN_102346A0). ProgressBeam calls it as
     // (trace.endpos, trace.plane.normal, charge), not (beam start, beam end).
     // Unique bytes: 55 8B EC 83 EC 78 8B 45 08 0F 57 C9 56 57 8B 7D
-    static inline int kCTauBeam_WorldBeam() { return bmvr::abi::Beta() ? 0x2281B0 : 0x2346A0; }
+    static inline int kCTauBeam_WorldBeam() { return bmvr::abi::Latest() ? 0x228400 : (bmvr::abi::Beta() ? 0x2281B0 : 0x2346A0); } // beta 26234270 (25844216: 0x2281B0)
 
     // client.dll CTauBeam fire: AngleVectors(this+0x18) then TraceRay from
     // this+0xC (FUN_102348B0). thiscall, 0 stack args. Unique bytes:
     // 53 8B DC 83 EC 08 83 E4 F0 83 C4 04 55 8B 6B 04 89 6C 24 04 8B EC 81 EC EC 00 00 00
-    static inline int kCTauBeam_FireTrace() { return bmvr::abi::Beta() ? 0x2283C0 : 0x2348B0; }
+    static inline int kCTauBeam_FireTrace() { return bmvr::abi::Latest() ? 0x228610 : (bmvr::abi::Beta() ? 0x2283C0 : 0x2348B0); } // beta 26234270 (25844216: 0x2283C0)
 
     // client.dll C_Weapon_Gluon impact trace (FUN_1029D430). ShootPosition +
     // EyeAngles (+0x274), not GetShootAngles, so the glow sits on the HMD look.
     // thiscall, 2 stack args (player, CGameTrace*), ret 8. Unique bytes:
     // 53 8B DC 83 EC 08 83 E4 F0 83 C4 04 55 8B 6B 04 89 6C 24 04 8B EC 81 EC D8 00 00 00
-    static inline int kCWeaponGluon_ImpactTrace() { return bmvr::abi::Beta() ? 0x29B4F0 : 0x29D430; }
+    static inline int kCWeaponGluon_ImpactTrace() { return bmvr::abi::Latest() ? 0x29C750 : (bmvr::abi::Beta() ? 0x29B4F0 : 0x29D430); } // beta 26234270 (25844216: 0x29B4F0)
     // client.dll C_Weapon_Gluon first-person beam update (FUN_1029A7D0).
     // thiscall, 0 stack args. Calls impact trace then SetControlPoint(0, end)
     // and C_GluonBeamFx::SetBeam (FUN_1029C960). Unique bytes:
     // 55 8B EC 81 EC D0 00 00 00 A1 ? ? ? ? 33 C5 89 45 FC 56 57 8B F9
-    static inline int kCWeaponGluon_BeamUpdate() { return bmvr::abi::Beta() ? 0x29E010 : 0x29A7D0; }
+    static inline int kCWeaponGluon_BeamUpdate() { return bmvr::abi::Latest() ? 0x299AF0 : (bmvr::abi::Beta() ? 0x29E010 : 0x29A7D0); } // beta 26234270 (25844216: 0x298890)
     // client.dll C_GluonBeamFx::SetBeam (FUN_1029C960). thiscall, 4 stack args
     // (viewmodel, start, mid, end), ret 0x10. Unique bytes:
     // 55 8B EC 8B 45 0C 56 8B F1 C6 46 0C 01
-    static inline int kCGluonBeamFx_SetBeam() { return bmvr::abi::Beta() ? 0x2A01A0 : 0x29C960; }
+    static inline int kCGluonBeamFx_SetBeam() { return bmvr::abi::Latest() ? 0x29BC80 : (bmvr::abi::Beta() ? 0x2A01A0 : 0x29C960); } // beta 26234270 (25844216: 0x29AA20)
     // client.dll C_GluonBeamFx Draw (FUN_1029B290) on IClientRenderable.
     // Start at this+0xC, end at this+0x24. thiscall, 1 stack arg, ret 4.
     // Unique bytes: 53 8B DC 83 EC 08 83 E4 F0 83 C4 04 55 8B 6B 04 89 6C 24 04 8B EC 81 EC 68 05 00 00
-    static inline int kCGluonBeamFx_Draw() { return bmvr::abi::Beta() ? 0x29EAD0 : 0x29B290; }
+    static inline int kCGluonBeamFx_Draw() { return bmvr::abi::Latest() ? 0x29A5B0 : (bmvr::abi::Beta() ? 0x29EAD0 : 0x29B290); } // beta 26234270 (25844216: 0x299350)
     // client.dll CNewParticleEffect::SetControlPoint (FUN_101A5170).
     // thiscall, 2 stack args (index, Vector*), ret 8.
     // Unique bytes: 55 8B EC 53 8B 5D 0C 57 8B F9 83 BF 54 1B 00 00 FF
-    static inline int kParticleSetControlPoint() { return bmvr::abi::Beta() ? 0x1A55C0 : 0x1A5170; }
+    static inline int kParticleSetControlPoint() { return bmvr::abi::Latest() ? 0x197860 : (bmvr::abi::Beta() ? 0x1A55C0 : 0x1A5170); } // beta 26234270 (25844216: 0x1976E0)
     // client.dll CParticleMgr::AddEffect (FUN_1019D940). thiscall, 1 stack arg
     // (CNewParticleEffect*), ret 4. If def+0x200 (view model effect) is set,
     // it puts the effect in render group 0xB (viewmodel FOV). Unique bytes:
     // 55 8B EC 8B 41 4C 53 56 8B 75 08
-    static inline int kParticleMgr_AddEffect() { return bmvr::abi::Beta() ? 0x18FEB0 : 0x19D940; }
-    // client.dll CParticleSystemMgr singleton used as this for FUN_10313390.
-    static constexpr int kParticleSystemMgr = 0x5631CC;
-    static constexpr int kParticleSystemMgr_Find = 0x313390;
-    // Not re-verified on client build 25844216; the old RVAs are mid-function.
-    static bool kParticleSystemMgrVerified() { return !bmvr::abi::Beta(); }
+    static inline int kParticleMgr_AddEffect() { return bmvr::abi::Latest() ? 0x190030 : (bmvr::abi::Beta() ? 0x18FEB0 : 0x19D940); } // beta 26234270 (25844216: 0x18FEB0)
+    // Both from `mov ecx,[g_pParticleSystemMgr]; push name; call FindParticleSystem` before the
+    // "Attempted to create unknown particle system" warnings (3 sites agree). The old 0x5631CC/0x313390
+    // were stale since an earlier build (no refs / mid-function on 25844216).
+    static inline int kParticleSystemMgr() { return bmvr::abi::Latest() ? (0x56024C) : (0x5631CC); } // beta 26234270
+    static inline int kParticleSystemMgr_Find() { return bmvr::abi::Latest() ? (0x3101E0) : (0x313390); } // beta 26234270
+    // Re-verified on 26234270 (PatchGluonImpactParticleDefs also checks Find's prologue at runtime).
+    static inline bool kParticleSystemMgrVerified() { return !bmvr::abi::Beta(); }
     static constexpr int kCParticleDef_ViewModelEffect = 0x200;
     static constexpr int kCParticleDef_Name = 0x228;
     static constexpr int kCNewParticleEffect_Def = 0x58;
@@ -223,18 +270,25 @@ public:
     // client.dll gpGlobals (CGlobalVarsBase*). CHudAir FUN_10271c90 subtracts
     // curtime at +0xC from m_AirFinished. Same .data neighborhood as the leaf
     // system pointer.
-    static constexpr int kClientGpGlobalsPtr = 0x54FA04;
+    static inline int kClientGpGlobalsPtr() { return bmvr::abi::Latest() ? (0x550A04) : (0x54FA04); } // beta 26234270, 1195 refs (25844216: 0x54FA04)
     static constexpr int kCGlobalVars_curtime = 0xC;
     // DT_LocalPlayerExclusive (FUN_100b7240): m_nWaterLevel +0x180 (byte),
     // m_AirFinished +0x16e4 (float). WL_Eyes == 3 is fully underwater.
     static constexpr int kCBasePlayer_nWaterLevel = 0x180;
+    // client.dll C_BaseEntity prediction datamap m_MoveType (FIELD_CHARACTER),
+    // one byte; MOVETYPE_LADDER = 9.
+    static constexpr int kCBaseEntity_MoveType = 0x17C;
+    // client.dll DT_FuncLadder (HL2 func_useableladder): player mount points,
+    // relative to the ladder's origin (func_ladder.cpp Spawn subtracts it).
+    static constexpr int kCFuncLadder_MountTop = 0x6C0;
+    static constexpr int kCFuncLadder_MountBottom = 0x6CC;
     static constexpr int kCBasePlayer_AirFinished = 0x16e4;
 
     // client.dll C_Weapon_RPG laser update (FUN_10291F80). CHudCrosshair Paint
     // calls weapon vtable +0x5C4. Draws ISurface circles at ScreenWidth/2,
     // ScreenHeight/2 (HMD centre in VR). Extra red geometry if m_bLaserOn.
     // thiscall, 0 stack args.
-    static inline int kCWeaponRpg_UpdateLaser() { return bmvr::abi::Beta() ? 0x2957C0 : 0x291F80; }
+    static inline int kCWeaponRpg_UpdateLaser() { return bmvr::abi::Latest() ? 0x2912A0 : (bmvr::abi::Beta() ? 0x2957C0 : 0x291F80); } // beta 26234270 (25844216: 0x290040)
     // RecvTable DT_Weapon_RPG (FUN_10291d30): m_hHomingGrenade +0xAE0,
     // m_bNeedReload +0xAE4, m_bLaserOn +0xAE5. There is no m_hLaserDot netvar;
     // the visible mark is a separate CEnvLaserDot sprite (CSprite::DrawModel
@@ -244,29 +298,30 @@ public:
     static constexpr int kCWeaponRpg_bLaserOn = 0xAE5;
     // client.dll CHudCrosshair::Paint (FUN_10278460). Calls weapon vtable +0x5C4.
     // thiscall, 0 stack args. Unique bytes: 55 8B EC 51 53 56 8B 35 ? ? ? ? 8B D9
-    static inline int kCHudCrosshair_Paint() { return bmvr::abi::Beta() ? 0x27BCA0 : 0x278460; }
+    static inline int kCHudCrosshair_Paint() { return bmvr::abi::Latest() ? 0x276D30 : (bmvr::abi::Beta() ? 0x27BCA0 : 0x278460); } // beta 26234270 (25844216: 0x275E00)
     // DT_BaseEntity m_fEffects (FUN_100a4cb0). EF_NODRAW = 0x20.
     static constexpr int kCBaseEntity_fEffects = 0x80;
     static constexpr int kEF_NODRAW = 0x20;
     // client.dll C_SpriteRenderer::DrawSprite (FUN_100f6900). thiscall,
     // 15 stack args, ret 0x3C. ecx is the renderer at CSprite+0x69C.
     // Copies origin from arg3; CEnvLaserDot's origin is the look-trace.
-    static inline int kCSpriteRenderer_DrawSprite() { return bmvr::abi::Beta() ? 0xF6B60 : 0xF6900; }
+    static inline int kCSpriteRenderer_DrawSprite() { return bmvr::abi::Latest() ? 0xE8B80 : (bmvr::abi::Beta() ? 0xF6B60 : 0xF6900); } // beta 26234270 (25844216: 0xE8A00)
     // client.dll FUN_102dcbf0. stdcall 8 args, ret 0x20. Alternate sprite
     // draw: origin from IClientRenderable vtable+4, then FUN_100f6b40.
     // Unique bytes: 55 8B EC 83 EC 64 53 8B 5D 08 8B CB 56 8B 03 FF 50 04
-    static inline int kCSpriteRenderable_Draw() { return bmvr::abi::Beta() ? 0x2E0490 : 0x2DCBF0; }
+    static inline int kCSpriteRenderable_Draw() { return bmvr::abi::Latest() ? 0x2DBED0 : (bmvr::abi::Beta() ? 0x2E0490 : 0x2DCBF0); } // beta 26234270 (25844216: 0x2DAC70)
     // client.dll C_EnvLaserDot DrawModel override (FUN_10221fd0). thiscall,
     // 1 stack arg (studio flags), ret 4. Traces from attachment "laser" or
     // owner EyePosition/EyeAngles (+0x268/+0x26c), then FUN_100821a0.
-    // Unique bytes: 55 8B EC 83 EC A0 A1 ? ? ? ? 33 C5 89 45 FC F7 45 08 00 00 00 4E
-    static inline int kCEnvLaserDot_Draw() { return bmvr::abi::Beta() ? 0x215AE0 : 0x221FD0; }
+    // Unique bytes (beta 25844216; stable 19042901 had `83 EC A0` at 0x221FD0):
+    // 55 8B EC 81 EC A0 00 00 00 A1 ? ? ? ? 33 C5 89 45 FC F7 45 08 00 00 00 4E
+    static inline int kCEnvLaserDot_Draw() { return bmvr::abi::Latest() ? 0x215D30 : (bmvr::abi::Beta() ? 0x215AE0 : 0x221FD0); } // beta 26234270 (25844216: 0x215AE0)
     // client.dll camera-facing sprite quad (FUN_100821a0). cdecl, origin* +
     // width/height/color. Unique bytes: 53 8B DC 83 EC 08 83 E4 F0 83 C4 04 55 8B 6B 04
-    static inline int kSpriteQuad() { return bmvr::abi::Beta() ? 0x82400 : 0x821A0; }
+    static inline int kSpriteQuad() { return bmvr::abi::Latest() ? 0x74360 : (bmvr::abi::Beta() ? 0x82400 : 0x821A0); } // beta 26234270 (25844216: 0x742A0)
     // client.dll CViewRenderBeams::DrawBeam (FUN_101f5be0). thiscall, Beam_t*
     // on the stack, ret 4. Unique bytes: 55 8B EC 83 EC 2C A1 ? ? ? ? 33 C5 89 45 FC 89 4D E8
-    static inline int kCViewRenderBeams_DrawBeam() { return bmvr::abi::Beta() ? 0x1F6130 : 0x1F5BE0; }
+    static inline int kCViewRenderBeams_DrawBeam() { return bmvr::abi::Latest() ? 0x1E84A0 : (bmvr::abi::Beta() ? 0x1F6130 : 0x1F5BE0); } // beta 26234270 (25844216: 0x1E82B0)
     static constexpr int kBeam_t_type = 0x30;
     static constexpr int kBeam_t_start = 0x3C;
     static constexpr int kBeam_t_delta = 0xB4;
@@ -274,95 +329,116 @@ public:
 
     // IClientMode slot 32. Reads viewmodel_fov_override then weapon GetViewModelFOV
     // (~54). That is why console fov does not change gun/near scale in VR.
-    Offset GetViewModelFOV = bmvr::abi::Beta() ? Offset{ "client.dll", 0x209EF0,
+    Offset GetViewModelFOV = bmvr::abi::Latest() ? Offset{ "client.dll", 0x20A140,
+        "55 8B EC 51 8B 0D ? ? ? ? 81 F9 ? ? ? ? 75 16 F3 0F 10 0D" } : (bmvr::abi::Beta() ? Offset{ "client.dll", 0x209EF0,
         "55 8B EC 51 8B 0D ? ? ? ? 81 F9 ? ? ? ? 75 16 F3 0F 10 0D" } : Offset{ "client.dll", 0x216510,
-        "55 8B EC 51 8B 0D ? ? ? ? 81 F9 ? ? ? ? 75 16 F3 0F 10 0D" };
+        "55 8B EC 51 8B 0D ? ? ? ? 81 F9 ? ? ? ? 75 16 F3 0F 10 0D" });
 
-    Offset AdjustEngineViewport = bmvr::abi::Beta() ? Offset{ "client.dll", 0x1023c0,
+    Offset AdjustEngineViewport = bmvr::abi::Latest() ? Offset{ "client.dll", 0x102540,
+        "C2 10 00 CC CC CC CC CC CC CC CC CC CC CC CC CC B0 01 C2 08 00" } : (bmvr::abi::Beta() ? Offset{ "client.dll", 0x1023c0,
         "C2 10 00 CC CC CC CC CC CC CC CC CC CC CC CC CC B0 01 C2 08 00" } : Offset{ "client.dll", 0x1102C0,
-        "C2 10 00 CC CC CC CC CC CC CC CC CC CC CC CC CC B0 01 C2 08 00" };
+        "C2 10 00 CC CC CC CC CC CC CC CC CC CC CC CC CC B0 01 C2 08 00" });
 
-    Offset LevelInit = bmvr::abi::Beta() ? Offset{ "client.dll", 0x102b80,
+    Offset LevelInit = bmvr::abi::Latest() ? Offset{ "client.dll", 0x102D00,
+        "55 8B EC 83 EC 20 56 8B F1 6A 01 68 ? ? ? ?" } : (bmvr::abi::Beta() ? Offset{ "client.dll", 0x102b80,
         "55 8B EC 83 EC 20 56 8B F1 6A 01 68 ? ? ? ?" } : Offset{ "client.dll", 0x110A80,
-        "55 8B EC 83 EC 20 56 8B F1 6A 01 68 ? ? ? ?" };
+        "55 8B EC 83 EC 20 56 8B F1 6A 01 68 ? ? ? ?" });
 
-    Offset LevelShutdown = bmvr::abi::Beta() ? Offset{ "client.dll", 0x102c30,
+    Offset LevelShutdown = bmvr::abi::Latest() ? Offset{ "client.dll", 0x102DB0,
+        "55 8B EC 83 EC 20 56 8B F1 B9 ? ? ? ? E8" } : (bmvr::abi::Beta() ? Offset{ "client.dll", 0x102c30,
         "55 8B EC 83 EC 20 56 8B F1 B9 ? ? ? ? E8" } : Offset{ "client.dll", 0x110B30,
-        "55 8B EC 83 EC 20 56 8B F1 B9 ? ? ? ? E8" };
+        "55 8B EC 83 EC 20 56 8B F1 B9 ? ? ? ? E8" });
 
     // CModelRender::DrawModelExecute — IModelRender vtable slot 19 (+0x4C).
     // thiscall (state, ModelRenderInfo_t&, bones), ret 0xC. Ghidra FUN_10113e80.
     // Do NOT use 0xF6A20: that prologue matches DispInfo_LoadDisplacements'
     // cdecl 5-arg helper (FUN_100f6a20). Hooking it as DME hung load-to-menu
     // (2026-08-18). DrawModelEx (+0x40) calls Setup (+0x48) then this slot.
-    Offset DrawModelExecute = bmvr::abi::Beta() ? Offset{ "engine.dll", 0x114110,
+    Offset DrawModelExecute = bmvr::abi::Latest() ? Offset{ "engine.dll", 0x1141F0,
+        "55 8B EC 81 EC 68 03 00 00 A1 ? ? ? ? 33 C5 89 45 FC 8B 45 10 53 8B 5D 0C" } : (bmvr::abi::Beta() ? Offset{ "engine.dll", 0x114110,
         "55 8B EC 81 EC 68 03 00 00 A1 ? ? ? ? 33 C5 89 45 FC 8B 45 10 53 8B 5D 0C" } : Offset{ "engine.dll", 0x113E80,
-        "55 8B EC 81 EC 68 03 00 00 A1 ? ? ? ? 33 C5 89 45 FC 8B 45 10 53 8B 5D 0C" };
+        "55 8B EC 81 EC 68 03 00 00 A1 ? ? ? ? 33 C5 89 45 FC 8B 45 10 53 8B 5D 0C" });
 
     // engine.dll FindNearest lightcache (LRU walk, sentinel 0x200).
     // mat_queue_mode 2 + GetLightForPoint/studio lighting can cycle +0x1D0
     // next pointers; the engine walk never hits 0x200 and freezes the game
     // thread (verified 2026-09-08, PID 25228, 12-node cycle).
-    Offset LightcacheFindNearest = bmvr::abi::Beta() ? Offset{ "engine.dll", 0x1d1a70,
+    Offset LightcacheFindNearest = bmvr::abi::Latest() ? Offset{ "engine.dll", 0x1D1B50,
+        "55 8B EC 83 EC 1C 0F B7 0D ? ? ? ? 33 D2 53 56 BB 00 02 00 00" } : (bmvr::abi::Beta() ? Offset{ "engine.dll", 0x1d1a70,
         "55 8B EC 83 EC 1C 0F B7 0D ? ? ? ? 33 D2 53 56 BB 00 02 00 00" } : Offset{ "engine.dll", 0x1D0E20,
-        "55 8B EC 83 EC 1C 0F B7 0D ? ? ? ? 33 D2 53 56 BB 00 02 00 00" };
+        "55 8B EC 83 EC 1C 0F B7 0D ? ? ? ? 33 D2 53 56 BB 00 02 00 00" });
 
-    Offset VGui_Paint = bmvr::abi::Beta() ? Offset{ "engine.dll", 0x23ac00,
+    Offset VGui_Paint = bmvr::abi::Latest() ? Offset{ "engine.dll", 0x23AD00,
+        "55 8B EC 83 EC 18 53 8B D9 8B 0D ? ? ? ? FF 15" } : (bmvr::abi::Beta() ? Offset{ "engine.dll", 0x23ac00,
         "55 8B EC 83 EC 18 53 8B D9 8B 0D ? ? ? ? FF 15" } : Offset{ "engine.dll", 0x238C50,
-        "55 8B EC 83 EC 18 53 8B D9 8B 0D ? ? ? ? FF 15" };
+        "55 8B EC 83 EC 18 53 8B D9 8B 0D ? ? ? ? FF 15" });
 
     // CMatRenderContext slot 7. RT-stack count moved 0x4C -> 0x58 on the beta.
-    Offset GetRenderTarget = bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x69BB0,
+    Offset GetRenderTarget = bmvr::abi::Latest() ? Offset{ "materialsystem.dll", 0x69BB0,
+        "83 79 58 00 7E 0E 8B 41 58 8D 14 C0" } : (bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x69BB0,
         "83 79 58 00 7E 0E 8B 41 58 8D 14 C0" } : Offset{ "materialsystem.dll", 0x68820,
-        "83 79 4C 00 7E 0E 8B 41 4C 8D 14 C0" };
+        "83 79 4C 00 7E 0E 8B 41 4C 8D 14 C0" });
     // CMatRenderContext::GetRenderTargetDimensions (vtable +0x20 after GetRT).
     // CLensflare WorldToScreen uses this as pixel size; GetViewport (+0x9C) is
     // the mesh NDC divisor. HWND 16:9 vs square eye parks flares off the lights.
     // Hardware slot 8. Stack base moved 0x40 -> 0x4C along with the count.
-    Offset GetRenderTargetDimensions = bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x69BD0,
+    Offset GetRenderTargetDimensions = bmvr::abi::Latest() ? Offset{ "materialsystem.dll", 0x69BD0,
+        "55 8B EC 8B 41 58 56 8D 14 C0 8B 41 4C 8B 74 90 DC 85 F6 74 1D" } : (bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x69BD0,
         "55 8B EC 8B 41 58 56 8D 14 C0 8B 41 4C 8B 74 90 DC 85 F6 74 1D" } : Offset{ "materialsystem.dll", 0x68840,
-        "55 8B EC 8B 41 4C 56 8D 14 C0 8B 41 40 8B 74 90 DC 85 F6 74 1D" };
+        "55 8B EC 8B 41 4C 56 8D 14 C0 8B 41 40 8B 74 90 DC 85 F6 74 1D" });
     // Same body as the queued context on this beta (one copy). Optional.
-    Offset GetRenderTargetDimensionsBase = bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x65460,
+    Offset GetRenderTargetDimensionsBase = bmvr::abi::Latest() ? Offset{ "materialsystem.dll", 0x65460,
+        "55 8B EC 56 8B F1 57 83 7E 58 00 74 2F 8B 46 58 8D 14 C0 8B 46 4C 8B 7C 90 DC",
+        0, true } : (bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x65460,
         "55 8B EC 56 8B F1 57 83 7E 58 00 74 2F 8B 46 58 8D 14 C0 8B 46 4C 8B 7C 90 DC",
         0, true } : Offset{ "materialsystem.dll", 0x64180,
         "55 8B EC 56 8B F1 57 83 7E 4C 00 74 2F 8B 46 4C 8D 14 C0 8B 46 40 8B 7C 90 DC",
-        0, true };
+        0, true });
     // CMatQueuedRenderContext slot 8. The old `ret 8` stub is gone; this
     // reads the RT stack (count at +0x58) the way the hardware context does.
-    Offset GetRenderTargetDimensionsQueued = bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x65460,
+    Offset GetRenderTargetDimensionsQueued = bmvr::abi::Latest() ? Offset{ "materialsystem.dll", 0x65460,
+        "55 8B EC 56 8B F1 57 83 7E 58 00 74 2F 8B 46 58 8D 14 C0 8B 46 4C 8B 7C 90 DC",
+        0, true } : (bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x65460,
         "55 8B EC 56 8B F1 57 83 7E 58 00 74 2F 8B 46 58 8D 14 C0 8B 46 4C 8B 7C 90 DC",
         0, true } : Offset{ "materialsystem.dll", 0x5F890,
         "C2 08 00 CC CC CC CC CC CC CC CC CC CC CC CC CC CC 55 8B EC 8B 45 08 C7 00 00 00 00 00",
-        0, true };
-    Offset GetViewport = bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x69DF0,
+        0, true });
+    Offset GetViewport = bmvr::abi::Latest() ? Offset{ "materialsystem.dll", 0x69DF0,
+        "55 8B EC 8B 41 58 56 8D 14 C0 8B 41 4C 83 7C 90 F8 00" } : (bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x69DF0,
         "55 8B EC 8B 41 58 56 8D 14 C0 8B 41 4C 83 7C 90 F8 00" } : Offset{ "materialsystem.dll", 0x68A70,
-        "55 8B EC 8B 41 4C 56 8D 14 C0 8B 41 40 83 7C 90 F8 00" };
+        "55 8B EC 8B 41 4C 56 8D 14 C0 8B 41 40 83 7C 90 F8 00" });
     // Queued GetViewport (slot 39). Hardware 0x69DF0 is a different function.
-    Offset GetViewportQueued = bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x654E0,
+    Offset GetViewportQueued = bmvr::abi::Latest() ? Offset{ "materialsystem.dll", 0x654E0,
+        "55 8B EC 56 57 8B F9 8B 47 58 8D 14 C0 8B 47 4C 83 7C 90 F8 00 8D 34 90 7C 2C",
+        0, true } : (bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x654E0,
         "55 8B EC 56 57 8B F9 8B 47 58 8D 14 C0 8B 47 4C 83 7C 90 F8 00 8D 34 90 7C 2C",
         0, true } : Offset{ "materialsystem.dll", 0x5F8C0,
         "55 8B EC 56 57 8B F9 8B 47 4C 8D 14 C0 8B 47 40 83 7C 90 F8 00 8D 34 90 7C 2C",
-        0, true };
-    Offset Viewport = bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x6B2B0,
+        0, true });
+    Offset Viewport = bmvr::abi::Latest() ? Offset{ "materialsystem.dll", 0x6B2B0,
+        "55 8B EC 56 FF 75 14 8B F1 FF 75 10 FF 75 0C FF 75 08 E8" } : (bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x6B2B0,
         "55 8B EC 56 FF 75 14 8B F1 FF 75 10 FF 75 0C FF 75 08 E8" } : Offset{ "materialsystem.dll", 0x69F30,
-        "55 8B EC 56 FF 75 14 8B F1 FF 75 10 FF 75 0C FF 75 08 E8" };
-    Offset PushRenderTargetAndViewport = bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x6B750,
+        "55 8B EC 56 FF 75 14 8B F1 FF 75 10 FF 75 0C FF 75 08 E8" });
+    Offset PushRenderTargetAndViewport = bmvr::abi::Latest() ? Offset{ "materialsystem.dll", 0x6B750,
+        "55 8B EC 83 EC 24 8B 45 08 89 45 DC 8B 45 0C 89 45 EC" } : (bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x6B750,
         "55 8B EC 83 EC 24 8B 45 08 89 45 DC 8B 45 0C 89 45 EC" } : Offset{ "materialsystem.dll", 0x6A3D0,
-        "55 8B EC 83 EC 24 8B 45 08 89 45 DC 8B 45 0C 89 45 EC" };
-    Offset PopRenderTargetAndViewport = bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x6B5D0,
+        "55 8B EC 83 EC 24 8B 45 08 89 45 DC 8B 45 0C 89 45 EC" });
+    Offset PopRenderTargetAndViewport = bmvr::abi::Latest() ? Offset{ "materialsystem.dll", 0x6B5D0,
+        "56 8B F1 83 7E 58 00 74 15 8B 06 6A 00 FF 50 10 FF 4E 58" } : (bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x6B5D0,
         "56 8B F1 83 7E 58 00 74 15 8B 06 6A 00 FF 50 10 FF 4E 58" } : Offset{ "materialsystem.dll", 0x6A250,
-        "56 8B F1 83 7E 4C 00 74 15 8B 06 6A 00 FF 50 10 FF 4E 4C" };
+        "56 8B F1 83 7E 4C 00 74 15 8B 06 6A 00 FF 50 10 FF 4E 4C" });
     // Hardware CMatRenderContext vtable: DrawScreenSpaceRectangle is two
     // slots before the 6-arg PushRT (0x6A3D0). Wrapper ret 0x38. Fire/glass/
     // AMS overlays pass dest 2560x1440 onto the 3168 G-buffer (bm_c1a1d).
-    Offset DrawScreenSpaceRectangle = bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x69120,
+    Offset DrawScreenSpaceRectangle = bmvr::abi::Latest() ? Offset{ "materialsystem.dll", 0x69120,
+        "55 8B EC 8B 4D 08 8B 01 FF 90 7C 01 00 00 D9 EE" } : (bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x69120,
         "55 8B EC 8B 4D 08 8B 01 FF 90 7C 01 00 00 D9 EE" } : Offset{ "materialsystem.dll", 0x67DC0,
-        "55 8B EC 8B 4D 08 8B 01 FF 90 7C 01 00 00 D9 EE" };
+        "55 8B EC 8B 4D 08 8B 01 FF 90 7C 01 00 00 D9 EE" });
     // CopyRenderTargetToTextureEx — UpdateRefractTexture / POT FB blit.
-    Offset CopyRenderTargetToTextureEx = bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x687A0,
+    Offset CopyRenderTargetToTextureEx = bmvr::abi::Latest() ? Offset{ "materialsystem.dll", 0x687A0,
+        "55 8B EC 53 8B 5D 14 56 8B 75 08 57 8B 7D 10 85 F6" } : (bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x687A0,
         "55 8B EC 53 8B 5D 14 56 8B 75 08 57 8B 7D 10 85 F6" } : Offset{ "materialsystem.dll", 0x67440,
-        "55 8B EC 53 8B 5D 14 56 8B 75 08 57 8B 7D 10 85 F6" };
+        "55 8B EC 53 8B 5D 14 56 8B 75 08 57 8B 7D 10 85 F6" });
 
     // Ghidra on Steam client.dll CBlackMesaViewRender_RenderView (0x20EE40):
     // IMaterialSystem +0x19C = GetRenderContext (AddRef'd). Context then:
@@ -383,6 +459,9 @@ public:
     // Z test. Same slot as L4D2VR sdk.h. Hardware and queued vtables both
     // implement it; hook from TryHookMatContextQueries like GetViewport.
     static constexpr int kIMatRenderContext_DepthRange = 0x2C;
+    // IMatRenderContext::Bind(IMaterial*, void* proxyData): slot 9, between
+    // GetRenderTargetDimensions (8) and BindLightmapPage (10).
+    static constexpr int kIMatRenderContext_Bind = 0x24;
     static constexpr int kIMatRenderContext_GetViewport = 0x9C;
     static constexpr int kIMatRenderContext_PushRT6 = 0x23C;
     static constexpr int kIMatRenderContext_PopRT = 0x24C;
@@ -395,32 +474,37 @@ public:
     // CMatRenderContext slot 186 returns 0. Old slot 185 now writes
     // [ecx+0x208] = 0, so probing it corrupts the context.
     static constexpr int kIMatRenderContext_GetCallQueueSlotSource = 146;
-    static inline int kIMatRenderContext_GetCallQueueSlotBmShift() { return bmvr::abi::Beta() ? 186 : 185; }
+    static inline int kIMatRenderContext_GetCallQueueSlotBmShift() { return bmvr::abi::Latest() ? 186 : (bmvr::abi::Beta() ? 186 : 185); }
 
     // IMaterialSystem vtable is shifted vs L4D2 (GetBackBufferFormat returned a
     // pointer). Call these by RVA. BeginRT no-ops after startup unless
     // isGameRunning. public-beta moved this field +0x24 (was 0x2AA4).
-    static inline int kCMaterialSystem_isGameRunning() { return bmvr::abi::Beta() ? 0x2AC8 : 0x2AA4; }
-    Offset BeginRTAlloc = bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x48810,
+    static inline int kCMaterialSystem_isGameRunning() { return bmvr::abi::Latest() ? 0x2AC8 : (bmvr::abi::Beta() ? 0x2AC8 : 0x2AA4); }
+    Offset BeginRTAlloc = bmvr::abi::Latest() ? Offset{ "materialsystem.dll", 0x48810,
+        "56 8B F1 80 BE C8 2A 00 00 00 74 10" } : (bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x48810,
         "56 8B F1 80 BE C8 2A 00 00 00 74 10" } : Offset{ "materialsystem.dll", 0x48450,
-        "56 8B F1 80 BE A4 2A 00 00 00 74 10" };
-    Offset EndRTAlloc = bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x4B150,
+        "56 8B F1 80 BE A4 2A 00 00 00 74 10" });
+    Offset EndRTAlloc = bmvr::abi::Latest() ? Offset{ "materialsystem.dll", 0x4B150,
+        "80 B9 C8 2A 00 00 00 75 62" } : (bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x4B150,
         "80 B9 C8 2A 00 00 00 75 62" } : Offset{ "materialsystem.dll", 0x4AD80,
-        "80 B9 A4 2A 00 00 00 75 62" };
+        "80 B9 A4 2A 00 00 00 75 62" });
     // Real CreateNamedRenderTargetTextureEx. Distinct from Ex2, which ends
     // the shared prologue with `mov eax,[ecx]`. Lock flag is this+0x2AC4.
-    Offset CreateNamedRTEx = bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x49A30,
+    Offset CreateNamedRTEx = bmvr::abi::Latest() ? Offset{ "materialsystem.dll", 0x49A30,
+        "55 8B EC 83 B9 C4 2A 00 00 00 75 14 68 ? ? ? ? FF 15 ? ? ? ? 83 C4 04 33 C0 5D C2 20 00 8B 0D" } : (bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x49A30,
         "55 8B EC 83 B9 C4 2A 00 00 00 75 14 68 ? ? ? ? FF 15 ? ? ? ? 83 C4 04 33 C0 5D C2 20 00 8B 0D" } : Offset{ "materialsystem.dll", 0x49660,
-        "55 8B EC 83 B9 A0 2A 00 00 00 75 14 68 ? ? ? ? FF 15 ? ? ? ? 83 C4 04 33 C0 5D C2 20 00 8B 0D" };
+        "55 8B EC 83 B9 A0 2A 00 00 00 75 14 68 ? ? ? ? FF 15 ? ? ? ? 83 C4 04 33 C0 5D C2 20 00 8B 0D" });
     // CreateNamedRenderTargetTextureEx2 (Begin+Ex+End). Same args as Ex.
-    Offset CreateNamedRTEx2 = bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x499D0,
+    Offset CreateNamedRTEx2 = bmvr::abi::Latest() ? Offset{ "materialsystem.dll", 0x499D0,
+        "55 8B EC 83 B9 C4 2A 00 00 00 75 14 68 ? ? ? ? FF 15 ? ? ? ? 83 C4 04 33 C0 5D C2 20 00 8B 01" } : (bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x499D0,
         "55 8B EC 83 B9 C4 2A 00 00 00 75 14 68 ? ? ? ? FF 15 ? ? ? ? 83 C4 04 33 C0 5D C2 20 00 8B 01" } : Offset{ "materialsystem.dll", 0x49600,
-        "55 8B EC 83 B9 A0 2A 00 00 00 75 14 68 ? ? ? ? FF 15 ? ? ? ? 83 C4 04 33 C0 5D C2 20 00 8B 01" };
+        "55 8B EC 83 B9 A0 2A 00 00 00 75 14 68 ? ? ? ? FF 15 ? ? ? ? 83 C4 04 33 C0 5D C2 20 00 8B 01" });
     // CMaterialSystem vtable slot 30 (+0x78). Thunk: g_pShaderAPI +0x458.
     // Slot 31 (+0x7C) is NOT GetBackBufferFormat on BM (returns a pointer).
-    Offset GetBackBufferDimensions = bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x53EF0,
+    Offset GetBackBufferDimensions = bmvr::abi::Latest() ? Offset{ "materialsystem.dll", 0x53EF0,
+        "55 8B EC 8B 0D ? ? ? ? 8B 01 8B 80 58 04 00 00 5D FF E0" } : (bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x53EF0,
         "55 8B EC 8B 0D ? ? ? ? 8B 01 8B 80 58 04 00 00 5D FF E0" } : Offset{ "materialsystem.dll", 0x52d20,
-        "55 8B EC 8B 0D ? ? ? ? 8B 01 8B 80 58 04 00 00 5D FF E0" };
+        "55 8B EC 8B 0D ? ? ? ? 8B 01 8B 80 58 04 00 00 5D FF E0" });
     // IVEngineClient slot 1 = GetLightForPoint (Vector by value, bClamp).
     // Same early-vtable layout as Source SDK 2013; slot 5/7 already match BM.
     static constexpr int kIEngineClient_GetLightForPoint = 1;
@@ -428,24 +512,94 @@ public:
     // After load, Source Reset(2560) while we keep a 1576 swapchain left this
     // at 2560 and HUD downsample (client FUN_10267420) used CViewSetup
     // width/height against _rt_Hud created from GetBackBufferDimensions.
-    Offset GetScreenSize = bmvr::abi::Beta() ? Offset{ "engine.dll", 0xA6CF0,
+    Offset GetScreenSize = bmvr::abi::Latest() ? Offset{ "engine.dll", 0xA6D30,
+        "55 8B EC 8B 0D ? ? ? ? 56 8B 01 FF 90 9C 01 00 00" } : (bmvr::abi::Beta() ? Offset{ "engine.dll", 0xA6CF0,
         "55 8B EC 8B 0D ? ? ? ? 56 8B 01 FF 90 9C 01 00 00" } : Offset{ "engine.dll", 0xA6BD0,
-        "55 8B EC 8B 0D ? ? ? ? 56 8B 01 FF 90 9C 01 00 00" };
+        "55 8B EC 8B 0D ? ? ? ? 56 8B 01 FF 90 9C 01 00 00" });
     // IVEngineClient slot 96 (+0x180). client.dll DrawViewModels (FUN_1020a8f0)
     // copies CViewSetup, then overwrites m_flAspectRatio with this (window
     // 16:9) before Push3DView. GetScreenSize is a different function and is
     // not on this path — the primary return is a videomode/config float.
-    Offset GetScreenAspectRatio = bmvr::abi::Beta() ? Offset{ "engine.dll", 0x101490,
+    Offset GetScreenAspectRatio = bmvr::abi::Latest() ? Offset{ "engine.dll", 0x101560,
+        "55 8B EC 8B 0D ? ? ? ? 83 EC 0C 81 F9 ? ? ? ? 75 16 F3 0F 10 0D" } : (bmvr::abi::Beta() ? Offset{ "engine.dll", 0x101490,
         "55 8B EC 8B 0D ? ? ? ? 83 EC 0C 81 F9 ? ? ? ? 75 16 F3 0F 10 0D" } : Offset{ "engine.dll", 0x1012D0,
-        "55 8B EC 8B 0D ? ? ? ? 83 EC 0C 81 F9 ? ? ? ? 75 16 F3 0F 10 0D" };
+        "55 8B EC 8B 0D ? ? ? ? 83 EC 0C 81 F9 ? ? ? ? 75 16 F3 0F 10 0D" });
 
-    Offset ProcessUsercmds = bmvr::abi::Beta() ? Offset{ "server.dll", 0x532AC0,
+    // CViewSetup::ComputeViewMatrices(worldToView, viewToProjection,
+    // worldToProjection), thiscall, ret 0xC. Honours m_bOffCenter (0xEC).
+    // The areaportal view setup calls it on its private view copy (beta
+    // 25844216: global engine+0x3F7820, return engine+0x139663; stable
+    // 19042901: 0x3F5820 / 0x138DF3); it pairs
+    // the result with a centred +-tan(fov/2) window.
+    Offset ComputeViewMatrices{ "engine.dll", 0x100B40,
+        "55 8B EC 51 56 8B F1 57 F3 0F 10 86 E8 00 00 00 0F 2E 05", 0, true };
+    // CNewRenderer::UpdatePerCamera(?, CViewSetup* view, bool secondary, ?),
+    // thiscall on the global renderer, ret 0x10: per-view deferred-light
+    // update (frustum from the view's ComputeViewMatrices). Diagnostic hook
+    // only (logs while a pass trace runs). Beta 26234270.
+    Offset NewRendererUpdatePerCamera{ "client.dll", 0x1870D0,
+        "55 8B EC 81 EC D4 01 00 00 A1 ? ? ? ? 33 C5 89 45 FC 53 8B 5D 0C 56 8B F1", 0, true };
+    // Client UpdatePVSNotifiers (no args): marks client-side PVS notifiers
+    // (ragdolls, client props) seen when the renderable is in the current
+    // view's PVS. BuildWorldRenderLists calls it per view; FRAME_RENDER_END
+    // treats unmarked notifiers as having left the PVS. Beta 26234270.
+    Offset ClientUpdatePvsNotifiers{ "client.dll", 0xF3F80,
+        "53 8B 1D ? ? ? ? 0F B7 83 7C 00 03 00 3D FF FF 00 00 74 ? 56 57 EB", 0, true };
+    // Client FRAME_RENDER_END PVS check (no args): a notifier marked in-PVS
+    // but not seen since the last check gets OnPVSStatusChanged(false)
+    // (client ragdolls/props drop their projected shadow). Beta 26234270.
+    Offset ClientPvsNotifierCheck{ "client.dll", 0xF4020,
+        "55 8B EC 51 56 8B 35 ? ? ? ? 8B CE 8B 06 FF 50 70 8B 0D ? ? ? ? 89 4D FC 0F B7 81 7C 00 03 00", 0, true };
+    // Black Mesa's COcclusionTracker::BeginView(short viewId, int, const float* plane, bool),
+    // thiscall on the global tracker (client+0x6E6780), ret 0x10. The tracker keys its GPU
+    // occlusion results by (viewId, object), so both stereo eyes (same main view id) shared
+    // one result per object, queried against the first eye's depth. Beta 26234270.
+    Offset OcclusionTrackerBeginView{ "client.dll", 0x253E50,
+        "55 8B EC 56 8B F1 80 7E 04 00 74 ? A1 ? ? ? ? B9 ? ? ? ? FF 50 2C 85 C0 74 ? 8A 45 14 88 46 06 66 8B 45 08 66 89 46", 0, true };
+    // COcclusionSystem::SetView(const Vector* origin, float fov, const VMatrix* worldToView,
+    // const VMatrix* viewToProjection, const VPlane* nearPlane), vtable slot 1, thiscall,
+    // ret 0x14. Called by CRender::Push3DView / PopView; the occluder edge list is rebuilt
+    // lazily at the next IsOccluded. Beta 26234270.
+    Offset OccluderSetView{ "engine.dll", 0x130C70,
+        "55 8B EC 51 56 8B 75 10 8B C1 57 8B 7D 08 56 8D 48 48 89 45 FC D9 07 D9 98 98 00 00 00", 0, true };
+    // COcclusionSystem::IsOccluded(const Vector& mins, const Vector& maxs), vtable slot 2, thiscall,
+    // ret 0x8. Diagnostic hook only (trace frames). Beta 26234270.
+    Offset OccluderIsOccluded{ "engine.dll", 0x12F1C0,
+        "55 8B EC 81 EC E4 01 00 00 A1 ? ? ? ? 33 C5 89 45 FC 57 8B F9 8B 0D ? ? ? ? 89 BD 54 FE FF FF 81 F9", 0, true };
+    static constexpr uint32_t kAreaPortalComputeViewReturnRva = 0x139743; // beta 26234270 (25844216: 0x139663)
+    // client CurrentViewID() and the pixel-visibility code's calls to it (E8 rel32):
+    // CPixelVisibilitySystem::GetFractionVisible 0xD48B0 (view check + find/create
+    // the query for the view) and EndView 0xD41F0 (issue that view's queries).
+    // The debug-spew calls in the same code are left alone. Beta 26234270.
+    static constexpr uint32_t kClientCurrentViewIdRva = 0x1F6A00;
+    static constexpr uint32_t kPixelVisViewIdCallRvas[] = { 0xD48D4, 0xD48F6, 0xD4215, 0xD42EB, 0xD43EA };
+    // `cmp eax, 1` (83 F8 01) on framecount - issued frame: DeleteUnusedQueries 0xD4080
+    // (per query) and the per-set check in EndScene 0xD4110. The immediate becomes
+    // kPixelVisQueryGraceFrames. Beta 26234270.
+    static constexpr uint32_t kPixelVisQueryAgeCmpRva = 0xD40D1;
+    static constexpr uint32_t kPixelVisSetAgeCmpRva = 0xD416B;
+    static constexpr unsigned char kPixelVisQueryGraceFrames = 8;
+    // CPixelVisibilityQuery::GetFractionVisible(float fadeTimeInv): thiscall on the
+    // query, returns brightness * on-screen fraction in ST0, ret 4. Beta 26234270.
+    static constexpr uint32_t kPixelVisQueryFractionRva = 0xD4650;
+    // Save thumbnail writer (CViewRender, vtable +0x5C): (name, w, h, pow2, vtf),
+    // ret 0x14. Deferred unless the byte kSaveShotNowRva is set (end of
+    // CViewRender::Render 0x1E50A0); then it box-scales the current RT into a TGA.
+    static constexpr uint32_t kSaveShotWriterRva = 0x1E6350;
+    static constexpr uint32_t kSaveShotNowRva = 0x6C5BA4;
+    // Headless diagnostic only (BMVR_PIXELVIS_STATS): CPixelVisibilitySystem
+    // GetFractionVisible 0xD48B0 and find-or-create query for a view 0xD4560.
+    static constexpr uint32_t kPixelVisGetFractionRva = 0xD48B0;
+    static constexpr uint32_t kPixelVisQueryForViewRva = 0xD4560;
+
+    Offset ProcessUsercmds = bmvr::abi::Latest() ? Offset{ "server.dll", 0x532D40,
+        "55 8B EC B8 ? ? ? ? E8 ? ? ? ? A1 ? ? ? ? 33 C5 89 45 FC 8B 45 0C 8B 55 08", 0, true } : (bmvr::abi::Beta() ? Offset{ "server.dll", 0x532AC0,
         "55 8B EC B8 ? ? ? ? E8 ? ? ? ? A1 ? ? ? ? 33 C5 89 45 FC 8B 45 0C 8B 55 08", 0, true } : Offset{ "server.dll", 0x5320F0,
-        "55 8B EC B8 ? ? ? ? E8 ? ? ? ? A1 ? ? ? ? 33 C5 89 45 FC 8B 45 0C 8B 55 08", 0, true };
+        "55 8B EC B8 ? ? ? ? E8 ? ? ? ? A1 ? ? ? ? 33 C5 89 45 FC 8B 45 0C 8B 55 08", 0, true });
 
     // CBasePlayer::ImpulseCommands. Ghidra server.dll FUN_1022dd40.
     // Hooked lazily once server.dll is loaded (not at Offset() time).
-    static constexpr int kCBasePlayer_ImpulseCommands = 0x22DD40;
+    static inline int kCBasePlayer_ImpulseCommands() { return bmvr::abi::Latest() ? (0x22E420) : (0x22DD40); } // betas 25844216 + 26234270 (0x22DD40 was mid-function since an earlier build)
 
     // L4D2 IMaterialSystem dump slots. BM is +7 (FindTexture 77→84,
     // GetRenderContext 96→103). Runtime ResolveMaterialThreadSlots confirms
@@ -459,14 +613,29 @@ public:
 
     // IMaterialSystem vtable (Ghidra materialsystem.dll, GetRenderContext slot 103).
     static constexpr int kIMaterialSystem_FindTextureVt = 84; // +0x150
-    // Dump slot 71 + 7 (same shift as FindTexture 77→84 / GetRenderContext 96→103).
-    static constexpr int kIMaterialSystem_FindMaterialVt = 78; // +0x138
-    // FindMaterial 78, then First/Next/Invalid/Get/GetNum, FindTexture 84.
-    // No IsMaterialLoaded between FindMaterial and FirstMaterial (not dedicated).
-    static constexpr int kIMaterialSystem_FirstMaterialVt = 79;
-    static constexpr int kIMaterialSystem_NextMaterialVt = 80;
-    static constexpr int kIMaterialSystem_InvalidMaterialVt = 81;
-    static constexpr int kIMaterialSystem_GetMaterialVt = 82;
+    // CMaterialSystem vtable via RTTI (26234270, 2026-11-02): 77 FindMaterial
+    // (4 args), 78 FirstMaterial, 79 NextMaterial(h), 80 InvalidMaterial
+    // (0xffff), 81 GetMaterial(h), 82 GetNumMaterials, 83 is a one-argument
+    // setter (calling it as GetNumMaterials crashed the map load).
+    static inline int kIMaterialSystem_FindMaterialVt() { return bmvr::abi::Latest() ? (77) : (78); }
+    static inline int kIMaterialSystem_FirstMaterialVt() { return bmvr::abi::Latest() ? (78) : (79); }
+    static inline int kIMaterialSystem_NextMaterialVt() { return bmvr::abi::Latest() ? (79) : (80); }
+    static inline int kIMaterialSystem_InvalidMaterialVt() { return bmvr::abi::Latest() ? (80) : (81); }
+    static inline int kIMaterialSystem_GetMaterialVt() { return bmvr::abi::Latest() ? (81) : (82); }
+    static constexpr int kIMaterialSystem_GetNumMaterialsVt = 82;
+    // CMaterial vtable via RTTI (26234270): 29 AlphaModulate, 30 ColorModulate,
+    // 31 SetMaterialVarFlag(flag, on), 32 GetMaterialVarFlag. Two slots past
+    // sdk.h's IMaterial (its SetMaterialVarFlag lands on AlphaModulate).
+    static constexpr int kIMaterial_SetMaterialVarFlagVt = 31;
+    // CMaterial 11 = FindVar(name, bool* found, bool complain) (precaches the
+    // vars, scans m_pShaderParams by symbol). CMaterialVar (RTTI, 26234270):
+    // SetVecValue overloads in reverse order, 10 (x,y,z,w), 11 (x,y,z),
+    // 12 (x,y), 13 (const float*, int). m_VecVal at +0xC, type nibble at
+    // +0x1C (2 = vector).
+    static constexpr int kIMaterial_FindVarVt = 11;
+    static constexpr int kIMaterialVar_SetVecValue3Vt = 11;
+    static constexpr int kIMaterialVar_VecValOffset = 0xC;
+    static constexpr int kIMaterialVar_TypeOffset = 0x1C;
     static constexpr int kIMaterialSystem_SetRTFBOverrideVt = 142; // +0x238
     static constexpr int kIMaterialSystem_GetRTFBDimensionsVt = 143; // +0x23C
 
@@ -482,7 +651,21 @@ public:
     // Pushes the string "CClientShadowMgr::UpdateFlashlightState".
     // client.dll build 25844216 (2026-10-10). 0x11BD80 is mid-function and
     // the detour AVs at client+0x11B6A4 on startup (exit code 1).
-    static inline int kUpdateFlashlightState() { return bmvr::abi::Beta() ? 0x10DC20 : 0x11BB20; }
+    static inline int kUpdateFlashlightState() { return bmvr::abi::Latest() ? 0x10DDA0 : (bmvr::abi::Beta() ? 0x10DC20 : 0x11BB20); } // beta 26234270 (25844216: 0x10DC20)
+    // Black Mesa's own deferred flashlight never goes through the one above.
+    // The player's flashlight think (client 0xAE9F0) calls this with
+    // (pos = EyePosition, player, fwd/right/up = EyeVectors) on the global
+    // light at 0x105E24A0 (ret 0x14); it adds fwd*gb_flashlight_PosX +
+    // right*PosY + up*PosZ (5, -10, 0) and traces back from the eye.
+    static constexpr int kBmFlashlightUpdate = 0x17BAF0; // beta 26234270
+    // Fog colour blending (env_fog_controller fogblend 1) lerps between the
+    // two fog colours by C_BasePlayer::EyeVectors (client 0x6C540, thiscall,
+    // ret 0xC) = the usercmd angles, which in VR are the gun or Use-hand aim.
+    // E8 call sites inside GetFogColor (0x1FF8A0) and GetSkyboxFogColor
+    // (0x2001C0), both preceded by `mov ecx, reg; push eax`.
+    static constexpr int kEyeVectors = 0x6C540; // beta 26234270
+    static constexpr int kFogColorEyeVectorsCall = 0x1FF9B0; // beta 26234270
+    static constexpr int kSkyFogColorEyeVectorsCall = 0x200266; // beta 26234270
 
     // L4D2 leftover referenced by copied sdk.h melee helpers. Unused on Black Mesa.
     struct { int address = 0; } GetMeleeWeaponInfoClient;

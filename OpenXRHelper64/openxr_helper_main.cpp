@@ -1411,8 +1411,27 @@ namespace
         float vMax = 1.0f;
         float renderFovXDeg = 90.0f;
         float renderAspect = 1.0f;
+        bool haveExplicitFov = false;
+        XrFovf explicitFov{};
         bool ownsImport = true;
     };
+
+    void ApplyExplicitFov(VulkanGameEyeTexture& eye, const L4D2VROpenXrSharedTextureDesc& desc)
+    {
+        const bool ok = std::isfinite(desc.tanLeft) && std::isfinite(desc.tanRight)
+            && std::isfinite(desc.tanDown) && std::isfinite(desc.tanUp)
+            && desc.tanLeft < desc.tanRight - 0.001f && desc.tanDown < desc.tanUp - 0.001f
+            && std::fabs(desc.tanLeft) < 20.0f && std::fabs(desc.tanRight) < 20.0f
+            && std::fabs(desc.tanDown) < 20.0f && std::fabs(desc.tanUp) < 20.0f;
+        eye.haveExplicitFov = ok;
+        if (ok)
+        {
+            eye.explicitFov.angleLeft = std::atan(desc.tanLeft);
+            eye.explicitFov.angleRight = std::atan(desc.tanRight);
+            eye.explicitFov.angleDown = std::atan(desc.tanDown);
+            eye.explicitFov.angleUp = std::atan(desc.tanUp);
+        }
+    }
 
     // BEGIN BMVR_SHARED_GPU_CPU_READER: CPU-only, extracted by the local tests.
     struct SharedGpuCpuSnapshot
@@ -1421,6 +1440,7 @@ namespace
         L4D2VROpenXrPoseDesc pose{};
         int64_t captureQpc = 0;
         float fovX = 90.f, aspect = 1.f;
+        float eyeTangents[2][4]{};
         int64_t cpuSnapshotStartQpc = 0, cpuSnapshotEndQpc = 0;
     };
 
@@ -1558,6 +1578,7 @@ namespace
                 next.captureQpc = slot.captureQpc;
                 next.fovX = slot.fovX;
                 next.aspect = slot.aspect;
+                std::memcpy(next.eyeTangents, slot.eyeTangents, sizeof(next.eyeTangents));
                 const auto* source = static_cast<const uint8_t*>(m_Pixels[static_cast<size_t>(selected)].data)
                     + static_cast<size_t>(bmvr_shared_gpu::PrefixBytes);
                 const size_t eyeBytes = static_cast<size_t>(m_EyeBytes);
@@ -1799,9 +1820,12 @@ namespace
         bool Loading() const
         {
             return m_State && InterlockedCompareExchange(
-                reinterpret_cast<volatile LONG*>(&m_State->reservedTail0),0,0) != 0;
+                reinterpret_cast<volatile LONG*>(&m_State->loadingState),0,0) != 0;
         }
 
+        bool ReadMenuQuadState(L4D2VROpenXrMenuQuadDesc& menu) const {
+            return m_State && L4D2VR_OpenXrReadSnapshot(m_State->menuQuadGeneration,m_State->menuQuad,menu);
+        }
         bool ReadMenuVisualState(L4D2VROpenXrMenuPointerDesc& pointer, L4D2VROpenXrInputStateDesc& input) const
         {
             return m_State
@@ -3186,6 +3210,7 @@ namespace
             eye.vMin = std::clamp(desc.vMin, 0.0f, 1.0f);
             eye.uMax = std::clamp(desc.uMax, 0.0f, 1.0f);
             eye.vMax = std::clamp(desc.vMax, 0.0f, 1.0f);
+            ApplyExplicitFov(eye, desc);
             eye.renderFovXDeg = (std::isfinite(desc.renderFovXDeg) && desc.renderFovXDeg > 1.0f && desc.renderFovXDeg < 179.0f)
                 ? desc.renderFovXDeg
                 : 90.0f;
@@ -6736,6 +6761,12 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             if (!m_InputBridge.InitializeSession(m_Session, m_AppSpace, m_HandTrackingExtensionEnabled, m_Log))
                 return false;
 
+            XrReferenceSpaceCreateInfo overlayViewInfo{ XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
+            overlayViewInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+            overlayViewInfo.poseInReferenceSpace.orientation.w = 1.f;
+            if (!Succeeded(m_Log, "xrCreateReferenceSpace(VIEW, head-locked overlays)",
+                    m_Xr.xrCreateReferenceSpace(m_Session, &overlayViewInfo, &m_OverlayViewSpace)))
+                m_OverlayViewSpace = XR_NULL_HANDLE;
             m_Log.Print("Created OpenXR Vulkan session and LOCAL reference space");
             m_Bridge.Update(L4D2VROpenXrBridgeStatus::SessionCreated, 0, 0, "OpenXR Vulkan session created");
             return true;
@@ -7747,6 +7778,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             eye.vMin = std::clamp(desc.vMin, 0.0f, 1.0f);
             eye.uMax = std::clamp(desc.uMax, 0.0f, 1.0f);
             eye.vMax = std::clamp(desc.vMax, 0.0f, 1.0f);
+            ApplyExplicitFov(eye, desc);
             eye.renderFovXDeg = (std::isfinite(desc.renderFovXDeg) && desc.renderFovXDeg > 1.0f && desc.renderFovXDeg < 179.0f)
                 ? desc.renderFovXDeg
                 : 90.0f;
@@ -7995,6 +8027,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             eye.vMin = std::clamp(desc.vMin, 0.0f, 1.0f);
             eye.uMax = std::clamp(desc.uMax, 0.0f, 1.0f);
             eye.vMax = std::clamp(desc.vMax, 0.0f, 1.0f);
+            ApplyExplicitFov(eye, desc);
             eye.renderFovXDeg = (std::isfinite(desc.renderFovXDeg) && desc.renderFovXDeg > 1.0f && desc.renderFovXDeg < 179.0f)
                 ? desc.renderFovXDeg
                 : 90.0f;
@@ -8587,6 +8620,42 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             return pose;
         }
 
+        XrPosef BuildHeadLockedOverlayPose(
+            const L4D2VROpenXrOverlayDesc& overlay,
+            const std::vector<XrView>& locatedViews,
+            uint32_t locatedCount,
+            const XrPosef* gameRenderCenterPose)
+        {
+            XrPosef head{};
+            if (!locatedViews.empty())
+            {
+                head = locatedViews[0].pose;
+                if (locatedCount >= 2 && locatedViews.size() >= 2)
+                {
+                    head.position.x = (locatedViews[0].pose.position.x + locatedViews[1].pose.position.x) * 0.5f;
+                    head.position.y = (locatedViews[0].pose.position.y + locatedViews[1].pose.position.y) * 0.5f;
+                    head.position.z = (locatedViews[0].pose.position.z + locatedViews[1].pose.position.z) * 0.5f;
+                }
+            }
+            else
+                head = *gameRenderCenterPose;
+            const float distance = (std::isfinite(overlay.distanceMeters) && overlay.distanceMeters > 0.1f && overlay.distanceMeters < 10.0f)
+                ? overlay.distanceMeters
+                : 3.0f;
+            const XrVector3f local{
+                overlay.offsetMeters[0],
+                overlay.offsetMeters[1],
+                overlay.offsetMeters[2] - distance };
+            const XrVector3f offset = RotateOpenXrVector(head.orientation, local);
+            XrPosef pose{};
+            pose.orientation = head.orientation;
+            pose.position = XrVector3f{
+                head.position.x + offset.x,
+                head.position.y + offset.y,
+                head.position.z + offset.z };
+            return pose;
+        }
+
         XrPosef BuildOverlaySubmitPose(
             uint32_t overlayIndex,
             const L4D2VROpenXrOverlayDesc& overlay,
@@ -8594,6 +8663,9 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             uint32_t locatedCount,
             const XrPosef* gameRenderCenterPose = nullptr)
         {
+            if ((overlay.reserved1 & L4D2VR_OPENXR_OVERLAY_FLAG_HEAD_LOCKED) != 0
+                && (!locatedViews.empty() || gameRenderCenterPose))
+                return BuildHeadLockedOverlayPose(overlay, locatedViews, locatedCount, gameRenderCenterPose);
             // Pause panel and ray intersection share the explicit game anchor.
             // A cached world-render pose may predate a Quest recenter.
             L4D2VROpenXrMenuPointerDesc pointer{};L4D2VROpenXrInputStateDesc input{};
@@ -8748,6 +8820,10 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 const float ty=tx/source.renderAspect;
                 if(tx>0.001f && ty>0.001f) {
                     params[20]=-tx;params[21]=tx;params[22]=-ty;params[23]=ty;
+                    if(source.haveExplicitFov) {
+                        params[20]=std::tan(source.explicitFov.angleLeft);params[21]=std::tan(source.explicitFov.angleRight);
+                        params[22]=std::tan(source.explicitFov.angleDown);params[23]=std::tan(source.explicitFov.angleUp);
+                    }
                     params[24]=std::tan(warpView->fov.angleLeft);params[25]=std::tan(warpView->fov.angleRight);
                     params[26]=std::tan(warpView->fov.angleDown);params[27]=std::tan(warpView->fov.angleUp);
                     params[28]=1;
@@ -8917,9 +8993,10 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 // Keep the previous coherent snapshot through allocation/mode
                 // changes. Only a complete new pair can replace it or reset the
                 // upload frame tags (new nonces can restart frame numbering).
-                if (!sameSnapshotIdentity)
+                if (!sameSnapshotIdentity) {
                     m_CpuUploads[0].frame = m_CpuUploads[1].frame = 0;
                     m_Fsr.InvalidateFrameCache();
+                }
                 m_CpuWidth = snapshot.width;
                 m_CpuHeight = snapshot.height;
                 m_CpuSnapshotFrame = snapshot.frame;
@@ -8927,6 +9004,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 m_CpuCaptureQpc = snapshot.captureQpc;
                 m_SharedGpuFovX = snapshot.fovX;
                 m_SharedGpuAspect = snapshot.aspect;
+                std::memcpy(m_SharedGpuEyeTangents, snapshot.eyeTangents, sizeof(m_SharedGpuEyeTangents));
                 m_SharedGpuSnapshotValid = true;
                 m_SharedGpuSnapshotNonce = left.image;
                 if (diagnostics)
@@ -8944,6 +9022,8 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 // newer descriptor. Normalization and warp math remain shared.
                 desc.renderFovXDeg = m_SharedGpuFovX;
                 desc.renderAspect = m_SharedGpuAspect;
+                desc.tanLeft=m_SharedGpuEyeTangents[eye][0];desc.tanRight=m_SharedGpuEyeTangents[eye][1];
+                desc.tanDown=m_SharedGpuEyeTangents[eye][2];desc.tanUp=m_SharedGpuEyeTangents[eye][3];
                 m_GameEyes[eye].width = m_CpuWidth;
                 m_GameEyes[eye].height = m_CpuHeight;
                 ApplyGameEyeSourceBounds(m_GameEyes[eye], desc, generation);
@@ -9509,6 +9589,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             uint32_t eyeIndex,
             bool useSymmetricProjectionFov)
         {
+            if (source.haveExplicitFov) return source.explicitFov;
             XrFovf gameFov{};
             const bool haveGameFov =
                 m_Bridge.HasState() &&
@@ -10079,12 +10160,13 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                                 if (!overlay.valid || !overlay.visible || !overlay.texture.valid)
                                 {
                                     ResetOverlaySpatialLock(overlayIndex, "hidden");
+                                    m_OverlayBlittedSinceShown[overlayIndex] = false;
                                     continue;
                                 }
 
                                 VulkanEyeSwapchain& overlaySwapchain = m_OverlaySwapchains[overlayIndex];
                                 const uint32_t overlayGeneration = m_Bridge.OverlayGeneration();
-                                const bool overlayNeedsBlit =
+                                const bool overlayNeedsBlit = !m_OverlayBlittedSinceShown[overlayIndex] ||
                                     overlayFrameReady &&
                                     (overlayFrameGeneration != lastSubmittedOverlayFrameGeneration ||
                                         m_OverlayTextures[overlayIndex].generation != overlayGeneration ||
@@ -10094,10 +10176,13 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                                 if (overlayNeedsBlit)
                                 {
                                     overlayReadyForSubmit = RenderOverlaySwapchain(overlayIndex, overlay);
-                                    if (overlayReadyForSubmit)
+                                    if (overlayReadyForSubmit) {
                                         blittedAnyOverlayFrame = true;
+                                        m_OverlayBlittedSinceShown[overlayIndex] = true;
+                                    }
                                 }
 
+                                if (!m_OverlayBlittedSinceShown[overlayIndex]) overlayReadyForSubmit = false;
                                 if (overlayReadyForSubmit && overlaySwapchain.handle != XR_NULL_HANDLE)
                                 {
                                     const float widthMeters = (std::isfinite(overlay.widthMeters) && overlay.widthMeters > 0.05f)
@@ -10190,6 +10275,12 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                                         }
                                         else
                                         {
+                                            if ((overlay.reserved1 & L4D2VR_OPENXR_OVERLAY_FLAG_HEAD_LOCKED) != 0 && m_OverlayViewSpace != XR_NULL_HANDLE) {
+                                                const float distance = (std::isfinite(overlay.distanceMeters) && overlay.distanceMeters > .1f && overlay.distanceMeters < 10.f) ? overlay.distanceMeters : 3.f;
+                                                overlayLayer.space = m_OverlayViewSpace;
+                                                overlayLayer.pose.orientation = XrQuaternionf{0.f,0.f,0.f,1.f};
+                                                overlayLayer.pose.position = XrVector3f{overlay.offsetMeters[0],overlay.offsetMeters[1],overlay.offsetMeters[2]-distance};
+                                            } else
                                             overlayLayer.pose = BuildOverlaySubmitPose(overlayIndex, overlay, locatedViews, locatedCount, overlayGameRenderCenterPose);
                                             overlayLayer.size = XrExtent2Df{ widthMeters, heightMeters };
                                         }
@@ -10271,8 +10362,10 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                             // ~43° and 1.15m (too far vs the old projection).
                             // Crop to that letterbox and sit it ~arm's length
                             // at ~78° so it reads like MenuPanelScale=0.70.
-                            constexpr float kMenuQuadDistanceM = 1.30f;
-                            constexpr float kMenuQuadWidthM = 2.10f;
+                            L4D2VROpenXrMenuQuadDesc menuMetrics{};
+                            m_Bridge.ReadMenuQuadState(menuMetrics);
+                            const float kMenuQuadDistanceM = menuMetrics.distanceMeters > .1f ? menuMetrics.distanceMeters : 1.30f;
+                            const float kMenuQuadWidthM = menuMetrics.widthMeters > .1f ? menuMetrics.widthMeters : 2.10f;
                             L4D2VROpenXrMenuPointerDesc pointer{};
                             L4D2VROpenXrInputStateDesc pointerInput{};
                             m_Bridge.ReadMenuVisualState(pointer,pointerInput);
@@ -10522,6 +10615,8 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 m_Vk.vkDestroyFence(m_VkDevice, m_BlitFence, nullptr);
             if (m_CommandPool != VK_NULL_HANDLE && m_Vk.vkDestroyCommandPool)
                 m_Vk.vkDestroyCommandPool(m_VkDevice, m_CommandPool, nullptr);
+            if (m_OverlayViewSpace != XR_NULL_HANDLE && m_Xr.xrDestroySpace)
+                m_Xr.xrDestroySpace(m_OverlayViewSpace);
             if (m_AppSpace != XR_NULL_HANDLE && m_Xr.xrDestroySpace)
                 m_Xr.xrDestroySpace(m_AppSpace);
             if (m_Session != XR_NULL_HANDLE && m_Xr.xrDestroySession)
@@ -10553,6 +10648,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         XrSystemId m_SystemId = XR_NULL_SYSTEM_ID;
         XrSession m_Session = XR_NULL_HANDLE;
         XrSpace m_AppSpace = XR_NULL_HANDLE;
+        XrSpace m_OverlayViewSpace = XR_NULL_HANDLE;
         XrSessionState m_SessionState = XR_SESSION_STATE_UNKNOWN;
         XrEnvironmentBlendMode m_BlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
         OpenXrInputBridge m_InputBridge;
@@ -10577,6 +10673,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         float m_SharedGpuFovX = 90.f, m_SharedGpuAspect = 1.f;
         uint32_t m_CpuWidth = 0, m_CpuHeight = 0, m_CpuSnapshotFrame = 0;
         std::vector<uint8_t> m_CpuPixels;
+        float m_SharedGpuEyeTangents[2][4]{};
         L4D2VROpenXrPoseDesc m_CpuSnapshotPose{};
         int64_t m_CpuCaptureQpc=0;
         struct CpuUpload {
@@ -10630,6 +10727,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         std::array<std::array<VulkanGameEyeTexture, kGameEyeCacheSlots>, L4D2VR_OPENXR_EYE_COUNT> m_GameEyeCache{};
         std::array<VulkanGameEyeTexture, L4D2VR_OPENXR_OVERLAY_COUNT> m_OverlayTextures;
         std::array<VulkanEyeSwapchain, L4D2VR_OPENXR_OVERLAY_COUNT> m_OverlaySwapchains;
+        std::array<bool, L4D2VR_OPENXR_OVERLAY_COUNT> m_OverlayBlittedSinceShown{};
         std::array<OverlaySpatialLock, L4D2VR_OPENXR_OVERLAY_COUNT> m_OverlaySpatialLocks;
         ULONGLONG m_DebugImageDumpStartMs = 0;
         ULONGLONG m_DebugImageDumpWaitingGameFrameLogMs = 0;

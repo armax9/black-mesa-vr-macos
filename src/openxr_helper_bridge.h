@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 #include "openxr_bridge_protocol.h"
@@ -16,6 +17,13 @@ struct OpenXrHelperLaunchConfig
     bool enableHandTracking = false;
     bool disableProjectionLayer = false;
     bool useSymmetricProjectionFov = false;
+    bool gameRendersRuntimeFov = false;
+    // Eye swapchains at the game eye size (1:1 copy, only the runtime
+    // resamples) when the game supplies the FOV. false = recommended size.
+    bool swapchainAtSourceSize = true;
+    // OpenXRHelperDownsample=box: the helper box-filters the eye down to the
+    // recommended swapchain size (wins over swapchainAtSourceSize). off = default.
+    bool downsampleBox = false;
     bool useGameRenderPoseForProjection = true;
     int forceMonoProjectionEye = -1;
     int forceMonoProjectionView = -1;
@@ -58,3 +66,9 @@ void L4D2VR_PublishOpenXrMenuPointer(const L4D2VROpenXrMenuPointerDesc& pointer)
 void L4D2VR_PublishOpenXrLoadingState(bool loading);
 
 uint32_t L4D2VR_OpenXrReferenceSpaceEpoch();
+void L4D2VR_PublishOpenXrMenuQuad(const L4D2VROpenXrMenuQuadDesc& menu);
+
+// VRRuntimeBackend=fake (vr_fake_helper.cpp): runs the helper's side of the
+// bridge in-process, and hands console commands from VR\cmd.txt to the game.
+void L4D2VR_StartFakeOpenXrHelper(L4D2VROpenXrBridgeState* state, bool gameRendersRuntimeFov);
+bool L4D2VR_FakeHelperPopCommand(char* out, size_t outSize);

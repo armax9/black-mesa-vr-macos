@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <atomic>
 #include <cstring>
@@ -76,8 +77,28 @@ inline bool L4D2VR_OpenXrReadSnapshot(const uint32_t& sequence, const T& shared,
 }
 #include <cctype>
 
+// Odd generation = writer is in the middle of the payload. Release fences
+// keep MSVC from moving the payload outside that window. The game and the
+// helper are different processes; a process-local mutex does not order them.
+inline void L4D2VR_SeqlockBegin(uint32_t& generation)
+{
+    ++generation;
+    std::atomic_thread_fence(std::memory_order_release);
+}
+
+inline void L4D2VR_SeqlockEnd(uint32_t& generation)
+{
+    std::atomic_thread_fence(std::memory_order_release);
+    ++generation;
+}
+
+inline void L4D2VR_SeqlockAcquire()
+{
+    std::atomic_thread_fence(std::memory_order_acquire);
+}
+
 constexpr uint32_t L4D2VR_OPENXR_BRIDGE_MAGIC = 0x5258344Cu; // L4XR
-constexpr uint32_t L4D2VR_OPENXR_BRIDGE_VERSION = 19;
+constexpr uint32_t L4D2VR_OPENXR_BRIDGE_VERSION = 20;
 // 13: XR_KHR_visibility_mask hidden triangle list (NDC xy per eye).
 // 14: helperConsumingFrameId / helperConsumedFrameId (helper -> game blit
 //     progress; the game reuses a publish slot only once the helper's blit
@@ -303,6 +324,16 @@ struct L4D2VROpenXrSharedTextureDesc
     float vMax = 1.0f;
     float renderFovXDeg = 90.0f;
     float renderAspect = 1.0f;
+    // Bridge v15: tangents of the frustum the whole texture was rendered with
+    // (left < 0 < right, down < 0 < up). When all four are set the helper
+    // submits exactly this FOV and never crops; it overrides renderFovXDeg /
+    // renderAspect and the runtime FOV. 0 = unset (old behaviour). Used for
+    // an eye rendered off-centre, e.g. the left eye widened to the right by
+    // LeftEyeCullPad.
+    float tanLeft = 0.0f;
+    float tanRight = 0.0f;
+    float tanDown = 0.0f;
+    float tanUp = 0.0f;
 };
 
 struct L4D2VROpenXrOverlayDesc
@@ -326,6 +357,9 @@ constexpr uint32_t L4D2VR_OPENXR_POSE_FLAG_MONO = 1u << 0;
 // L4D2VROpenXrOverlayDesc.reserved1. HUD overlay uses texture alpha (HL2VR
 // IgnoreTextureAlpha=false). reserved0 stays the spatial-lock epoch.
 constexpr uint32_t L4D2VR_OPENXR_OVERLAY_FLAG_BLEND_ALPHA = 1u << 0;
+// Placed in front of the head every frame (full head pose) instead of the
+// pose captured when the epoch started: chapter titles, intro logo, "Saved...".
+constexpr uint32_t L4D2VR_OPENXR_OVERLAY_FLAG_HEAD_LOCKED = 1u << 1;
 // L4D2VROpenXrSharedTextureDesc.reserved0. UVs are a subrect of a shared
 // ring (or similar); do not treat 0..1 as one eye.
 constexpr uint32_t L4D2VR_OPENXR_SHARED_UV_EXPLICIT = 1u << 0;
@@ -339,6 +373,19 @@ struct L4D2VROpenXrPoseDesc
     int64_t displayTime = 0;
     float position[3] = {};
     float orientation[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+};
+
+// Bridge v16, game -> helper: where the mono 2D menu quad (main menu / load
+// GameUI) sits, the same numbers the game's menu pointer ray uses. distance /
+// width / offsetY in metres from the latched head pose; contentScale is the
+// letterbox fraction the game drew the menu into the eye image at
+// (MenuPanelScale). 0 = helper default.
+struct L4D2VROpenXrMenuQuadDesc
+{
+    float distanceMeters = 0.0f;
+    float widthMeters = 0.0f;
+    float offsetYMeters = 0.0f;
+    float contentScale = 0.0f;
 };
 
 struct L4D2VROpenXrControllerPoseDesc
@@ -516,4 +563,7 @@ struct L4D2VROpenXrBridgeState
     uint32_t referenceSpaceEpoch = 0; // helper increments after runtime recenter takes effect
     uint32_t menuPointerGeneration = 0;
     L4D2VROpenXrMenuPointerDesc menuPointer = {};
+    uint32_t loadingState = 0; // independent from reservedTail0 transport capability bits
+    uint32_t menuQuadGeneration = 0;
+    L4D2VROpenXrMenuQuadDesc menuQuad = {};
 };

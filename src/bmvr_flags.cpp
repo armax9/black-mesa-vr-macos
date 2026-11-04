@@ -19,8 +19,40 @@
 #include <string>
 #include <vector>
 
+extern "C" volatile int g_BmvrFlashlightMatrixFix;
+
 namespace bmvr
 {
+    const std::wstring& TestDir()
+    {
+        static const std::wstring dir = [] {
+            wchar_t buf[MAX_PATH]{};
+            const DWORD n = GetEnvironmentVariableW(L"BMVR_TESTDIR", buf, MAX_PATH);
+            std::wstring d = (n > 0 && n < MAX_PATH) ? std::wstring(buf, n) : std::wstring();
+            while (!d.empty() && (d.back() == L'\\' || d.back() == L'/'))
+                d.pop_back();
+            return d;
+        }();
+        return dir;
+    }
+
+    std::string VrFilePath(const char* leaf)
+    {
+        std::string base;
+        const std::wstring& d = TestDir();
+        if (!d.empty())
+        {
+            const int n = WideCharToMultiByte(CP_ACP, 0, d.c_str(), -1, nullptr, 0, nullptr, nullptr);
+            if (n > 1)
+            {
+                base.resize(static_cast<size_t>(n - 1));
+                WideCharToMultiByte(CP_ACP, 0, d.c_str(), -1, &base[0], n - 1, nullptr, nullptr);
+                base += "\\";
+            }
+        }
+        return base + "VR\\" + leaf;
+    }
+
     uint32_t g_RecommendedEyeWidth = 0;
     uint32_t g_RecommendedEyeHeight = 0;
     uint32_t g_FramebufferWidth = 0;
@@ -41,6 +73,7 @@ namespace bmvr
     float g_ControllerPitchTiltTouch = 0.f;
     float g_ControllerPitchTiltIndex = 0.f;
     float g_ControllerPitchTiltVive = -45.f;
+    float g_GunPitchOffset = 0.f;
     float g_AimPitchOffset = 0.f;
     bool g_DisableRecoilAim = true;
     float g_IPDScale = 1.f;
@@ -49,7 +82,7 @@ namespace bmvr
     float g_SeatedHeightOffsetMeters = 0.f;
     bool g_AutoMatQueueMode = false;
     bool g_MulticoreMode = true;
-    uint32_t g_Msaa = 0;
+    uint32_t g_Msaa = 0; // >= 2 switches FXAA off and only reaches the lighting buffers
     bool g_MsaaAllowed = true;
     bool g_Haptics = true;
     bool g_HideCrosshair = true;
@@ -57,6 +90,7 @@ namespace bmvr
     bool g_DisableViewBob = true;
     bool g_LeftHanded = false;
     bool g_RecenterResetsYaw = true;
+    bool g_AutoRecenterOnResume = true;
     bool g_HideLocalPlayerModel = true;
     bool g_HideViewmodelArms = true;
     bool g_VrHandsGlovesEnabled = true;
@@ -67,9 +101,65 @@ namespace bmvr
     bool g_VrCrosshair = true;
     float g_VrCrosshairScale = 1.f;
     int g_VrCrosshairEye = 0;
+    bool g_VrCrosshairDot = false;
+    bool g_VrLaserBeam = false;
+    float g_VrLaserWidth = 0.06f;
+    float g_VrLaserStartForward = 0.f;
+    bool g_AimDebug = false;
+    bool g_OffCenterTest = false;
+    bool g_OffCenterEyes = false;
+    bool g_FakeRuntime = false;
+    bool g_MirrorBothEyes = false;
+    // Fixes: on by default, a config key can turn each off.
+    bool g_VrShotOriginFix = true;
+    bool g_VrShootFromMuzzle = true;
+    bool g_TwoHandHoldWhileGrip = true;
+    bool g_TwoHandGripToggle = false;
+    bool g_FlashlightLeftHand = false;
+    float g_PauseMenuAlphaPasses = 3.f;
+    bool g_PauseMenuColourFromFrame = true;
+    float g_DebugBlankEye = 0.f;
+    float g_FrameCapMode = 2.f;
+    bool g_VrHandThrow = true;
+    float g_ThrowScale = 3.75f;
+    bool g_VrSkipMotionBlur = true;
+    bool g_VrSkipScreenEffects = true;
+    float g_EnvmapScaleWorld = 1.f;
+    float g_EnvmapScaleModels = 1.f;
+    bool g_StereoEnginePost = true;
+    uint32_t g_MaxEyeSize = 4096;
+    float g_ReflectionRtScale = 0.5f;
+    float g_RefractCopyRtScale = -1.f;
+    int g_ReflectionRtW = 0;
+    int g_RefractCopyRtW = 0;
+    int g_RefractCopyRtH = 0;
+    bool g_GpuPassTiming = false;
+    int g_ReflectionRtH = 0;
+    int g_PassTraceFrames = 0;
+    bool g_SprintAimedPose = true;
+    // Optional features: off unless enabled in VR/config.txt.
+    bool g_ShoulderGestures = true;
+    bool g_SettingsTriangleHold = false;
+    bool g_WeaponMenuSettingsGear = true;
+    bool g_WeaponMenuTilt = true;
+    bool g_CrouchStickHold = false;
+    float g_StickJumpCrouchThreshold = 0.8f;
+    bool g_TurnBlocksJumpCrouch = true;
+    bool g_SprintToggle = false;
+    bool g_VrSettingsPause = true;
     bool g_HideHandsWithoutSuit = true;
     bool g_ScopeUsesHmdAim = true;
     float g_ScopeZoomFovScale = 0.28f;
+    int g_ScopeEye = 2;
+    float g_LeftEyeCullPad = 0.f;
+    bool g_MenuCursorHook = true;
+    bool g_DebugDumps = false;
+    bool g_RightEyeFirst = false;
+    bool g_OcclusionTrackerPerEye = true;
+    bool g_PixelVisPerEye = true;
+    float g_GlowHold = 0.f;
+    bool g_FollowScriptedCamera = true;
+    bool g_OccluderViewPerEye = true;
     float g_ScopeZoomSmoothSec = 0.16f;
     float g_VrHandsPoseRotX = 0.f;
     float g_VrHandsPoseRotY = 180.f;
@@ -113,7 +203,6 @@ namespace bmvr
     // hitch is separate; do not put WaitGetPoses on the RenderView thread.
     bool g_CompositorPostPresentHandoff = true;
     bool g_ForceOpenVis = false;
-    bool g_HiddenAreaMesh = false;
     bool g_MaterialPredraw = false;
     bool g_StereoBlitGpuFlush = true;
     // Synchronous publish spins ~12 ms per pair on the material thread
@@ -141,34 +230,18 @@ namespace bmvr
 
     static HMODULE g_Module = nullptr;
     static std::mutex g_LogMutex;
-    static bool g_TryHmdSwapchain = true;
     static bool g_TryHmdFramebuffer = true;
     static bool g_TryHmdNative = true;
     static bool g_TryNamedRT = true;
-    static bool g_TryNamedStereoWrap = false;
     static bool g_TryStereoRV = true;
-    static bool g_TryWaitIdle = true;
-    static bool g_TryAbsView = true;
     static bool g_TryMenuCompositor = true;
     static bool g_TryRelativeHmdLook = true;
-    static bool g_TryStereoCopy = false;
-    static bool g_TryStereoFov = false;
     static bool g_TryMatQueue = true;
     static bool g_TryHl2vrQueuedWgp = true;
-    static bool g_TryHl2vrStereoEye = false;
-    static bool g_TryHl2vrHam = false;
-    static bool g_TryHl2vrPixelVis = false;
-    static bool g_TryHl2vrPredraw = false;
-    static bool g_TryHl2vrPlayerCull = false;
-    static bool g_TryStereoVisReset = false;
-    static bool g_Hl2vrHamBlocked = false;
-    static bool g_Hl2vrPixelVisBlocked = false;
-    static bool g_Hl2vrPlayerCullBlocked = false;
     static bool g_TryCtrlPose = true;
     static bool g_TryCtrlVm = true;
     static bool g_TryVrGloves = true;
     static bool g_TryHandOverlay = true;
-    static bool g_TrySteamVrEyeRt = false;
     // Private eyes at OpenVR recommended * RenderScale. World RTs stay at
     // the HWND (gbmatch squash-blit). LITERAL FullFrame/G-buffer at rec
     // filled only the top HWND slice of the eyes (2026-08-26, user miss).
@@ -194,19 +267,6 @@ namespace bmvr
     static bool g_TryGameUiActivate = true;
     static bool g_TryMeleeTrace = true;
     static bool g_TryFbOverride = true;
-    // 2026-08-20 HMD: LITERAL FullFrame grow (2560x2144) + eyes 2192x2144
-    // warped/smeared the scene and put gun/hands behind the player. Sticky
-    // ff_stereo already persisted; keep the attempt OFF. Do not grow FullFrame.
-    static bool g_TryFullFrameStereo = false;
-    // 47777b5 same-buffer: size FullFrame to fitted eye size, not 16:9 HWND.
-    // Verified fail 2026-08-22: LITERAL 1584 FullFrame + G-buffer while PushRT
-    // still used 2560 viewports; unbind copied A2R10 HDR (fmt=35) into LDR
-    // eyes → white untextured HMD, textured desktop, ~20fps. Keep OFF.
-    static bool g_TryHmdFitFullFrame = false;
-    // Same-buffer retry that also LITERAL-sized `_rt_gb*` to 1584. Verified
-    // miss 2026-08-22: alloc succeeded, process died on background04 before
-    // 120 stereo frames (crash-sticky). Do not retry.
-    static bool g_TryEyeFitWorldRts = false;
     // Keep stereo CViewSetup/viewport at 2560 GB size so deferred flashlight
     // apply runs; HMD fov+aspect+IPD; squash-blit into 1584 eyes. Not an RT
     // resize (ff_hmdfit / ff_gbfit). Sticky fl_gbmatch. Default on; leftover
@@ -222,6 +282,8 @@ namespace bmvr
 
     static std::wstring ModuleDir()
     {
+        if (!TestDir().empty())
+            return TestDir();
         wchar_t path[MAX_PATH]{};
         HMODULE mod = g_Module;
         if (!mod)
@@ -239,6 +301,8 @@ namespace bmvr
 
     static std::wstring ExeDir()
     {
+        if (!TestDir().empty())
+            return TestDir();
         wchar_t path[MAX_PATH]{};
         GetModuleFileNameW(nullptr, path, MAX_PATH);
         std::wstring full(path);
@@ -458,6 +522,12 @@ namespace bmvr
                 g_ControllerPitchTiltTouch = static_cast<float>(atof(val));
             else if (std::strcmp(n, "ControllerPitchTiltIndex") == 0)
                 g_ControllerPitchTiltIndex = static_cast<float>(atof(val));
+            else if (std::strcmp(n, "GunPitchOffset") == 0)
+            {
+                const float s = static_cast<float>(atof(val));
+                if (s >= -60.f && s <= 60.f)
+                    g_GunPitchOffset = s;
+            }
             else if (std::strcmp(n, "ControllerPitchTiltVive") == 0)
                 g_ControllerPitchTiltVive = static_cast<float>(atof(val));
             else if (std::strcmp(n, "AimPitchOffset") == 0)
@@ -483,6 +553,8 @@ namespace bmvr
                 g_AutoMatQueueMode = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "MulticoreMode") == 0)
                 g_MulticoreMode = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "FlashlightShadowMatrixFix") == 0)
+                g_BmvrFlashlightMatrixFix = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0) ? 1 : 0;
             else if (std::strcmp(n, "Msaa") == 0 || std::strcmp(n, "msaa") == 0)
                 g_Msaa = NormalizeMsaa(atoi(val));
             else if (std::strcmp(n, "Haptics") == 0)
@@ -497,6 +569,8 @@ namespace bmvr
                 g_LeftHanded = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "RecenterResetsYaw") == 0)
                 g_RecenterResetsYaw = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "AutoRecenterOnResume") == 0)
+                g_AutoRecenterOnResume = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "HideLocalPlayerModel") == 0)
                 g_HideLocalPlayerModel = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "HideViewmodelArms") == 0)
@@ -524,12 +598,130 @@ namespace bmvr
             }
             else if (std::strcmp(n, "VrCrosshairScale") == 0)
                 g_VrCrosshairScale = static_cast<float>(atof(val));
+            else if (std::strcmp(n, "VrCrosshairDot") == 0)
+                g_VrCrosshairDot = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrLaserBeam") == 0)
+                g_VrLaserBeam = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrLaserWidth") == 0)
+                g_VrLaserWidth = static_cast<float>(atof(val));
+            else if (std::strcmp(n, "VrLaserStartForward") == 0)
+                g_VrLaserStartForward = static_cast<float>(atof(val));
+            else if (std::strcmp(n, "AimDebug") == 0)
+                g_AimDebug = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrShotOriginFix") == 0)
+                g_VrShotOriginFix = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "CrouchStickHold") == 0)
+                g_CrouchStickHold = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "StickJumpCrouchThreshold") == 0)
+            {
+                const float t = static_cast<float>(atof(val));
+                if (t >= 0.3f && t <= 0.95f)
+                    g_StickJumpCrouchThreshold = t;
+            }
+            else if (std::strcmp(n, "TurnBlocksJumpCrouch") == 0)
+                g_TurnBlocksJumpCrouch = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "SprintToggle") == 0)
+                g_SprintToggle = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrSettingsPause") == 0)
+                g_VrSettingsPause = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrShootFromMuzzle") == 0)
+                g_VrShootFromMuzzle = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "ShoulderGestures") == 0)
+                g_ShoulderGestures = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "SettingsTriangleHold") == 0)
+                g_SettingsTriangleHold = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "WeaponMenuSettingsGear") == 0)
+                g_WeaponMenuSettingsGear = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "WeaponMenuTilt") == 0)
+                g_WeaponMenuTilt = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "TwoHandGripToggle") == 0)
+                g_TwoHandGripToggle = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "PauseMenuColourFromFrame") == 0)
+                g_PauseMenuColourFromFrame = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "PauseMenuAlphaPasses") == 0)
+                g_PauseMenuAlphaPasses = static_cast<float>(atof(val));
+            else if (std::strcmp(n, "FlashlightLeftHand") == 0)
+                g_FlashlightLeftHand = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "FrameCap") == 0)
+                g_FrameCapMode = static_cast<float>(atof(val));
+            else if (std::strcmp(n, "VrHandThrow") == 0)
+                g_VrHandThrow = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "ThrowScale") == 0)
+                g_ThrowScale = static_cast<float>(atof(val));
+            else if (std::strcmp(n, "TwoHandHoldWhileGrip") == 0)
+                g_TwoHandHoldWhileGrip = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrSkipMotionBlur") == 0)
+                g_VrSkipMotionBlur = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrSkipScreenEffects") == 0)
+                g_VrSkipScreenEffects = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "EnvmapScaleWorld") == 0)
+                g_EnvmapScaleWorld = std::clamp(static_cast<float>(atof(val)), 0.f, 1.f);
+            else if (std::strcmp(n, "EnvmapScaleModels") == 0)
+                g_EnvmapScaleModels = std::clamp(static_cast<float>(atof(val)), 0.f, 1.f);
+            else if (std::strcmp(n, "StereoEnginePost") == 0)
+                g_StereoEnginePost = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "GpuPassTiming") == 0)
+                g_GpuPassTiming = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "ReflectionRtScale") == 0)
+            {
+                const float v = static_cast<float>(atof(val));
+                g_ReflectionRtScale = (v > 0.f && v <= 1.f) ? v : 0.f;
+            }
+            else if (std::strcmp(n, "RefractCopyRtScale") == 0)
+            {
+                const float v = static_cast<float>(atof(val));
+                g_RefractCopyRtScale = v < 0.f ? -1.f : ((v > 0.f && v <= 1.f) ? v : 0.f);
+            }
+            else if (std::strcmp(n, "MaxEyeSize") == 0)
+            {
+                const int v = atoi(val);
+                g_MaxEyeSize = static_cast<uint32_t>(v < 2048 ? 2048 : (v > 8192 ? 8192 : v)) & ~15u;
+            }
+            else if (std::strcmp(n, "SprintAimedPose") == 0)
+                g_SprintAimedPose = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "MirrorBothEyes") == 0)
+                g_MirrorBothEyes = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VRRuntimeBackend") == 0)
+                g_FakeRuntime = (_strnicmp(val, "fake", 4) == 0
+                    && (val[4] == 0 || val[4] == ' ' || val[4] == '\t'));
+            else if (std::strcmp(n, "OffCenterEyes") == 0)
+                g_OffCenterEyes = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "OffCenterTest") == 0)
+                g_OffCenterTest = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "VrHideHandsWithoutSuit") == 0)
                 g_HideHandsWithoutSuit = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "VrScopeUsesHmdAim") == 0)
                 g_ScopeUsesHmdAim = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "ScopeZoomFovScale") == 0)
                 g_ScopeZoomFovScale = static_cast<float>(atof(val));
+            else if (std::strcmp(n, "ScopeEye") == 0)
+                g_ScopeEye = std::strcmp(val, "left") == 0 ? 1 : (std::strcmp(val, "center") == 0 ? 0 : 2);
+            else if (std::strcmp(n, "MenuCursorHook") == 0)
+                g_MenuCursorHook = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "OcclusionTrackerPerEye") == 0)
+                g_OcclusionTrackerPerEye = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "FollowScriptedCamera") == 0)
+                g_FollowScriptedCamera = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "GlowHold") == 0)
+            {
+                const float v = static_cast<float>(atof(val));
+                if (v >= 0.f && v <= 2.f)
+                    g_GlowHold = v;
+            }
+            else if (std::strcmp(n, "PixelVisPerEye") == 0)
+                g_PixelVisPerEye = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "OccluderViewPerEye") == 0)
+                g_OccluderViewPerEye = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "RightEyeFirst") == 0)
+                g_RightEyeFirst = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "DebugDumps") == 0)
+                g_DebugDumps = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "LeftEyeCullPad") == 0)
+            {
+                const float s = static_cast<float>(atof(val));
+                if (s >= 0.f && s <= 0.25f)
+                    g_LeftEyeCullPad = s;
+            }
             else if (std::strcmp(n, "ScopeZoomSmoothSec") == 0)
                 g_ScopeZoomSmoothSec = static_cast<float>(atof(val));
             else if (std::strcmp(n, "VrHandsPoseRotationOffset") == 0)
@@ -592,8 +784,6 @@ namespace bmvr
                 g_DesktopLeftoverRender = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "ForceOpenVis") == 0)
                 g_ForceOpenVis = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
-            else if (std::strcmp(n, "HiddenAreaMesh") == 0)
-                g_HiddenAreaMesh = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "MaterialPredraw") == 0)
                 g_MaterialPredraw = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "StereoBlitGpuFlush") == 0)
@@ -701,11 +891,29 @@ namespace bmvr
         }
     }
 
+    // Skip-file names of removed experiments (docs/RETIRED.md). Old installs
+    // may still list them; there is nothing left to turn off.
+    static bool IsRetiredSkipName(const std::string& name)
+    {
+        static const char* const kRetired[] = {
+            "hmd_swap", "wait_idle", "abs_view", "stereo_copy", "stereo_fov", "steamvr_rt",
+            "ff_stereo", "ff_hmdfit", "ff_gbfit", "stereo_vis", "named_bind", "named_l4d",
+            "named_eye", "named_push", "hl2vr_eye", "hl2vr_ham", "hl2vr_pixelvis",
+            "hl2vr_playercull", "hl2vr_predraw", "hl2vr_proj", "hl2vr_cproj", "hl2vr_neye",
+        };
+        for (const char* n : kRetired)
+        {
+            if (name == n)
+                return true;
+        }
+        return false;
+    }
+
     static void ApplySkipName(const std::string& name, const char* via)
     {
-        if (name == "hmd_swap")
-            g_TryHmdSwapchain = false;
-        else if (name == "hmd_fb")
+        if (IsRetiredSkipName(name))
+            return;
+        if (name == "hmd_fb")
             g_TryHmdFramebuffer = false;
         else if (name == "hmd_native")
             g_TryHmdNative = false;
@@ -713,12 +921,6 @@ namespace bmvr
             g_TryNamedRT = false;
         else if (name == "stereo_rv")
             g_TryStereoRV = false;
-        else if (name == "named_bind" || name == "named_l4d" || name == "named_eye" || name == "named_push")
-            g_TryNamedStereoWrap = false;
-        else if (name == "wait_idle")
-            g_TryWaitIdle = false;
-        else if (name == "abs_view")
-            g_TryAbsView = false;
         else if (name == "menu_vr")
         {
             Log("Ignoring menu_vr skip (%s): empty-map GameUI Submit must stay on",
@@ -727,16 +929,10 @@ namespace bmvr
         }
         else if (name == "rel_look")
             g_TryRelativeHmdLook = false;
-        else if (name == "stereo_copy")
-            g_TryStereoCopy = false;
-        else if (name == "stereo_fov")
-            g_TryStereoFov = false;
         else if (name == "mat_queue")
         {
             g_TryMatQueue = false;
         }
-        else if (name == "steamvr_rt")
-            g_TrySteamVrEyeRt = false;
         else if (name == "hmd_offscreen")
             g_TryOffscreenHmd = false;
         else if (name == "hmd_world")
@@ -764,12 +960,6 @@ namespace bmvr
             g_TryMeleeTrace = false;
         else if (name == "fb_override")
             g_TryFbOverride = false;
-        else if (name == "ff_stereo")
-            g_TryFullFrameStereo = false;
-        else if (name == "ff_hmdfit")
-            g_TryHmdFitFullFrame = false;
-        else if (name == "ff_gbfit")
-            g_TryEyeFitWorldRts = false;
         else if (name == "fl_gbmatch")
             g_TryFlashlightGbMatch = false;
         else if (name == "gb_leftskip")
@@ -780,36 +970,10 @@ namespace bmvr
             g_TryDme = false;
         else if (name == "hl2vr_wgp")
             g_TryHl2vrQueuedWgp = false;
-        else if (name == "hl2vr_eye")
-            g_TryHl2vrStereoEye = false;
-        else if (name == "stereo_vis")
-            g_TryStereoVisReset = false;
-        else if (name == "hl2vr_ham")
+        else if (name == "msaa")
         {
-            g_TryHl2vrHam = false;
-            g_Hl2vrHamBlocked = true;
-            g_HiddenAreaMesh = false;
-        }
-        else if (name == "hl2vr_pixelvis")
-        {
-            g_TryHl2vrPixelVis = false;
-            g_Hl2vrPixelVisBlocked = true;
-        }
-        else if (name == "hl2vr_playercull")
-        {
-            // First stereo BeginRisky overlapped this with hmd_fb / quit, so
-            // a later death skip-filed it. Player-cull crash-sticky is
-            // one-launch only (persist=false).
-            Log("Ignoring %s skip (%s): not a permanent ban",
-                name.c_str(), via ? via : "skip file");
-            return;
-        }
-        else if (name == "hl2vr_predraw")
-            g_TryHl2vrPredraw = false;
-        else if (name == "hl2vr_proj" || name == "hl2vr_cproj" || name == "hl2vr_neye")
-        {
-            // Leftover from the reverted native OpenVR stereo experiment.
-            return;
+            g_MsaaAllowed = false;
+            g_Msaa = 0;
         }
         else if (name == "msaa")
         {
@@ -969,7 +1133,8 @@ namespace bmvr
         WriteUtf8File(SkipPath(), line, true);
         WriteUtf8File(ModuleDir() + L"\\bmvr_skip.txt", line, true);
         if (reason)
-            Log("Persisted skip '%s': %s", name, reason);
+            Log("Disabled '%s' for later launches too (%s); delete bmvr_skip.txt next to bms.exe to retry it",
+                name, reason);
     }
 
     void SetDllModule(HMODULE module)
@@ -1256,7 +1421,7 @@ namespace bmvr
             Log("Disabled %s this launch only (previous launch died; not skip-filed)", label);
     }
 
-    float EffectiveControllerPitchTilt(uint32_t controllerFamily)
+    static float FamilyControllerPitchTilt(uint32_t controllerFamily)
     {
         switch (controllerFamily)
         {
@@ -1270,6 +1435,13 @@ namespace bmvr
         default:
             return g_ControllerPitchTilt;
         }
+    }
+
+    float EffectiveControllerPitchTilt(uint32_t controllerFamily)
+    {
+        // The per-family tilt matches each controller's shape; the player's
+        // own preference (menu / GunPitchOffset) comes on top.
+        return FamilyControllerPitchTilt(controllerFamily) + g_GunPitchOffset;
     }
 
     void EffectiveVrHandsPoseOffset(uint32_t controllerFamily, float& x, float& y, float& z)
@@ -1389,7 +1561,6 @@ namespace bmvr
         ConsumeIfStuck(L"msaa", g_MsaaAllowed, "msaa", "HL2VR scene MSAA");
         if (!g_MsaaAllowed)
             g_Msaa = 0;
-        ConsumeIfStuck(L"hmd_swap", g_TryHmdSwapchain, "hmd_swap", "HMD-sized swapchain");
         ConsumeIfStuck(L"hmd_native", g_TryHmdNative, "hmd_native", "L4D2VR recommended G-buffer size");
         // Last launch: 8 pass-through 1584 RenderViews (zNear=7) succeeded,
         // then stereo wrote 1440 into CViewSetup+0x1C (m_eStereoEye on BM).
@@ -1397,8 +1568,6 @@ namespace bmvr
         for (const auto& dir : FlagDirs())
             DeleteFileW((dir + L"\\bmvr_in_hmd_fb.flag").c_str());
         ConsumeIfStuck(L"named_rt", g_TryNamedRT, "named_rt", "MaterialSystem named eye RTs");
-        ConsumeIfStuck(L"wait_idle", g_TryWaitIdle, "wait_idle", "WaitDeviceIdle");
-        ConsumeIfStuck(L"abs_view", g_TryAbsView, "abs_view", "absolute HMD CViewSetup");
         // 2026-08-16 hang persist-skipped this. Skip-file is already ignored.
         // 2026-09-03: BeginRisky stayed armed until LevelInit, so quitting (or
         // an install killing bms.exe) from GameUI left bmvr_in_menu_vr.flag.
@@ -1411,13 +1580,10 @@ namespace bmvr
         // died (2026-08-19). That is not the look copy. Same as skip-file ignore.
         for (const auto& dir : FlagDirs())
             DeleteFileW((dir + L"\\bmvr_in_rel_look.flag").c_str());
-        ConsumeIfStuck(L"stereo_copy", g_TryStereoCopy, "stereo_copy", "double RenderView blit stereo");
-        ConsumeIfStuck(L"stereo_fov", g_TryStereoFov, "stereo_fov", "same-size HMD-FOV double RenderView");
         // Skip-file mat_queue is ignored. Do not PersistSkip a leftover flag
         // from an EndFrame/gbmatch death — that false-bans SetThreadMode.
         for (const auto& dir : FlagDirs())
             DeleteFileW((dir + L"\\bmvr_in_mat_queue.flag").c_str());
-        ConsumeIfStuck(L"steamvr_rt", g_TrySteamVrEyeRt, "steamvr_rt", "SteamVR recommended eye RT (offscreen)");
         // WorldRenderAtEyeSize keeps private eyes at recommended size.
         // Predraw's dummy DrawScreenSpaceRectangle AV'd after the first
         // stereo pair (2026-09-05, shaderapidx9+412FF eip=0) while
@@ -1451,12 +1617,6 @@ namespace bmvr
             "crowbar TraceRay viewmodel-origin rewrite");
         ConsumeIfStuck(L"fb_override", g_TryFbOverride, "fb_override",
             "IMaterialSystem::SetRenderTargetFrameBufferSizeOverrides");
-        ConsumeIfStuck(L"ff_stereo", g_TryFullFrameStereo, "ff_stereo",
-            "stereo at FullFrame/OpenVR recommended size (swapchain unchanged)");
-        ConsumeIfStuck(L"ff_hmdfit", g_TryHmdFitFullFrame, "ff_hmdfit",
-            "47777b5 HMD-fit FullFrame LITERAL (window-capped, not grow)");
-        ConsumeIfStuck(L"ff_gbfit", g_TryEyeFitWorldRts, "ff_gbfit",
-            "LITERAL FullFrame+G-buffer at eye size (HDR unbind still skipped)");
         // Skip-file already ignores fl_gbmatch. ConsumeIfStuck still disabled
         // it from leftover bmvr_in_fl_gbmatch.flag (BeginRisky held when the
         // first simulator pair died). Next launch then double-RVed 1280 into
@@ -1472,26 +1632,6 @@ namespace bmvr
         Log("Ignoring drawhud crash-sticky (third HWND HUD pass after small-eye stereo)");
         ConsumeIfStuck(L"hl2vr_wgp", g_TryHl2vrQueuedWgp, "hl2vr_wgp",
             "HL2VR queued WaitGetPoses on ICallQueue");
-        ConsumeIfStuck(L"hl2vr_eye", g_TryHl2vrStereoEye, "hl2vr_eye",
-            "HL2VR CViewSetup.m_eStereoEye LEFT/RIGHT");
-        PersistSkip("hl2vr_eye",
-            "first stereo RenderView died after writing m_eStereoEye LEFT/RIGHT (OpenXR, 2026-09-04); hl2vr native retry presented white freeze (2026-09-05)");
-        for (const auto& dir : FlagDirs())
-        {
-            DeleteFileW((dir + L"\\bmvr_in_hl2vr_ham.flag").c_str());
-            DeleteFileW((dir + L"\\bmvr_in_hl2vr_pixelvis.flag").c_str());
-            DeleteFileW((dir + L"\\bmvr_in_stereo_vis.flag").c_str());
-        }
-        PersistSkip("hl2vr_ham",
-            "OpenXR visibility-mask HAM drew a black overlay on the world; no FPS gain (2026-09-05)");
-        PersistSkip("hl2vr_pixelvis",
-            "PixelVisibility_EndCurrentView skip on the second stereo eye; one-eye skybox + flashlight through walls (2026-09-05)");
-        PersistSkip("stereo_vis",
-            "CViewRender+0x744 is m_rbTakeFreezeFrame; zeroing it draws an empty freeze (white void) while m_flFreezeFrameUntil is live (2026-09-05)");
-        ConsumeIfStuck(L"hl2vr_predraw", g_TryHl2vrPredraw, "hl2vr_predraw",
-            "HL2VR DrawAllMaterials pipeline predraw");
-        ConsumeIfStuck(L"hl2vr_playercull", g_TryHl2vrPlayerCull, "hl2vr_playercull",
-            "HL2VR local-player GetRenderBoundsWorldspace", false);
         ConsumeIfStuck(L"ctrl_pose", g_TryCtrlPose, "ctrl_pose",
             "first OpenXR/OpenVR controller pose apply", false);
         ConsumeIfStuck(L"ctrl_vm", g_TryCtrlVm, "ctrl_vm",
@@ -1504,54 +1644,9 @@ namespace bmvr
         // disabling the viewmodel hook; createHook still uses a short window.
         for (const auto& dir : FlagDirs())
             DeleteFileW((dir + L"\\bmvr_in_dme.flag").c_str());
-        // 2026-08-18: 3296x3216 private eyes + SetRT/depth redirect over the
-        // 2560x1440 deferred G-buffer. Stereo pair logged redirected=1, blit
-        // skipped, Present ~90fps, audio OK, Escape menu OK, world black on
-        // desktop and HMD. Crash-sticky never fired (process stayed alive).
-        PersistSkip("steamvr_rt", "3296 offscreen SetRT over 2560 G-buffer blacked world");
-        // 16:9 blit stereo is not fused. Do not keep offering it.
-        // Verified on this DLL 2026-08-16: CreateDevice + Reset forced 3168x3100,
-        // desktop went black, one OpenVR Submit then rt0=null / waiting room.
-        if (g_TryHmdSwapchain)
-            PersistSkip("hmd_swap", "black desktop + SteamVR waiting room after Reset");
-        // TransferSurface(..., TRUE) + WaitDeviceIdle during loading with
-        // compositor DoNotHaveFocus coincided with the 1 FPS crash.
-        if (g_TryWaitIdle)
-            PersistSkip("wait_idle", "WaitDeviceIdle during loading crash");
-        // Absolute HMD yaw/pitch on the live CViewSetup replaced the tram's
-        // scripted camera (e.g. yaw 96.5 → HMD 14.7) and the headset went
-        // black after the load logo. L4D2VR only writes HMD on stereo copies.
-        if (g_TryAbsView)
-            PersistSkip("abs_view", "absolute HMD on live CViewSetup blacked gameplay after load logo");
-        if (g_TryStereoCopy)
-            PersistSkip("stereo_copy", "16:9 blit stereo is not fused");
-        PersistSkip("stereo_fov", "HMD FOV in 16:9 pixels is magnified and not fused");
-        PersistSkip("ff_hmdfit", "unbind A2R10 FullFrame whites HMD; G-buffer 1584 vs PushRT 2560");
-        PersistSkip("ff_gbfit", "LITERAL FullFrame+G-buffer 1584 died on background04 before stereo; user miss");
-        // 2026-09-04: 8 HMD-fb pass-throughs at 3168 OpenXR succeeded, then
-        // the first stereo pair died after pose latch. Copies wrote
-        // m_eStereoEye LEFT/RIGHT and drew RIGHT then LEFT. BM RenderView
-        // indexes this+0x744 by [ebx+0x1C]. Leave MONO (0); LEFT then RIGHT.
-        // 2026-09-05: hl2vr native ignored that skip, wrote stereoEye=2 on
-        // the first RIGHT copy, and presented white freeze. Always skip.
-        PersistSkip("hl2vr_eye",
-            "first stereo RenderView died after writing m_eStereoEye LEFT/RIGHT (OpenXR, 2026-09-04); hl2vr native retry presented white freeze (2026-09-05)");
-        PersistSkip("hl2vr_predraw",
-            "DrawAllMaterials dummy DrawScreenSpaceRectangle null-called shaderapidx9 (C0000005 eip=0, 2026-09-05)");
-        for (const auto& dir : FlagDirs())
-        {
-            DeleteFileW((dir + L"\\bmvr_in_hl2vr_proj.flag").c_str());
-            DeleteFileW((dir + L"\\bmvr_in_hl2vr_cproj.flag").c_str());
-            DeleteFileW((dir + L"\\bmvr_in_hl2vr_neye.flag").c_str());
-        }
-        if (!g_WorldEyeSizeOptIn)
-            PersistSkip("hmd_world", "LITERAL FullFrame+G-buffer at SteamVR rec still PushRT 2560x1440; HMD warp + bottom garbage");
         // Do not PersistSkip or ConsumeIfStuck fl_gbmatch. Skip-file ignore
         // was not enough: leftover bmvr_in_fl_gbmatch.flag still disabled
         // the HWND lock on OpenXR Simulator (2026-09-09).
-        // Named HDR wrap + rewriting CSimpleWorldView PushRT(NULL) dies after
-        // the third bind even when the named RT is 2560x1440. Do not retry it.
-        g_TryNamedStereoWrap = false;
         Log("hmd_offscreen=%d hmd_world=%d optIn=%d (%s)",
             g_TryOffscreenHmd ? 1 : 0, g_TryOffscreenWorldGrow ? 1 : 0,
             g_WorldEyeSizeOptIn ? 1 : 0,
@@ -1561,20 +1656,31 @@ namespace bmvr
         SetStage("init");
     }
 
-    bool TryHmdSwapchain() { return g_TryHmdSwapchain; }
     bool TryHmdFramebuffer() { return g_TryHmdFramebuffer; }
+    bool OffCenterTestActive()
+    {
+        if (!g_OffCenterTest)
+            return false;
+        static ULONGLONG s_lastCheck = 0;
+        static bool s_on = false;
+        const ULONGLONG now = GetTickCount64();
+        if (now - s_lastCheck >= 500)
+        {
+            s_lastCheck = now;
+            const std::wstring marker = ExeDir() + L"\\VR\\offcenter_test_on";
+            const bool on = GetFileAttributesW(marker.c_str()) != INVALID_FILE_ATTRIBUTES;
+            if (on != s_on)
+                Log(on ? "OffCenterTest on" : "OffCenterTest off");
+            s_on = on;
+        }
+        return s_on;
+    }
     bool TryHmdNative() { return g_TryHmdNative; }
     bool TryNamedRenderTargets() { return g_TryNamedRT; }
-    bool TryNamedStereoWrap() { return g_TryNamedStereoWrap; }
     bool TryStereoRenderView() { return g_TryStereoRV; }
-    bool TryWaitDeviceIdle() { return g_TryWaitIdle; }
-    bool TryAbsoluteHmdView() { return g_TryAbsView; }
     bool TryMenuCompositor() { return g_TryMenuCompositor; }
     bool TryRelativeHmdLook() { return g_TryRelativeHmdLook; }
-    bool TryStereoCopy() { return g_TryStereoCopy; }
-    bool TryStereoFov() { return g_TryStereoFov; }
     bool TryMatQueue() { return g_TryMatQueue; }
-    bool TrySteamVrEyeRt() { return g_TrySteamVrEyeRt; }
     bool TryOffscreenHmd() { return g_TryOffscreenHmd; }
     bool TryOffscreenWorldGrow() { return g_TryOffscreenWorldGrow; }
     static bool MapNameIsGameplay(const char* map)
@@ -1647,20 +1753,11 @@ namespace bmvr
     bool TryGameUiActivate() { return g_TryGameUiActivate; }
     bool TryMeleeTrace() { return g_TryMeleeTrace; }
     bool TryFramebufferOverride() { return g_TryFbOverride; }
-    bool TryFullFrameStereo() { return g_TryFullFrameStereo; }
-    bool TryHmdFitFullFrame() { return g_TryHmdFitFullFrame; }
-    bool TryEyeFitWorldRts() { return g_TryEyeFitWorldRts; }
     bool TryFlashlightGbMatch() { return g_TryFlashlightGbMatch; }
     bool TryGbLeftSkip() { return g_TryGbLeftSkip; }
     bool TryDrawHud() { return g_TryDrawHud; }
     bool TryDrawModelExecute() { return g_TryDme; }
     bool TryHl2vrQueuedWgp() { return g_TryHl2vrQueuedWgp; }
-    bool TryHl2vrStereoEye() { return g_TryHl2vrStereoEye; }
-    bool TryHl2vrHam() { return g_TryHl2vrHam; }
-    bool TryHl2vrPixelVis() { return g_TryHl2vrPixelVis; }
-    bool TryHl2vrPredraw() { return g_TryHl2vrPredraw; }
-    bool TryHl2vrPlayerCull() { return g_TryHl2vrPlayerCull; }
-    bool TryStereoVisReset() { return g_TryStereoVisReset; }
     bool TryCtrlPose() { return g_TryCtrlPose; }
     bool TryCtrlVm() { return g_TryCtrlVm; }
     bool TryVrGloves() { return g_TryVrGloves; }
@@ -1674,11 +1771,6 @@ namespace bmvr
     void DisableStereoRenderView(const char* reason)
     {
         PersistSkip("stereo_rv", reason);
-    }
-
-    void DisableStereoFov(const char* reason)
-    {
-        PersistSkip("stereo_fov", reason);
     }
 
     // In-process record of which crash-sticky flags are currently on disk.
@@ -1996,12 +2088,41 @@ namespace bmvr
         float s = g_RenderScale;
         if (!(s > 0.24f && s < 4.f))
             s = 1.f;
-        uint32_t w = (static_cast<uint32_t>(static_cast<float>(recW) * s + 0.5f) + 15u) & ~15u;
-        uint32_t h = (static_cast<uint32_t>(static_cast<float>(recH) * s + 0.5f) + 15u) & ~15u;
-        if (w > 4096)
-            w = 4096;
-        if (h > 4096)
-            h = 4096;
+        // One factor for both axes. Clamping each axis on its own changed the
+        // eye aspect once one side hit the cap (PSVR2 recommended 2884x2940
+        // clamped only the height above RenderScale 1.39). DXVK's texture
+        // limit is 16384; the MulticoreMode ring stacks three eye heights
+        // (McRingHeight = 3 * h), so h <= 5456 there.
+        const float cap = static_cast<float>(g_MaxEyeSize);
+        const float capH = g_MulticoreMode ? std::min(cap, 5456.f) : cap;
+        const float fw = static_cast<float>(recW) * s;
+        const float fh = static_cast<float>(recH) * s;
+        const float fit = std::min(1.f, std::min(cap / fw, capH / fh));
+        uint32_t w = 0;
+        uint32_t h = 0;
+        if (fit < 1.f)
+        {
+            w = static_cast<uint32_t>(fw * fit) & ~15u;
+            h = static_cast<uint32_t>(fh * fit) & ~15u;
+        }
+        else
+        {
+            w = (static_cast<uint32_t>(fw + 0.5f) + 15u) & ~15u;
+            h = (static_cast<uint32_t>(fh + 0.5f) + 15u) & ~15u;
+            if (w > static_cast<uint32_t>(cap))
+                w = static_cast<uint32_t>(cap) & ~15u;
+            if (h > static_cast<uint32_t>(capH))
+                h = static_cast<uint32_t>(capH) & ~15u;
+        }
+        static uint32_t s_loggedW, s_loggedH;
+        if (fit < 1.f && (s_loggedW != w || s_loggedH != h))
+        {
+            s_loggedW = w;
+            s_loggedH = h;
+            Log("Eye size %ux%u capped to %ux%u (MaxEyeSize %u%s; aspect kept)",
+                static_cast<uint32_t>(fw + 0.5f), static_cast<uint32_t>(fh + 0.5f), w, h, g_MaxEyeSize,
+                g_MulticoreMode ? ", MulticoreMode ring height 5456" : "");
+        }
         if (w < 640)
             w = (recW + 15u) & ~15u;
         if (h < 360)
@@ -2009,6 +2130,17 @@ namespace bmvr
         width = w;
         height = h;
         return w >= 640 && h >= 360;
+    }
+
+    float RefractCopyRtScale()
+    {
+        return g_RefractCopyRtScale < 0.f ? g_ReflectionRtScale : g_RefractCopyRtScale;
+    }
+
+    bool GrownAuxRtSized(int w, int h)
+    {
+        return (g_ReflectionRtW > 0 && w == g_ReflectionRtW && h == g_ReflectionRtH)
+            || (g_RefractCopyRtW > 0 && w == g_RefractCopyRtW && h == g_RefractCopyRtH);
     }
 
     bool WorldRtGrowActive()
@@ -2111,6 +2243,30 @@ namespace bmvr
             && SizesNear(g_GbActualWidth, eyeW) && SizesNear(g_GbActualHeight, eyeH);
     }
 
+    void DescribeWorldRtMatch(char* buf, size_t size)
+    {
+        if (!buf || !size)
+            return;
+        uint32_t eyeW = 0, eyeH = 0;
+        const bool haveEye = ComputeOffscreenEyeSize(eyeW, eyeH);
+        const char* state = "world RTs match the eyes";
+        if (!g_WorldEyeSizeOptIn)
+            state = "WorldRenderAtEyeSize is off";
+        else if (!g_TryOffscreenHmd)
+            state = "offscreen eyes disabled (hmd_offscreen in bmvr_skip.txt or a crash flag)";
+        else if (!g_TryOffscreenWorldGrow)
+            state = "world RT grow disabled (hmd_world)";
+        else if (!g_GameplayWorldRts)
+            state = "not a gameplay map yet";
+        else if (!haveEye)
+            state = "eye size unknown";
+        else if (!OffscreenWorldMatchesEyes())
+            state = "world RTs were created at another size than the eyes";
+        snprintf(buf, size, "%s: FullFrame %ux%u G-buffer %ux%u eye %ux%u (recommended %ux%u RenderScale %.2f)",
+            state, g_FullFrameActualWidth, g_FullFrameActualHeight, g_GbActualWidth, g_GbActualHeight,
+            eyeW, eyeH, g_RecommendedEyeWidth, g_RecommendedEyeHeight, g_RenderScale);
+    }
+
     void SetOpenXrHelperSession(bool active)
     {
         (void)active;
@@ -2138,18 +2294,6 @@ namespace bmvr
         // died (2026-08-18).
         width = g_FramebufferWidth;
         height = g_FramebufferHeight;
-        return true;
-    }
-
-    bool ApplyHmdAspectBackbuffer(uint32_t& width, uint32_t& height)
-    {
-        uint32_t w = 0, h = 0;
-        if (!HaveHmdFramebufferSize(w, h))
-            return false;
-        if (width == w && height == h)
-            return false;
-        width = w;
-        height = h;
         return true;
     }
 }

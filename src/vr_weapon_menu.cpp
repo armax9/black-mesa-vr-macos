@@ -1755,11 +1755,65 @@ bool VR::WeaponMenuStickHeld() const
     return PressedDigitalAction(m_ActionResetPosition);
 }
 
+void VR::Recenter(const char* why)
+{
+    m_HmdOriginLatched = false;
+    m_MenuPanelPoseValid = false;
+    ++m_MenuOverlayEpoch;
+    if (bmvr::g_RecenterResetsYaw)
+        m_RotationOffsetY.store(0.f, std::memory_order_release);
+    Game::logMsg("Recenter (%s)%s", why, bmvr::g_RecenterResetsYaw ? " + yaw" : "");
+}
+
+void VR::RecenterPosition(const char* why)
+{
+    // The next tracking update re-latches the HMD origin (position only;
+    // the latched angles are never applied), so the eye lands back on the
+    // body. Stick-turn yaw and the menu panel stay as they are.
+    m_HmdOriginLatched = false;
+    Game::logMsg("Recenter position (%s)", why);
+}
+
+// Right-stick tap (HL2VR style): bare hands <-> the weapon held before.
+// Holstering never changes the game's active weapon, so going back only
+// re-selects when that weapon changed meanwhile (e.g. a pickup).
+void VR::ToggleEmptyHands()
+{
+    if (!m_EmptyHands)
+    {
+        Game::InventoryWeapon inv[kMaxMenuSlots]{};
+        const int n = m_Game->CollectInventoryWeapons(inv, kMaxMenuSlots);
+        if (n <= 0)
+            return;
+        C_BaseEntity* active = m_Game->GetActiveWeaponEntity();
+        for (int i = 0; i < n; ++i)
+        {
+            if (m_Game->GetClientEntity(inv[i].entityIndex) != active)
+                continue;
+            m_WeaponMenuPrevEntity = inv[i].entityIndex;
+            m_WeaponMenuPrevKind = KindFromNames(inv[i].modelName, inv[i].networkName);
+            break;
+        }
+        m_EmptyHands = true;
+        Game::logMsg("Right-stick tap: hands");
+    }
+    else
+    {
+        m_EmptyHands = false;
+        const int prev = m_WeaponMenuPrevEntity;
+        if (prev > 0 && m_Game->GetClientEntity(prev) != m_Game->GetActiveWeaponEntity())
+            m_PendingWeaponSelect.store(prev, std::memory_order_release);
+        Game::logMsg("Right-stick tap: weapon entity=%d", prev);
+    }
+    // No menu sound: the quick swap never opens the weapon menu.
+    PulseHandHaptic(vr::TrackedControllerRole_RightHand, 900, 0.35f);
+}
+
 void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
 {
     (void)deltaMs;
     const DWORD now = GetTickCount();
-    if (!m_GameplayEligible || !m_Game || PauseUiActive())
+    if (!m_GameplayEligible || !m_Game || PauseUiActive() || m_SettingsOpen)
     {
         m_WeaponMenuOpen = false;
         m_WeaponMenuClickHeld = false;
@@ -1809,19 +1863,45 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
 
                 const Vector body = MenuPlayerBody(this);
                 Vector hand{};
+                Vector eye{};
                 {
                     std::lock_guard<std::recursive_mutex> lock(m_ControllerMutex);
                     hand = ControllerTrackingToWorld(body, m_PhysicalRightPosAbs);
+                    eye = ControllerTrackingToWorld(body, m_HmdPosAbs);
                 }
 
                 // HL2VR OpenWeaponSelection: screen centre at
                 // PrimaryHandOrigin() + yaw-forward * 4, vertical plane.
+                // Opened low (hand down by the hip), an upright plane is seen
+                // edge-on: tilt it back about its horizontal axis to face the
+                // eye, by the angle the eye looks down at it (max 60 degrees).
+                Vector menuFwd = yawFwd;
+                Vector menuUp = worldUp;
+                {
+                    const Vector toCenter = hand + yawFwd * kMenuHandForwardHu - eye;
+                    const float flat = sqrtf(toCenter.x * toCenter.x + toCenter.y * toCenter.y);
+                    constexpr float kMaxTiltRad = 60.f * 3.14159265f / 180.f;
+                    float tilt = (bmvr::g_WeaponMenuTilt && flat > 1.f) ? atan2f(-toCenter.z, flat) : 0.f;
+                    if (tilt > kMaxTiltRad)
+                        tilt = kMaxTiltRad;
+                    if (tilt > 0.f)
+                    {
+                        const float c = cosf(tilt), sn = sinf(tilt);
+                        menuFwd = yawFwd * c - worldUp * sn;   // normal along the line of sight
+                        menuUp = worldUp * c + yawFwd * sn;    // top leans away
+                    }
+                }
+                // Centre on the hand's line along the (tilted) normal: hover
+                // projects the hand along it, so an offset centre put the hand
+                // on the slot below (the crowbar) at open.
+                const Vector center = hand + menuFwd * kMenuHandForwardHu;
                 m_WeaponMenuLatchBody = body;
-                m_WeaponMenuLatchWorld = hand + yawFwd * kMenuHandForwardHu;
+                m_WeaponMenuLatchWorld = center;
                 m_WeaponMenuLatchDelta = m_WeaponMenuLatchWorld - body;
-                m_WeaponMenuLatchFwd = yawFwd;
+                m_WeaponMenuLatchHandDelta = hand - body;
+                m_WeaponMenuLatchFwd = menuFwd;
                 m_WeaponMenuLatchRight = yawRight;
-                m_WeaponMenuLatchUp = worldUp;
+                m_WeaponMenuLatchUp = menuUp;
                 m_WeaponMenuLatchYaw = m_RotationOffsetY.load(std::memory_order_acquire);
                 m_WeaponMenuLatched = true;
             }
@@ -1944,6 +2024,19 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
             }
         };
         packInto(kWeaponHex, static_cast<int>(sizeof(kWeaponHex) / sizeof(kWeaponHex[0])));
+        // VR settings: one cell below the crowbar, outside the weapon brick.
+        // Hidden only when the Triangle/Y hold can still open the panel.
+        const bool showGear = bmvr::g_WeaponMenuSettingsGear || !bmvr::g_SettingsTriangleHold;
+        if (showGear && placed < kMaxMenuSlots && take(0, -2))
+        {
+            WeaponMenuSlot& gear = m_WeaponMenuSlots[placed];
+            OffsetToPlane(0, -2, gear.planeX, gear.planeY);
+            gear.hudSlot = 0;
+            gear.hudPos = -2;
+            gear.settingsGear = true;
+            strncpy_s(gear.label, "VR", _TRUNCATE);
+            ++placed;
+        }
         m_WeaponMenuCount = placed;
         ApplyWeaponMenuWorldPose();
 
@@ -1955,19 +2048,19 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
             const Vector trackingBody = MenuPlayerBody(this);
             hand = ControllerTrackingToWorld(trackingBody, m_PhysicalRightPosAbs);
         }
-        const Vector rayStart = hand - m_WeaponMenuFwd * 20.f;
-        const Vector rayDir = m_WeaponMenuFwd;
-        const float planeDenom = rayDir.Dot(m_WeaponMenuFwd);
-        if (fabsf(planeDenom) > 0.0001f)
+        // Hover = the hand's sideways and vertical travel since the menu
+        // opened, mapped 1:1 onto the menu's own right/up. Projecting along
+        // the tilted normal mixed in forward/back travel: an arm raised from
+        // straight ahead also comes back towards the body, which the tilted
+        // plane read as down, so up took noticeably longer than down.
         {
-            const float hitT = (m_WeaponMenuOrigin - rayStart).Dot(m_WeaponMenuFwd) / planeDenom;
-            if (hitT > 0.f && hitT < 120.f)
-            {
-                const Vector hit = rayStart + rayDir * hitT;
-                const Vector rel = hit - m_WeaponMenuOrigin;
-                m_WeaponMenuHandX = rel.Dot(m_WeaponMenuRight);
-                m_WeaponMenuHandY = rel.Dot(m_WeaponMenuUp);
-            }
+            const float yawDelta = m_RotationOffsetY.load(std::memory_order_acquire)
+                - m_WeaponMenuLatchYaw;
+            Vector handDelta = m_WeaponMenuLatchHandDelta;
+            YawAroundZ(handDelta, yawDelta);
+            const Vector d = hand - (MenuPlayerBody(this) + handDelta);
+            m_WeaponMenuHandX = d.Dot(m_WeaponMenuRight);
+            m_WeaponMenuHandY = d.z;
         }
 
         const int prevHover = m_WeaponMenuHover;
@@ -2020,15 +2113,14 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
 
     if (!stickClickHeld && m_WeaponMenuClickHeld)
     {
-        if (m_WeaponMenuOpenedThisHold)
+        const bool openSettings = m_WeaponMenuOpen && m_WeaponMenuHover >= 0
+            && m_WeaponMenuHover < m_WeaponMenuCount && m_WeaponMenuSlots[m_WeaponMenuHover].settingsGear;
+        if (openSettings)
+            OpenSettingsPanel();
+        else if (m_WeaponMenuOpenedThisHold)
             QueueWeaponMenuSound(kWeaponSoundSelect, 0, 0);
         else if ((now - m_WeaponMenuClickStartMs) < kMenuHoldMs)
-        {
-            m_HmdOriginLatched = false;
-            if (bmvr::g_RecenterResetsYaw)
-                m_RotationOffsetY.store(0.f, std::memory_order_release);
-            Game::logMsg("Right-stick tap: recenter");
-        }
+            ToggleEmptyHands();
         m_WeaponMenuOpen = false;
         m_WeaponMenuClickHeld = false;
         m_WeaponMenuOpenedThisHold = false;
@@ -2061,7 +2153,7 @@ void VR::ApplyWeaponMenuWorldPose()
     }
 }
 
-void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
+void VR::DrawWeaponMenu(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
     const Vector& eyeOrig, const Vector& fwd, const Vector& right, const Vector& up)
 {
     if (!m_WeaponMenuOpen || !device || m_WeaponMenuCount <= 0)
@@ -2070,11 +2162,14 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
     EnsureWeaponIcons(device);
     EnsureRadialTextures(device);
     const float pixelAspect = (h > 0) ? (static_cast<float>(w) / static_cast<float>(h)) : m_Aspect;
-    const float aspect = (bmvr::UseGbMatchViewLock() && m_Aspect > 0.1f) ? m_Aspect : pixelAspect;
-    const float projFov = HorizontalFovForAspect(aspect);
+    const float aspect = m_OffCenterActive ? m_OffCenterAspect
+        : (bmvr::UseGbMatchViewLock() && m_Aspect > 0.1f) ? m_Aspect : pixelAspect;
+    const float projFov = m_OffCenterActive ? WorldRenderFov() : HorizontalFovForAspect(aspect);
     const float tanHalf = tanf(projFov * 0.5f * kPi / 180.f);
     if (!(tanHalf > 0.01f))
         return;
+    float ocSx = 1.f, ocOx = 0.f, ocSy = 1.f, ocOy = 0.f;
+    OffCenterNdc(stereoEye, ocSx, ocOx, ocSy, ocOy);
 
     auto project = [&](const Vector& world, float& sx, float& sy, float& rhw) -> bool {
         const Vector delta = world - eyeOrig;
@@ -2084,8 +2179,8 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
         rhw = 1.f / z;
         const float x = delta.Dot(right);
         const float y = delta.Dot(up);
-        const float ndcX = (x * rhw) / tanHalf;
-        const float ndcY = ((y * rhw) * aspect) / tanHalf;
+        const float ndcX = (x * rhw) / tanHalf * ocSx + ocOx;
+        const float ndcY = ((y * rhw) * aspect) / tanHalf * ocSy + ocOy;
         sx = (ndcX * 0.5f + 0.5f) * static_cast<float>(w);
         sy = (-ndcY * 0.5f + 0.5f) * static_cast<float>(h);
         return true;
@@ -2103,7 +2198,7 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
     };
 
     auto drawTexturedQuad = [&](IDirect3DTexture9* tex, const Vector& center,
-        float halfW, float halfH, D3DCOLOR tint) {
+        float halfW, float halfH, D3DCOLOR tint, bool mirrorU = false) {
         if (!tex)
             return;
         const Vector tl = center - m_WeaponMenuRight * halfW + m_WeaponMenuUp * halfH;
@@ -2135,10 +2230,10 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
         device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
         device->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
         MenuVertTex tv[4] = {
-            { x0, y0, 0.f, r0, tint, 0.f, 0.f },
-            { x1, y1, 0.f, r1, tint, 1.f, 0.f },
-            { x2, y2, 0.f, r2, tint, 0.f, 1.f },
-            { x3, y3, 0.f, r3, tint, 1.f, 1.f }
+            { x0, y0, 0.f, r0, tint, mirrorU ? 1.f : 0.f, 0.f },
+            { x1, y1, 0.f, r1, tint, mirrorU ? 0.f : 1.f, 0.f },
+            { x2, y2, 0.f, r2, tint, mirrorU ? 1.f : 0.f, 1.f },
+            { x3, y3, 0.f, r3, tint, mirrorU ? 0.f : 1.f, 1.f }
         };
         DrawVrUiPrimitive(device, D3DPT_TRIANGLESTRIP, 2, tv, sizeof(MenuVertTex));
         device->SetTexture(0, nullptr);
@@ -2203,6 +2298,15 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
         const WeaponMenuSlot& slot = m_WeaponMenuSlots[i];
         const bool hover = (i == m_WeaponMenuHover);
         const bool dry = slot.dry && !slot.emptyHand;
+        if (slot.settingsGear)
+        {
+            if (IDirect3DTexture9* gear = SettingsGearTexture(device))
+                // m_WeaponMenuRight = up x fwd points left in Source;
+                // text must not come out mirrored.
+                drawTexturedQuad(gear, slot.center, radiusHu * 0.62f, radiusHu * 0.31f,
+                    hover ? D3DCOLOR_XRGB(255, 255, 255) : pal.tintIdle, true);
+            continue;
+        }
         const bool showIcon = slot.entityIndex > 0 || (!slot.emptyHand && slot.kind > 0);
         if (!showIcon)
             continue;

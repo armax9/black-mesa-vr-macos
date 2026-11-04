@@ -11,7 +11,7 @@
 // image->buffer / x64 CPU reader, 24 frames, 2026-10-14.
 namespace bmvr_shared_gpu {
 constexpr uint32_t Magic = 0x47564d42;
-constexpr uint32_t Version = 1;
+constexpr uint32_t Version = 2;
 constexpr uint32_t HandleType = 0x80000001u;
 constexpr uint32_t HelperCapability = 1u; // bridge v14 reservedTail0 bit.
 constexpr uint32_t SlotCount = 3;
@@ -26,7 +26,8 @@ struct alignas(64) Slot {
     L4D2VROpenXrPoseDesc pose{};
     int64_t captureQpc = 0;
     float fovX = 90.f, aspect = 1.f;
-    uint32_t reserved1[10]{};
+    float eyeTangents[2][4]{};
+    uint32_t reserved1[2]{};
 };
 struct alignas(64) Control {
     uint32_t magic = 0, version = Version, size = sizeof(Control), producerPid = 0;

@@ -8,6 +8,7 @@
 #include <Windows.h>
 
 #include "game.h"
+#include "bmvr_flags.h"
 #include "openxr_bridge_protocol.h"
 
 #include <algorithm>
@@ -162,8 +163,8 @@ namespace
                 }
             };
 
-        parsePath("VR\\config.txt");
-        parsePath("VR\\config2.txt");
+        parsePath(bmvr::VrFilePath("config.txt").c_str());
+        parsePath(bmvr::VrFilePath("config2.txt").c_str());
         return values;
     }
 
@@ -270,6 +271,8 @@ OpenXrHelperLaunchConfig L4D2VR_ReadOpenXrHelperLaunchConfig()
 
     if (const std::string value = get("OpenXRHelper"); !value.empty())
         config.enabled = ParseBool(value, config.enabled);
+    if (bmvr::g_FakeRuntime)
+        config.enabled = true;
     if (const std::string value = get("OpenXRHelperSwapProjectionEyes"); !value.empty())
         config.swapProjectionEyes = ParseFlipSubmitY(value, config.swapProjectionEyes);
     if (const std::string value = get("OpenXRHelperSwapProjectionViewOrder"); !value.empty())
@@ -280,6 +283,13 @@ OpenXrHelperLaunchConfig L4D2VR_ReadOpenXrHelperLaunchConfig()
         config.disableProjectionLayer = ParseBool(value, config.disableProjectionLayer);
     if (const std::string value = get("OpenXRHelperUseSymmetricProjectionFov"); !value.empty())
         config.useSymmetricProjectionFov = ParseBool(value, config.useSymmetricProjectionFov);
+    // OffCenterEyes: the game renders each eye at the runtime's own FOV, so the
+    // helper submits that FOV and never crops.
+    config.gameRendersRuntimeFov = bmvr::g_OffCenterEyes;
+    if (const std::string value = get("OpenXRHelperSwapchainAtSourceSize"); !value.empty())
+        config.swapchainAtSourceSize = ParseBool(value, config.swapchainAtSourceSize);
+    if (const std::string value = get("OpenXRHelperDownsample"); !value.empty())
+        config.downsampleBox = _stricmp(value.c_str(), "box") == 0 || ParseBool(value, false);
     if (const std::string value = get("OpenXRHelperUseGameRenderPoseForProjection"); !value.empty())
         config.useGameRenderPoseForProjection = ParseBool(value, config.useGameRenderPoseForProjection);
     if (const std::string value = get("OpenXRHelperForceMonoProjectionEye"); !value.empty())
@@ -338,6 +348,24 @@ bool L4D2VR_StartOpenXrHelper(const OpenXrHelperLaunchConfig& config)
                 return {};
             return s.substr(0, slash);
         };
+
+    if (bmvr::g_FakeRuntime)
+    {
+        // Headless tests: no helper process, no SteamVR. The fake helper thread
+        // plays the helper's side of the bridge (vr_fake_helper.cpp).
+        auto* fakeState = new L4D2VROpenXrBridgeState{};
+        fakeState->gamePid = GetCurrentProcessId();
+        fakeState->status = static_cast<uint32_t>(L4D2VROpenXrBridgeStatus::Starting);
+        fakeState->heartbeatTickMs = GetTickCount64();
+        {
+            std::lock_guard<std::mutex> lock(g_OpenXrBridgeStateMutex);
+            g_OpenXrBridgeState = fakeState;
+        }
+        L4D2VR_StartFakeOpenXrHelper(fakeState, config.gameRendersRuntimeFov);
+        Game::logMsg("[VR][OpenXRHelper] fake helper started (VRRuntimeBackend=fake, gameRendersRuntimeFov=%d)",
+            config.gameRendersRuntimeFov ? 1 : 0);
+        return true;
+    }
 
     const std::wstring gameRoot = CurrentDirectoryPath();
     const std::wstring moduleDir = moduleDirectory();
@@ -399,7 +427,8 @@ bool L4D2VR_StartOpenXrHelper(const OpenXrHelperLaunchConfig& config)
 
     *state = L4D2VROpenXrBridgeState{};
     state->gamePid = GetCurrentProcessId();
-    state->reservedTail0 = g_OpenXrLoading.load(std::memory_order_acquire) ? 1u : 0u;
+    state->reservedTail0 = 0;
+    state->loadingState = g_OpenXrLoading.load(std::memory_order_acquire) ? 1u : 0u;
     state->status = static_cast<uint32_t>(L4D2VROpenXrBridgeStatus::Starting);
     state->heartbeatTickMs = GetTickCount64();
 
@@ -420,6 +449,9 @@ bool L4D2VR_StartOpenXrHelper(const OpenXrHelperLaunchConfig& config)
         << L" --mirror-projection-horizontal " << (config.mirrorProjectionHorizontal ? 1 : 0)
         << L" --disable-projection-layer " << (config.disableProjectionLayer ? 1 : 0)
         << L" --use-symmetric-projection-fov " << (config.useSymmetricProjectionFov ? 1 : 0)
+        << L" --game-renders-runtime-fov " << (config.gameRendersRuntimeFov ? 1 : 0)
+        << L" --swapchain-at-source-size " << (config.swapchainAtSourceSize ? 1 : 0)
+        << L" --downsample " << (config.downsampleBox ? L"box" : L"off")
         << L" --use-game-render-pose-for-projection " << (config.useGameRenderPoseForProjection ? 1 : 0)
         << L" --force-mono-projection-eye " << config.forceMonoProjectionEye
         << L" --force-mono-projection-view " << config.forceMonoProjectionView
@@ -662,6 +694,22 @@ void L4D2VR_PublishOpenXrGameRenderPose(const L4D2VROpenXrPoseDesc& pose)
     state->heartbeatTickMs = GetTickCount64();
 }
 
+void L4D2VR_PublishOpenXrMenuQuad(const L4D2VROpenXrMenuQuadDesc& menu)
+{
+    std::lock_guard<std::mutex> lock(g_OpenXrBridgeStateMutex);
+    L4D2VROpenXrBridgeState* state = g_OpenXrBridgeState;
+    if (!state)
+        return;
+    const L4D2VROpenXrMenuQuadDesc& cur = state->menuQuad;
+    if (state->menuQuadGeneration != 0
+        && cur.distanceMeters == menu.distanceMeters && cur.widthMeters == menu.widthMeters
+        && cur.offsetYMeters == menu.offsetYMeters && cur.contentScale == menu.contentScale)
+        return;
+    const uint32_t sequence = L4D2VR_OpenXrBeginPublish(state->menuQuadGeneration);
+    state->menuQuad = menu;
+    L4D2VR_OpenXrEndPublish(state->menuQuadGeneration, sequence);
+}
+
 void L4D2VR_PublishOpenXrHapticRequest(uint32_t handIndex, float durationSeconds, float frequency, float amplitude)
 {
     if (handIndex >= L4D2VR_OPENXR_HAND_COUNT)
@@ -887,7 +935,7 @@ void L4D2VR_PublishOpenXrLoadingState(bool loading)
     g_OpenXrLoading.store(loading, std::memory_order_release);
     std::lock_guard<std::mutex> lock(g_OpenXrBridgeStateMutex);
     if (g_OpenXrBridgeState)
-        InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_OpenXrBridgeState->reservedTail0), loading ? 1 : 0);
+        InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_OpenXrBridgeState->loadingState), loading ? 1 : 0);
 }
 
 uint32_t L4D2VR_OpenXrReferenceSpaceEpoch() {

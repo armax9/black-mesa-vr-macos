@@ -329,6 +329,182 @@ reproject; motion smoothing needs the slower regular cadence.
 - Keep GPU run-ahead bounded (`OpenXrMaxPending`); the published pose must
   not be more than one GPU frame behind the helper's read.
 
+### 8. Multicore Present skip with a dead ICallQueue (Index, 2026-09-09)
+
+`MulticoreMode=true` grows a 2×3 atlas (`MC ring ready`) and, after
+pass-through warmup, sets `mat_queue_mode` 2. `McPipelineEnabled()` then made
+`SubmitVRTextures` return without copying 1x eyes, expecting
+`QueueMcCompositeToRing` → material-thread `CopyEyesToOpenXrPublishSlot`.
+
+Black Mesa's IMatRenderContext is shifted vs Source. Slot 146 can return a
+non-null object that is **not** `ICallQueue`; `QueueFunctorInternal` SEH-fails
+and is later `no ICallQueue`. Stereo still runs (`mc=1`, `direct=1`, NPCs
+audible) but `published=0/s`. The helper keeps the last 2D menu letterbox
+(stuck cursor, dark HMD). SteamVR's desktop preview can still flicker the
+live game because the HWND Present path is unrelated.
+
+Index 1848×2052 → ring ~3728×6192, which fits typical D3D9 caps so this path
+**arms**. A taller HMD (WMR G2 3168×3104 → ring height ~9312) can fail ring
+create and stay on the single-thread publish path — that is the headset
+split, not an Index compositor quirk.
+
+Fix: do not skip Present copy unless a composite actually queued or finished.
+If `QueueFunctorInternal` SEH-fails, forget that slot and copy 1x eyes from
+Present. Do not retry the other vtable slot in the same call, and do not
+bind/copy on the game thread — that killed `bms.exe` at first stereo
+(2026-09-09, exitCode=1). `mat_queue_mode` 2 stays on.
+
+## 9. High FPS, non-native 90 Hz, occasional broken frame (2026-09-20)
+
+Desktop Present and `bmvr_log.txt` `present tick` can sit at 180–320/s while
+the helper's `Submitted OpenXR Vulkan frame` timestamps are ~60/s against a
+90 Hz G2. That is not "probably reprojection" as a guess: the compositor
+client is missing vsync, so the runtime fills the other 30 Hz with ATW /
+reprojection. Extra game frames do not help.
+
+Same log interval in-game:
+
+```
+present=186-228/s published=186-228/s skipRate=0/s helperFeedback=0 consumedLag=-1
+```
+
+Helper gen skips (`sourceGen=22` then `26`) show dropped publishes. Slot reuse
+on `OpenXrDeferredPublish=false` ignored `helperConsumedFrameId` and
+round-robined 4 slots at ~200/s (~20 ms wrap) while two `vkQueueWaitIdle`s
+per eye plus overlay idle held the blit ~16 ms — a slot the compositor was
+still reading could be overwritten. That is the occasional broken / old frame.
+
+HL2VR does not do this. `OnFrameBegin` → `Mat_AwaitFrame` (`WaitGetPoses`) →
+render with that pose → DXVK submit thread `Submit_TextureWithPose` →
+`PostPresentHandoff`. One compositor frame in flight. Next `WaitGetPoses`
+waits for that handoff.
+
+OpenXR equivalent that **failed on HMD** (2026-09-20, WMR G2 90 Hz):
+
+1. Game waited up to 16 ms for `helperConsumedFrameId` and 32 ms for a new
+   `displayTime` before stereo (`handoffWait` every published frame,
+   `await avg=5–15ms max=16–47ms`).
+2. Helper polled ≤9 ms after `xrWaitFrame` for a pair tagged with this
+   `predictedDisplayTime` (`matchHit=2–6` out of thousands,
+   `matchWaitAvg=9.01ms` — the timeout every frame).
+3. Same-`displayTime` skip starved the menu (`published=0/s skipVsync=258`
+   because the latched panel pose never changes).
+
+`waitFrameAvg` sat at 12.5–15.5 ms, in-game `published≈helperHz≈44–78`.
+That is the documented 2026-08-30 failure: waiting after `xrWaitFrame`
+makes `xrEndFrame` late, so WMR cannot hold 90 Hz and ATW/reprojects.
+Glitched frames did drop (`helperFeedback=1` slot gate). Keep the gate;
+do not keep the waits.
+
+Corrected path after HMD run 1 (removed helper 9 ms poll and consume waits).
+**HMD run 2 (user, 2026-09-20):** desktop FPS improved; still heavy
+reprojection; “not true 90 Hz”. In-game logs: `present=150-250/s`
+`await=130-190/s` stereo pairs of 3168x3088, `helperHz` 89 → 45,
+`helperHold` 9 → 132, `consumedLag=2-4`. Helper `waitFrameWin` lifetime
+avg ended at 14.9 ms (~67 Hz) with `blitSkip`/`fenceBusyFrames` climbing.
+Stereo CPU is ~1 ms; the extra pairs saturate the GPU so the helper blit
+fence misses vsync and the runtime ATWs.
+
+HL2VR waits `WaitGetPoses` then draws **one** pair with that pose. OpenXR
+now:
+
+1. Game `AwaitOpenXrCompositorFrame`: wait ≤22 ms for a new helper
+   `displayTime`/`gen` only (no consume wait). No new pose → skip this
+   engine frame’s stereo (last swapchain stays). Desktop FPS in a map
+   should sit near 90.
+2. Helper still EndFrames immediately. Two blit command-buffer/fence sets
+   so one in-flight blit does not skip the next vsync.
+3. Slot consume-id gate stays.
+
+Expect in-game `await≈90/s`, `helperHz≈90`, helper `waitFrameWin≈11ms`,
+`blitSkip` not climbing. Do not claim native 90 Hz until the headset run
+shows that. Desktop FPS will look lower in-map; that is the compositor
+cadence, not a settings cut.
+
+## 10. Deferred publish again, waiting instead of dropping (2026-10-14)
+
+Public beta 25844216, `bm_c1a0a` tram, WMR G2 90 Hz, RTX 4070 Ti, eyes
+3168x3104, multicore. User: "a lot of tearing during movement, like some
+frames can't keep up or aren't synchronized with the head".
+
+Sync publish (`OpenXrDeferredPublish=false`): the material thread spun in
+`pollEvent` for the GPU after every eye copy.
+
+```
+pairs=25-42/s copyWait=25-42/s avg=10.6-14.0ms max=19-212ms (copyTid = presentTid)
+pairs=68-89/s on lighter stretches, GPU 14-71%
+```
+
+CPU and GPU never overlap, so every frame cost CPU + GPU time and the
+compositor repeated frames under a moving world.
+
+Deferred with the §7b throttle rendered at the compositor rate but dropped
+every other pair, because the previous copy was still on the GPU when the next
+pair was ready:
+
+```
+pairs=87-90/s published=41-45/s throttled=44/s pending=1/1
+```
+
+Fix: in `CopyEyesToOpenXrPublishSlot`, when `OpenXrMaxPending` copies are
+pending, `WaitOldestOpenXrPending` (publish it) before this copy instead of
+returning `throttled`. The GPU is already working on the new pair, so the wait
+is only the tail of the previous one. Default `OpenXrDeferredPublish` is now
+`true`.
+
+```
+pairs=82-89/s published=83-89/s throttled=0/s dropped=0/s pending=1/1
+paceWait=70-83/s avg=4-8ms helperHz=89-90 waitFrameWin=11.1ms GPU 83-98%
+```
+
+Invariants still hold: one frame in flight, descriptor goes out only after its
+EVENT signaled, consumed-id slot gate unchanged. Remaining gap to 90 is GPU
+time (~98% busy).
+
+### 10a. User session: mostly 90, dips in crowded rooms (2026-10-14)
+
+User played the §10 build on `bm_c1a0a` then `bm_c1a0b`: "really good now",
+then "the odd stutter and tearing every now and then, especially the last
+2 minutes". Rate lines for those minutes:
+
+```
+published=89-94/s helperHz=90 throttled=0-5/s   (open areas)
+published=64-73/s pairs=64-70/s helperHz=90     (crowded)
+```
+
+`helperHz` never left 90 and `dropped=0` throughout, so the compositor kept
+its cadence and the dips are the game producing fewer pairs, not the helper
+repeating or mixing frames. `blitSkip` rose 0 → 3 over the whole session
+(cumulative), i.e. the blit fence was busy on 3 of ~64,000 frames.
+
+Stereo-cost samples (599 of them; the timer covers only the two RenderViews,
+not the queue wait): 117 ≥ 5 ms, 6 ≥ 10 ms, max 30.1 ms. Every slow sample is
+the same shape: `shadowPush=76` and `dme` in the hundreds
+(`models/humans/scientist.mdl`, `guard.mdl`, `scientist_02.mdl`). `gbDepth`
+stays 4, so the deferred path never switched to the cheap one. Two outliers
+are not GPU frames: a 4406 ms stall is the `bm_c1a0a` → `bm_c1a0b` load, and a
+1016 ms stall has 0.6–5 ms pairs on both sides of it (a scheduling hitch, one
+instance all session).
+
+Not changed. The earlier CSM-quality cuts were measured unplayable on this
+engine (RUNTIME.md, Surface Tension). `RenderScale=0.9` is the available
+headroom knob.
+
+### 10b. Closed session: desktop 150, headset 90 (2026-10-14)
+
+User closed the session and said frames still glitch while the shown FPS is
+150. That counter is `present=` (150–180/s on `bm_c1a0b`). The headset stayed
+at `helperHz=90` and received `published=82–91/s`. `dropped=0`, `blitSkip`
+did not climb, `waitFrameLast` stayed ~11 ms. The 150 is not a headset rate.
+
+The leftover hitch is the submit clock. The eyes are drawn for WaitFrame N's
+predicted time, then the helper's next `xrEndFrame` stamps them with WaitFrame
+N+1. The runtime treats the old pose as already current and does not timewarp
+that ~11 ms (`consumedLag=2`). Fix, not yet headset-checked: when the latched
+render pose time is 0–40 ms behind this WaitFrame, `xrEndFrame.displayTime` is
+that pose time. Helper log field `poseSkewMs` is the correction. The desktop
+counter will still read ~150.
+
 ## Status
 
 Defects 1-5 are implemented and confirmed live in the game/helper logs (publish

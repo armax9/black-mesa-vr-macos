@@ -1,8 +1,9 @@
 #include <Windows.h>
 #include "game.h"
 #include "bmvr_flags.h"
+#include "bmvr_version.h"
+#include <cstdint>
 #include <cstring>
-#include "bmvr_abi.h"
 
 static LONG CALLBACK FaultVeh(PEXCEPTION_POINTERS info)
 {
@@ -80,6 +81,8 @@ static LONG CALLBACK FaultVeh(PEXCEPTION_POINTERS info)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+#include "bmvr_abi.h"
+
 extern "C" void __cdecl L4D2VR_ShutdownSystemMouseInputSuppression();
 extern "C" void __cdecl L4D2VR_ShutdownReShadeVRBridge();
 
@@ -100,6 +103,68 @@ static BOOL CALLBACK RestoreMonitorMode(HMONITOR monitor, HDC, LPRECT, LPARAM)
 static void RestoreDesktopDisplayModes()
 {
     EnumDisplayMonitors(nullptr, nullptr, RestoreMonitorMode, 0);
+}
+
+// Counts access violations (caught or not) so a guarded read that faults every
+// frame shows up in bmvr_log; under Wine each one costs a kernel round trip.
+namespace
+{
+    volatile LONG g_FaultCount = 0;
+    struct FaultSlot { volatile LONG addr; volatile LONG hits; };
+    FaultSlot g_FaultSlots[8]{};
+
+    LONG CALLBACK CountFaults(PEXCEPTION_POINTERS info)
+    {
+        if (info && info->ExceptionRecord
+            && info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
+        {
+            InterlockedIncrement(&g_FaultCount);
+            const LONG addr = static_cast<LONG>(reinterpret_cast<uintptr_t>(
+                info->ExceptionRecord->ExceptionAddress));
+            for (FaultSlot& s : g_FaultSlots)
+            {
+                if (s.addr == addr || InterlockedCompareExchange(&s.addr, addr, 0) == 0)
+                {
+                    InterlockedIncrement(&s.hits);
+                    break;
+                }
+            }
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+}
+
+namespace bmvr
+{
+    void LogFaultStats()
+    {
+        const LONG n = InterlockedExchange(&g_FaultCount, 0);
+        LONG topAddr = 0, topHits = 0;
+        for (FaultSlot& s : g_FaultSlots)
+        {
+            const LONG hits = InterlockedExchange(&s.hits, 0);
+            const LONG addr = InterlockedExchange(&s.addr, 0);
+            if (hits > topHits)
+            {
+                topHits = hits;
+                topAddr = addr;
+            }
+        }
+        if (n == 0)
+            return;
+        HMODULE mod = nullptr;
+        char name[MAX_PATH] = "?";
+        uintptr_t rva = static_cast<uintptr_t>(topAddr);
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCSTR>(static_cast<uintptr_t>(topAddr)), &mod) && mod)
+        {
+            GetModuleFileNameA(mod, name, MAX_PATH);
+            rva -= reinterpret_cast<uintptr_t>(mod);
+        }
+        const char* base = std::strrchr(name, '\\');
+        Log("Access violations since last report: %ld, top %ld at %s+0x%X",
+            n, topHits, base ? base + 1 : name, static_cast<unsigned>(rva));
+    }
 }
 
 static DWORD WINAPI InitBMVR(LPVOID param)
@@ -128,6 +193,9 @@ static DWORD WINAPI InitBMVR(LPVOID param)
         return 0;
     }
 
+    // First log line: lets a shared bmvr_log.txt name the exact build.
+    bmvr::Log("Black Mesa VR %s (commit %s %s, built %s %s)",
+        BMVR_RELEASE, BMVR_COMMIT, BMVR_COMMIT_DATE, __DATE__, __TIME__);
     bmvr::InitFromDisk();
     char path[MAX_PATH]{};
     GetModuleFileNameA(static_cast<HMODULE>(param), path, MAX_PATH);
@@ -144,12 +212,14 @@ static DWORD WINAPI InitBMVR(LPVOID param)
     const auto* nt=reinterpret_cast<const IMAGE_NT_HEADERS*>(base+dos->e_lfanew);
     const unsigned char beta[] = {0x55,0x8B,0xEC,0x83,0xEC,0x24,0x53,0x56,0x57,0x8B,0x7D,0x08,0x8B,0xF1,0x85,0xFF};
     const unsigned char stable[] = {0x55,0x8B,0xEC,0x83,0xEC,0x24,0x53,0x56,0x8B,0x75,0x08,0x57,0x8B,0xF9,0x85,0xF6};
-    if (nt->OptionalHeader.SizeOfImage > 0x29BA10+sizeof(beta) && std::memcmp(base+0x29BA10,beta,sizeof(beta))==0)
+    if (nt->OptionalHeader.SizeOfImage > 0x29CC70+sizeof(beta) && std::memcmp(base+0x29CC70,beta,sizeof(beta))==0)
+        bmvr::abi::build=bmvr::abi::Build::Beta26234270;
+    else if (nt->OptionalHeader.SizeOfImage > 0x29BA10+sizeof(beta) && std::memcmp(base+0x29BA10,beta,sizeof(beta))==0)
         bmvr::abi::build=bmvr::abi::Build::Beta25844216;
     else if (nt->OptionalHeader.SizeOfImage > 0x29D930+sizeof(stable) && std::memcmp(base+0x29D930,stable,sizeof(stable))==0)
         bmvr::abi::build=bmvr::abi::Build::Stable19042901;
     else { bmvr::Log("Game ABI: unsupported client; VR hooks disabled"); return 0; }
-    bmvr::Log("Game ABI selected: %s; common v53 gameplay fixes",bmvr::abi::Beta()?"public-beta25844216":"stable19042901");
+    bmvr::Log("Game ABI selected: %s; common v53 gameplay fixes",bmvr::abi::build == bmvr::abi::Build::Beta26234270 ? "public-beta26234270" : bmvr::abi::Beta()?"public-beta25844216":"stable19042901");
     g_Game = new Game();
     return 0;
 }

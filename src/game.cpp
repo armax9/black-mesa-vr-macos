@@ -15,6 +15,8 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <mutex>
+#include <set>
 using tCreateInterface = void*(__cdecl*)(const char* name, int* returnCode);
 
 static HMODULE GetModuleWithRetry(const char* dllname, int maxTries = 1800, int delayMs = 100)
@@ -173,19 +175,13 @@ Game::Game()
 
     m_Initialized = true;
     bmvr::SetStage("game_ready");
-    Game::logMsg("BMVR Game initialized (L4D2VR architecture, Black Mesa offsets). namedRT=%d stereoRV=%d stereoCopy=%d stereoFov=%d hmdSwap=%d hmdFb=%d hmdNative=%d steamvrRT=%d offscreen=%d hmd_world=%d waitIdle=%d absView=%d menuVR=%d relLook=%d",
+    Game::logMsg("BMVR Game initialized (L4D2VR architecture, Black Mesa offsets). namedRT=%d stereoRV=%d hmdFb=%d hmdNative=%d offscreen=%d hmd_world=%d menuVR=%d relLook=%d",
         bmvr::TryNamedRenderTargets() ? 1 : 0,
         bmvr::TryStereoRenderView() ? 1 : 0,
-        bmvr::TryStereoCopy() ? 1 : 0,
-        bmvr::TryStereoFov() ? 1 : 0,
-        bmvr::TryHmdSwapchain() ? 1 : 0,
         bmvr::TryHmdFramebuffer() ? 1 : 0,
         bmvr::TryHmdNative() ? 1 : 0,
-        bmvr::TrySteamVrEyeRt() ? 1 : 0,
         bmvr::TryOffscreenHmd() ? 1 : 0,
         bmvr::TryOffscreenWorldGrow() ? 1 : 0,
-        bmvr::TryWaitDeviceIdle() ? 1 : 0,
-        bmvr::TryAbsoluteHmdView() ? 1 : 0,
         bmvr::TryMenuCompositor() ? 1 : 0,
         bmvr::TryRelativeHmdLook() ? 1 : 0);
 }
@@ -463,7 +459,7 @@ void Game::EmitEntitySound(C_BaseEntity* entity, const char* soundName)
         return;
     using EmitFn = void(__thiscall*)(void*, const char*, float, float*);
     auto emit = reinterpret_cast<EmitFn>(
-        reinterpret_cast<uintptr_t>(client) + Offsets::kCBaseEntity_EmitSound);
+        reinterpret_cast<uintptr_t>(client) + Offsets::kCBaseEntity_EmitSound());
     __try
     {
         emit(entity, soundName, 0.f, nullptr);
@@ -599,6 +595,7 @@ const char* Game::GetEntityClientClassName(C_BaseEntity* entity)
 namespace
 {
     int g_nvHealth = -1;
+    int g_nvViewEntity = -1;
     int g_nvArmor = -1;
     int g_nvClip1 = -1;
     int g_nvClip2 = -1;
@@ -611,6 +608,8 @@ namespace
     int g_nvRpgLaserDot = -1;
     int g_nvWaterLevel = -1;
     int g_nvAirFinished = -1;
+    int g_nvMoveType = -1;
+    int g_nvFlags = -1;
     bool g_nvScanned = false;
 
     const char* FindStringInImage(const unsigned char* base, size_t size, const char* s)
@@ -636,6 +635,9 @@ namespace
         if (!s)
         {
             Game::logMsg("WristHUD RecvProp '%s': string not found", propName);
+            // m_hLaserDot is HL2's RPG prop; BM has no such string in any build, so it is no update sign.
+            if (std::strcmp(propName, "m_hLaserDot") != 0)
+                Game::noteMissingOffset(propName);
             return -1;
         }
         const uintptr_t nameVA = reinterpret_cast<uintptr_t>(s);
@@ -674,21 +676,24 @@ namespace
         if (!s)
         {
             Game::logMsg("WristHUD datamap '%s': string not found", propName);
+            Game::noteMissingOffset(propName);
             return -1;
         }
         const uintptr_t nameVA = reinterpret_cast<uintptr_t>(s);
         int best = -1;
         int hits = 0;
-        for (size_t i = 5; i + 4 < size; i += 1)
+        // i = the name's imm32: 68 <offset> 68 <nameVA> puts the offset at i-5 and the pushes at i-6 / i-1
+        // (it read i-4 behind a test of i-5 and never matched: m_ArmorValue hits=0 on every build).
+        for (size_t i = 6; i + 4 < size; i += 1)
         {
             uintptr_t v = 0;
             memcpy(&v, base + i, sizeof(v));
             if (v != nameVA)
                 continue;
-            if (base[i - 5] != 0x68)
+            if (base[i - 1] != 0x68 || base[i - 6] != 0x68)
                 continue;
             int val = 0;
-            memcpy(&val, base + i - 4, sizeof(val));
+            memcpy(&val, base + i - 5, sizeof(val));
             ++hits;
             if (val < minOff || val > maxOff || (val & 3) != 0)
                 continue;
@@ -722,6 +727,9 @@ void Game::ScanWristHudNetVars()
     if (g_nvHealth < 0)
         g_nvHealth = 0x98;
     // Live HEV is C_BlackMesaPlayer::m_ArmorValue 0x17C0, not C_BasePlayer 0x134C.
+    // DT_LocalPlayerExclusive m_hViewEntity (0x12E8 on 26234270), registered
+    // as 68 <offset> 68 <name> like a datamap field.
+    g_nvViewEntity = FindDatamapFieldOffset(base, imgSize, "m_hViewEntity", 0x800, 0x3000);
     g_nvArmor = FindDatamapFieldOffset(base, imgSize, "m_ArmorValue", 0x1000, 0x4000);
     if (g_nvArmor < 0)
         g_nvArmor = 0x17C0;
@@ -757,10 +765,17 @@ void Game::ScanWristHudNetVars()
     // the server SendProp leftover at +0x1374; taking the smallest hit in a wide
     // range landed on that leftover, so zoom never read as 1 and scoped aim
     // stayed on the controller.
-    const int flashlight = FindRecvPropOffsetPlus4(
+    int flashlight = FindRecvPropOffsetPlus4(
         base, imgSize, "m_bFlashlightEnabled", 0x1700, 0x1A00, false, true);
     g_nvZooming = FindRecvPropOffsetPlus4(
         base, imgSize, "m_bZooming", 0x1700, 0x1A00, false, true);
+    // BM builds these two RecvProps in code (push offset; push name; call), so there is no table entry
+    // with the offset after the name (both -1 on betas 25844216 and 26234270: zoom 0x17C8, flashlight
+    // 0x17E8). The datamap scan reads exactly that push pair.
+    if (flashlight < 0)
+        flashlight = FindDatamapFieldOffset(base, imgSize, "m_bFlashlightEnabled", 0x1700, 0x1A00);
+    if (g_nvZooming < 0)
+        g_nvZooming = FindDatamapFieldOffset(base, imgSize, "m_bZooming", 0x1700, 0x1A00);
     if (g_nvZooming < 0 && flashlight > 0)
         g_nvZooming = flashlight - 1;
     g_nvRpgLaserOn = FindRecvPropOffsetPlus4(
@@ -775,12 +790,22 @@ void Game::ScanWristHudNetVars()
         base, imgSize, "m_AirFinished", 0x1400, 0x1800);
     if (g_nvAirFinished < 0)
         g_nvAirFinished = Offsets::kCBasePlayer_AirFinished;
+    // Datamap typedescription_t: name pointer, then the field offset.
+    g_nvMoveType = FindRecvPropOffsetPlus4(
+        base, imgSize, "m_MoveType", 0x100, 0x200, false);
+    if (g_nvMoveType < 0)
+        g_nvMoveType = Offsets::kCBaseEntity_MoveType;
+    // m_fFlags (FL_ONGROUND bit 0, FL_ONTRAIN bit 4, FL_CLIENT bit 8): train controls.
+    g_nvFlags = FindRecvPropOffsetPlus4(
+        base, imgSize, "m_fFlags", 0x100, 0x600);
     Game::logMsg("Wrist HUD netvars health=%d armor=%d clip1=%d clip2=%d ammo=%d primType=%d secType=%d",
         g_nvHealth, g_nvArmor, g_nvClip1, g_nvClip2, g_nvAmmoBase, g_nvPrimaryAmmoType,
         g_nvSecondaryAmmoType);
-    Game::logMsg("VR netvars m_Local=%d m_bWearingSuit(+local)=%d suit=%d zooming=%d flashlight=%d rpgLaserOn=%d rpgLaserDot=%d water=%d airFinished=%d",
+    Game::logMsg("VR netvar m_hViewEntity=%d (%s)", g_nvViewEntity,
+        g_nvViewEntity >= 0 ? "cutscene cameras need it" : "not found: cutscene follow uses the angles alone");
+    Game::logMsg("VR netvars m_Local=%d m_bWearingSuit(+local)=%d suit=%d zooming=%d flashlight=%d rpgLaserOn=%d rpgLaserDot=%d water=%d airFinished=%d moveType=%d flags=%d",
         localData, suitInLocal, g_nvWearingSuit, g_nvZooming, flashlight,
-        g_nvRpgLaserOn, g_nvRpgLaserDot, g_nvWaterLevel, g_nvAirFinished);
+        g_nvRpgLaserOn, g_nvRpgLaserDot, g_nvWaterLevel, g_nvAirFinished, g_nvMoveType, g_nvFlags);
 }
 
 // Reads a networked bool. Returns -1 when the offset is unresolved, has been
@@ -815,6 +840,191 @@ int Game::ReadPlayerFlagByte(int& offset)
         return -1;
     }
     return value;
+}
+
+// MOVETYPE_* of the local player, -1 when unavailable. Retired like the
+// bools above when it reads past MOVETYPE_CUSTOM (11).
+int Game::LocalPlayerMoveType()
+{
+    ScanWristHudNetVars();
+    if (g_nvMoveType < 0 || !m_EngineClient || !m_ClientEntityList)
+        return -1;
+    const int local = m_EngineClient->GetLocalPlayer();
+    if (local <= 0)
+        return -1;
+    void* player = m_ClientEntityList->GetClientEntity(local);
+    if (!player)
+        return -1;
+    unsigned char value = 0;
+    __try
+    {
+        value = *reinterpret_cast<volatile unsigned char*>(
+            static_cast<unsigned char*>(player) + g_nvMoveType);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        g_nvMoveType = -1;
+        return -1;
+    }
+    if (value > 11)
+    {
+        Game::logMsg("VR movetype at +0x%X read %u, offset retired", g_nvMoveType, value);
+        g_nvMoveType = -1;
+        return -1;
+    }
+    return value;
+}
+
+// m_fFlags of the local player, -1 when unavailable. Retired when FL_CLIENT
+// (bit 8) is missing: then the scan did not land on the player's flags.
+int Game::LocalPlayerFlags()
+{
+    ScanWristHudNetVars();
+    if (g_nvFlags < 0 || !m_EngineClient || !m_ClientEntityList)
+        return -1;
+    const int local = m_EngineClient->GetLocalPlayer();
+    if (local <= 0)
+        return -1;
+    void* player = m_ClientEntityList->GetClientEntity(local);
+    if (!player)
+        return -1;
+    int value = 0;
+    __try
+    {
+        value = *reinterpret_cast<volatile int*>(static_cast<unsigned char*>(player) + g_nvFlags);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        g_nvFlags = -1;
+        return -1;
+    }
+    if (!(value & (1 << 8)))
+    {
+        Game::logMsg("VR m_fFlags at +0x%X read 0x%X, not player flags: offset retired", g_nvFlags, value);
+        g_nvFlags = -1;
+        return -1;
+    }
+    return value;
+}
+
+bool Game::LocalPlayerAbsOrigin(Vector& out)
+{
+    if (!m_EngineClient || !m_ClientEntityList)
+        return false;
+    const int local = m_EngineClient->GetLocalPlayer();
+    void* player = local > 0 ? m_ClientEntityList->GetClientEntity(local) : nullptr;
+    if (!player)
+        return false;
+    __try
+    {
+        out = *reinterpret_cast<const Vector*>(static_cast<const char*>(player) + Offsets::kCBaseEntity_AbsOrigin);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+    return out.LengthSqr() > 0.f;
+}
+
+int Game::CollectLadders(Vector* bottoms, Vector* tops, int maxLadders)
+{
+    static int s_index[64];
+    static int s_count = 0;
+    static DWORD s_scanMs = 0;
+    if (!m_ClientEntityList)
+        return 0;
+    const DWORD now = GetTickCount();
+    if (s_scanMs == 0 || now - s_scanMs > 1000)
+    {
+        s_scanMs = now;
+        s_count = 0;
+        const int hi = m_ClientEntityList->GetHighestEntityIndex();
+        for (int e = 1; e <= hi && s_count < 64; ++e)
+        {
+            const char* name = GetEntityNetworkName(e);
+            if (name && std::strcmp(name, "CFuncLadder") == 0)
+                s_index[s_count++] = e;
+        }
+    }
+    int n = 0;
+    for (int i = 0; i < s_count && n < maxLadders; ++i)
+    {
+        const char* ent = static_cast<const char*>(m_ClientEntityList->GetClientEntity(s_index[i]));
+        if (!ent)
+            continue;
+        __try
+        {
+            const Vector org = *reinterpret_cast<const Vector*>(ent + Offsets::kCBaseEntity_AbsOrigin);
+            bottoms[n] = org + *reinterpret_cast<const Vector*>(ent + Offsets::kCFuncLadder_MountBottom);
+            tops[n] = org + *reinterpret_cast<const Vector*>(ent + Offsets::kCFuncLadder_MountTop);
+            ++n;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+    }
+    static int s_loggedCount = -1;
+    if (n != s_loggedCount)
+    {
+        s_loggedCount = n;
+        Vector me{};
+        const bool haveMe = LocalPlayerAbsOrigin(me);
+        if (n > 0)
+            Game::logMsg("Ladders: %d on the map; first bottom (%.0f,%.0f,%.0f) top (%.0f,%.0f,%.0f), player (%.0f,%.0f,%.0f)%s",
+                n, bottoms[0].x, bottoms[0].y, bottoms[0].z, tops[0].x, tops[0].y, tops[0].z,
+                me.x, me.y, me.z, haveMe ? "" : " (unknown)");
+        else
+            Game::logMsg("Ladders: none on the map");
+    }
+    return n;
+}
+
+int Game::CollectMountedGunProps(int* indexes, int maxProps)
+{
+    static int s_index[32];
+    static int s_count = 0;
+    static DWORD s_scanMs = 0;
+    if (!m_ClientEntityList)
+        return 0;
+    const DWORD now = GetTickCount();
+    if (s_scanMs == 0 || now - s_scanMs > 1000)
+    {
+        s_scanMs = now;
+        s_count = 0;
+        const int hi = m_ClientEntityList->GetHighestEntityIndex();
+        for (int e = 1; e <= hi && s_count < 32; ++e)
+        {
+            const char* model = GetEntityModelName(GetClientEntity(e));
+            if (model && (std::strstr(model, "props_marines/50cal.mdl")
+                || std::strstr(model, "props_marines/tow_missile_system")))
+                s_index[s_count++] = e;
+        }
+        static int s_loggedCount = -1;
+        if (s_count != s_loggedCount)
+        {
+            s_loggedCount = s_count;
+            Game::logMsg("Mounted guns: %d on the map", s_count);
+        }
+    }
+    int n = 0;
+    for (int i = 0; i < s_count && n < maxProps; ++i)
+        indexes[n++] = s_index[i];
+    return n;
+}
+
+bool Game::GetEntityAbsOrigin(C_BaseEntity* entity, Vector& out)
+{
+    if (!entity)
+        return false;
+    __try
+    {
+        out = *reinterpret_cast<const Vector*>(reinterpret_cast<const char*>(entity) + Offsets::kCBaseEntity_AbsOrigin);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+    return out.LengthSqr() > 0.f;
 }
 
 bool Game::LocalPlayerHasSuit()
@@ -936,6 +1146,30 @@ bool Game::WeaponHasNoAmmo(C_BaseEntity* weapon)
     return clip <= 0 && reserve <= 0;
 }
 
+bool Game::ReadLocalPlayerViewEntitySet(bool& set)
+{
+    ScanWristHudNetVars();
+    if (!m_EngineClient || !m_ClientEntityList || g_nvViewEntity < 0)
+        return false;
+    const int local = m_EngineClient->GetLocalPlayer();
+    if (local <= 0)
+        return false;
+    void* player = m_ClientEntityList->GetClientEntity(local);
+    if (!player)
+        return false;
+    __try
+    {
+        const unsigned int h = *reinterpret_cast<volatile unsigned int*>(
+            reinterpret_cast<unsigned char*>(player) + g_nvViewEntity);
+        set = h != 0xFFFFFFFFu && h != 0;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
 bool Game::ReadWristHudValues(int& health, int& armor, int& clip, int& reserve, int& secondary, int& air)
 {
     ScanWristHudNetVars();
@@ -1011,7 +1245,7 @@ bool Game::ReadWristHudValues(int& health, int& armor, int& clip, int& reserve, 
             __try
             {
                 const uintptr_t gp = *reinterpret_cast<uintptr_t*>(
-                    m_BaseClient + Offsets::kClientGpGlobalsPtr);
+                    m_BaseClient + Offsets::kClientGpGlobalsPtr());
                 if (gp)
                     curtime = *reinterpret_cast<float*>(gp + Offsets::kCGlobalVars_curtime);
             }
@@ -1682,6 +1916,11 @@ namespace
     }
 }
 
+void* Game::FindConVar(const char* name) const
+{
+    return FindConVarProbe(m_Cvar, name);
+}
+
 bool Game::SetConVarInt(const char* name, int value) const
 {
     void* cvar = FindConVarProbe(m_Cvar, name);
@@ -1745,6 +1984,24 @@ void Game::logMsg(const char* fmt, ...)
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
     bmvr::Log("%s", buf);
+}
+
+namespace
+{
+    std::mutex g_MissingOffsetsMutex;
+    std::set<std::string> g_MissingOffsets;
+}
+
+void Game::noteMissingOffset(const char* what)
+{
+    std::lock_guard<std::mutex> lock(g_MissingOffsetsMutex);
+    g_MissingOffsets.insert(what ? what : "?");
+}
+
+int Game::missingOffsetCount()
+{
+    std::lock_guard<std::mutex> lock(g_MissingOffsetsMutex);
+    return static_cast<int>(g_MissingOffsets.size());
 }
 
 void Game::errorMsg(const char* msg)

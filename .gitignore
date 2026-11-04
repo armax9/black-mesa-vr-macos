@@ -17,3 +17,14 @@ CMakeUserPresets.json
 .git.upstream/
 third_party/l4d2vr-openxr/
 third_party/openxr/loader/
+build-linux/
+build-linux-helper/
+build-stable*/
+build-beta/
+build-beta-helper/
+
+# Local macOS cross-build outputs
+build-mac-*/
+build-checks-*/
+__pycache__/
+release-local/

@@ -50,13 +50,16 @@ set(BMVR_SOURCES
   src/vr_audio_focus.cpp
   src/vr_crowbar.cpp
   src/vr_weapon_menu.cpp
+  src/vr_settings_panel.cpp
   src/vr_hands.cpp
   src/vr_hand_renderer_d3d9.cpp
   src/vr_runtime_backend.cpp
   src/openxr_helper_bridge.cpp
+  src/vr_fake_helper.cpp
   src/openxr_loader_util.cpp
   src/bmvr_flags.cpp
   src/bmvr_stall_capture.cpp
+  src/bmvr_cvars.cpp
   src/sdk/checksum_crc.cpp
   third_party/l4d2vr/L4D2VR/vr_hands/vr_hand_asset_loader.cpp
   third_party/minhook/src/buffer.c
@@ -66,6 +69,16 @@ set(BMVR_SOURCES
 )
 
 add_library(d3d9 SHARED ${DXVK_SOURCES} ${BMVR_SOURCES})
+
+# Release name + commit for the log header (src/dllmain.cpp).
+set(BMVR_VERSION_H "${CMAKE_CURRENT_BINARY_DIR}/generated/bmvr_version.h")
+add_custom_target(bmvr_version
+  COMMAND "${CMAKE_COMMAND}" -DSRC=${ROOT} -DOUT=${BMVR_VERSION_H} -P "${ROOT}/cmake/bmvr_version.cmake"
+  BYPRODUCTS "${BMVR_VERSION_H}"
+  COMMENT "BMVR version header"
+  VERBATIM
+)
+add_dependencies(d3d9 bmvr_version)
 set_target_properties(d3d9 PROPERTIES
   OUTPUT_NAME "d3d9"
   PREFIX ""
@@ -83,6 +96,7 @@ target_compile_definitions(d3d9 PRIVATE
 )
 
 target_include_directories(d3d9 PRIVATE
+  "${CMAKE_CURRENT_BINARY_DIR}/generated"
   "${ROOT}"
   "${ROOT}/src"
   "${ROOT}/src/sdk"

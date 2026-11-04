@@ -84,10 +84,26 @@ public:
     bool ReadWristHudValues(int& health, int& armor, int& clip, int& reserve, int& secondary, int& air);
     // False only when m_bWearingSuit resolved and reads 0 (pre-HEV intro).
     bool LocalPlayerHasSuit();
+    // Local player m_hViewEntity is set (a point_viewcontrol camera has the
+    // view; death, view punch and shakes never set it). False when it cannot
+    // be read (offset not found, no player).
+    bool ReadLocalPlayerViewEntitySet(bool& set);
     // True only when m_bZooming resolved and reads 1 (crossbow scope).
     bool LocalPlayerZooming();
     // -1 if the netvar is missing/retired, otherwise 0 or 1.
     int LocalPlayerZoomFlag();
+    // MOVETYPE_* of the local player (9 = ladder), -1 when unavailable.
+    int LocalPlayerMoveType();
+    int LocalPlayerFlags();
+    bool LocalPlayerAbsOrigin(Vector& out);
+    // World-space bottom/top mount points of the map's func_useableladders
+    // (CFuncLadder; entity list rescanned at most once a second).
+    int CollectLadders(Vector* bottoms, Vector* tops, int maxLadders);
+    // Entity indexes of the props mounted guns turn (50cal / TOW model; the
+    // func_50cal / func_tow itself is a brush with no model of its own).
+    // Rescanned at most once a second.
+    int CollectMountedGunProps(int* indexes, int maxProps);
+    bool GetEntityAbsOrigin(C_BaseEntity* entity, Vector& out);
     int RpgLaserOnOffset() const;
     int RpgLaserDotOffset() const;
     C_BaseEntity* FindEntityByNetworkNameContains(const char* token);
@@ -126,10 +142,16 @@ public:
     bool SetConVarFloat(const char* name, float value) const;
     bool GetConVarInt(const char* name, int& value) const;
     bool GetConVarFloat(const char* name, float& value) const;
+    // ICvar::FindVar (slot-probed); null when the cvar does not exist.
+    void* FindConVar(const char* name) const;
     bool MaterialVTableMatchesDump() const;
 
     static void logMsg(const char* fmt, ...);
     static void errorMsg(const char* msg);
+    // A signature or byte check that no longer matches the game (usually a Black Mesa update), counted
+    // once per name so VR can warn in the headset (ShowToast) instead of only in bmvr_log.txt.
+    static void noteMissingOffset(const char* what);
+    static int missingOffsetCount();
     static bool InstallVertexFormatWarningFilter() { return false; }
     static void UninstallVertexFormatWarningFilter() {}
 };
