@@ -4,7 +4,7 @@ Play Black Mesa in VR on Apple Silicon with **CrossOver, DXVK and [MoltenVR](htt
 
 Tested on **M3 Max + Quest 3 over USB, HEVC at 200 Mbps**. Our earlier Office Complex benchmark reached approximately **72 FPS at 2144×2304 rendered pixels per eye**, with deferred shadows disabled. v71 has been tested successfully in the headset; a new performance comparison has not been run.
 
-**[Download the latest macOS release](https://github.com/armax9/black-mesa-vr-macos/releases/latest)** · [Original Black Mesa VR](https://github.com/Hochgeschwindigkeitsrennfahrer/black-mesa-vr/releases/latest)
+**[Download the latest macOS release](https://github.com/armax9/black-mesa-vr-macos/releases/tag/v71-macos-preview)** · [Original Black Mesa VR](https://github.com/Hochgeschwindigkeitsrennfahrer/black-mesa-vr/releases/latest)
 
 ## What's new in v71
 
@@ -55,7 +55,7 @@ For Preview, use `CrossOver Preview.app`. If CrossOver is installed elsewhere, u
 
 ### 3. Install the macOS mod
 
-1. Download and extract **BlackMesa-MoltenVR-v71-macOS.zip** from the [latest release](https://github.com/armax9/black-mesa-vr-macos/releases/latest).
+1. Download and extract **BlackMesa-MoltenVR-v71-macOS.zip** from the [latest release](https://github.com/armax9/black-mesa-vr-macos/releases/tag/v71-macos-preview).
 2. Close Black Mesa.
 3. Double-click **Install.command**, then choose the Black Mesa folder containing `bms.exe`.
 
