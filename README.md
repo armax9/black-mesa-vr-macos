@@ -1,40 +1,48 @@
-> Local update candidate: v71, integrating all upstream changes through [experimental-beta-26234270.6](https://github.com/Hochgeschwindigkeitsrennfahrer/black-mesa-vr/releases/tag/experimental-beta-26234270.6). See [integration and validation](docs/macos-upstream-26234270.6.md). Headset validation is pending; the published release linked below remains v70.
-
 # Black Mesa VR for macOS
 
 Play Black Mesa in VR on Apple Silicon with **CrossOver, DXVK and [MoltenVR](https://github.com/MoltenVR/MoltenVR-Preview)**.
 
-Tested on **M3 Max + Quest 3 over USB**, using HEVC at 200 Mbps. The measured Office Complex scene runs at approximately **72 FPS at 2144×2304 rendered pixels per eye**, with deferred shadows disabled. Performance varies by location and settings.
+Tested on **M3 Max + Quest 3 over USB, HEVC at 200 Mbps**. Our earlier Office Complex benchmark reached approximately **72 FPS at 2144×2304 rendered pixels per eye**, with deferred shadows disabled. v71 has been tested successfully in the headset; a new performance comparison has not been run.
 
-One DLL supports Black Mesa main build **19042901** and public beta **25844216**. Testing used CrossOver Preview. Regular CrossOver is expected to work with the same setup, but has not yet been tested.
+**[Download the latest macOS release](https://github.com/armax9/black-mesa-vr-macos/releases/latest)** · [Original Black Mesa VR](https://github.com/Hochgeschwindigkeitsrennfahrer/black-mesa-vr/releases/latest)
 
-Based on [Black Mesa VR by Hochgeschwindigkeitsrennfahrer](https://github.com/Hochgeschwindigkeitsrennfahrer/black-mesa-vr/releases/latest).
+## What's new in v71
+
+This update integrates the full upstream range since our v70 baseline: **211 commits**, through [experimental-beta-26234270.6](https://github.com/Hochgeschwindigkeitsrennfahrer/black-mesa-vr/releases/tag/experimental-beta-26234270.6).
+
+- Compatibility with the latest Black Mesa public beta, **build 26234270**.
+- Water and reflective-floor rendering fixes, adjustable reflection strength, and HUD/colour-correction fixes.
+- Improved iron-sight alignment, crossbow scope, muzzle flashes and projectile origins; optional weapon laser.
+- Upstream VR settings panel, two-handed weapon handling, grenade handling and controller improvements.
+- Save/pause overlays, scripted-camera handling and audio fixes.
+- Updated MoltenVR frame transport, including coherent per-eye projection data and separate loading/transport flags.
+- **Launch with the normal Play button in Windows Steam through CrossOver.** The mod applies its performance and audio configuration automatically.
+
+The latest public beta was tested with this update. Compatibility code for main build **19042901** and earlier beta **25844216** is retained; those builds have not been retested with v71. Testing used CrossOver Preview. Regular CrossOver is expected to work with the same setup but has not been tested.
 
 ## Features
 
-- Stereo rendering and tracked headset/controllers through MoltenVR.
-- VR main and pause menus with a right-hand laser pointer and trigger selection.
+- Stereo rendering with tracked headset and controllers through MoltenVR.
+- Main and pause menus with a right-hand laser pointer and trigger selection.
 - Large menu panels that stay in place when you turn your head.
-- Menu recentering when you reset your position in Quest.
-- Orange controller markers in menus.
+- Menu recentering when you reset your position in Quest; orange controller markers in menus.
 - Hold both thumbstick buttons for three seconds to recenter.
-- Two-handed aiming for supported long guns: grab with the support hand and hold grip to keep holding the weapon.
+- Two-handed aiming for supported long guns: hold the support grip to keep holding the weapon.
 - Smaller stereo aiming reticle and hand HUD.
 - **Optional FSR 1 upscaling (EASU + RCAS), disabled by default.**
 - **Optional seated mode with height compensation, disabled by default.**
-- Upstream experimental gameplay updates included for both supported game builds.
 
 ## Installation
 
-### 1. Set up CrossOver and MoltenVR
+### 1. CrossOver and MoltenVR
 
 Install Windows Steam and Black Mesa in a CrossOver bottle. Select **DXVK** as the bottle's graphics backend.
 
-Install [MoltenVR and its Quest client](https://github.com/MoltenVR/MoltenVR-Preview), following the project's setup instructions. Register its OpenXR runtime in the same CrossOver bottle, connect Quest and start a streaming session.
+Install [MoltenVR and its Quest client](https://github.com/MoltenVR/MoltenVR-Preview), following its setup instructions. Register the MoltenVR OpenXR runtime in the same bottle, connect Quest and start a streaming session.
 
-### 2. Install MoltenVK 1.4.2
+### 2. MoltenVK
 
-Download the macOS libraries from [MoltenVK 1.4.2](https://github.com/KhronosGroup/MoltenVK/releases/tag/v1.4.2). MoltenVK translates Vulkan graphics to Metal; MoltenVR handles VR tracking and streaming.
+Download the macOS libraries from [MoltenVK 1.4.2](https://github.com/KhronosGroup/MoltenVK/releases/tag/v1.4.2). MoltenVK translates Vulkan graphics to Metal; MoltenVR handles tracking and streaming.
 
 Quit CrossOver and its Windows applications. Back up the existing libraries, then copy the universal macOS `libMoltenVK.dylib` into both locations:
 
@@ -43,57 +51,42 @@ Quit CrossOver and its Windows applications. Back up the existing libraries, the
 /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/lib/aarch64/libMoltenVK.dylib
 ```
 
-For Preview, use `CrossOver Preview.app` instead of `CrossOver.app`. If CrossOver is installed elsewhere, use that location. CrossOver updates may replace these libraries.
+For Preview, use `CrossOver Preview.app`. If CrossOver is installed elsewhere, use that location. CrossOver updates may replace these libraries.
 
-### 3. Install the mod
+### 3. Install the macOS mod
 
-1. Install the original mod assets from the [upstream release](https://github.com/Hochgeschwindigkeitsrennfahrer/black-mesa-vr/releases/latest) appropriate to your game version.
-2. Download and extract **BlackMesa-MoltenVR-v70-macOS.zip** from [this fork's release](https://github.com/armax9/black-mesa-vr-macos/releases/tag/v70-macos-preview).
-3. Close the game. Open Terminal in the extracted folder and run:
+1. Download and extract **BlackMesa-MoltenVR-v71-macOS.zip** from the [latest release](https://github.com/armax9/black-mesa-vr-macos/releases/latest).
+2. Close Black Mesa.
+3. Double-click **Install.command**, then choose the Black Mesa folder containing `bms.exe`.
 
-```bash
-python3 install.py "/path/to/SteamLibrary/steamapps/common/Black Mesa"
-```
+The package includes the DLL, matching OpenXR helper, hands, weapon-wheel assets and configuration. The installer preserves existing mod settings, adds missing options and backs up replaced files under `VR/backups/`. Updating from v70 uses the same installer.
 
-Replace the example path with your Black Mesa folder containing `bms.exe`. The installer backs up replaced files under `VR/backups/` and preserves existing configuration files.
+The DLL and helper form a matching pair; the installer updates them together.
 
-The package installs the mod DLL, matching OpenXR helper, default configuration and launcher. The original mod supplies the required hands and weapon-wheel assets. Keep the 64-bit `openxr_loader.dll` beside `VR/openxr_helper64/OpenXRHelper64.exe`.
+## Launch from Steam
 
-## Launch
-
-The supplied `start.command` prepares the required Wine/MoltenVK environment. Open it in a text editor and set:
-
-- `cx` to your CrossOver Wine executable. Regular CrossOver uses `/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine`; Preview uses `CrossOver Preview.app`.
-- The bottle name after `--bottle` to your Steam bottle's name. The default is `Steam`.
-
-Start the MoltenVR stream, wear the headset, then run `start.command` from the Black Mesa folder:
-
-```bash
-bash "/path/to/SteamLibrary/steamapps/common/Black Mesa/start.command"
-```
-
-Load your save from the main menu.
-
-For launches through Windows Steam in the same configured bottle, use these game launch options:
+In Windows Steam inside CrossOver, open **Black Mesa → Properties → Launch Options** and set this once:
 
 ```text
--oldgameui -enabledxvk -novid -dev +developer 0 +exec bmvr_performance.cfg +snd_mix_async 0 +snd_async_fullyasync 0
+-oldgameui -enabledxvk -novid -dev +developer 0
 ```
 
-The launcher supplies these options automatically. `-oldgameui` selects the classic menu; `-dev` skips the background 3D map to avoid rendering corruption when loading a save from the menu.
+Start MoltenVR, then click **Play** in Steam. If Steam offers several launch choices, choose **Default**. Load your save from the menu.
 
-### Configuration
+`-oldgameui` selects the classic menu. `-dev` skips the background 3D map, which avoids rendering corruption after loading a save from that menu. The mod loads `bmvr.cfg` itself; the macOS configuration applies the performance profile and audio settings automatically.
 
-Mod options are in `VR/config.txt`. FSR and seated mode are optional and disabled in the supplied defaults. Restart the game after changing them.
+## Configuration
 
-`bms/cfg/bmvr_performance.cfg` contains the performance profile used for the measurement above: deferred shadows disabled (`nr_shadow_active 1`), VSync disabled and no FPS cap. MSAA and FXAA were disabled for the baseline measurement. Render resolution and headset stream resolution are separate settings.
+Mod options are in `VR/config.txt`. FSR and seated mode are disabled in the supplied defaults. Restart after changing them.
 
-## Preview status
+- **FSR:** set `FSR=true` and a lower `RenderScale`, for example `0.75`. Its effect on frame time depends on the scene and hardware.
+- **Seated mode:** set `SeatedMode=true`; `SeatedHeightOffsetMeters` adds an optional height adjustment.
+- **VR settings:** open the gear entry in the weapon-selection menu for the upstream settings panel. Weapon laser and reflection controls are available there.
 
-The supported game builds have been tested, but full-campaign and level-transition testing is still in progress. Later game updates may require compatibility changes. The classic menu with its 3D background disabled is the supported menu configuration.
+`bms/cfg/bmvr_performance.cfg` contains the profile used for the earlier benchmark: deferred shadows disabled (`nr_shadow_active 1`) and VSync disabled. MSAA and FXAA were disabled for that measurement. Upstream frame-cap controls are available in the VR settings. Render resolution and headset stream resolution are separate settings.
 
 ## Source and credits
 
-The release includes `BlackMesa-MoltenVR-v70-source.zip`; `macos-v70.patch` contains tracked source changes. `SHA256SUMS.txt` provides checksums for the release archives.
+Current sources are in this repository. The release also includes **BlackMesa-MoltenVR-v71-source.zip** and **SHA256SUMS.txt**. [Integration and validation notes](docs/macos-upstream-26234270.6.md) describe the build and compatibility work.
 
-Based on [Black Mesa VR](https://github.com/Hochgeschwindigkeitsrennfahrer/black-mesa-vr/releases/latest), L4D2VR and DXVK. Original copyright and license notices are retained.
+Based on [Black Mesa VR](https://github.com/Hochgeschwindigkeitsrennfahrer/black-mesa-vr/releases/latest), L4D2VR, DXVK, OpenXR and AMD FidelityFX FSR. Original copyright and license notices are retained. The source can be cross-built on macOS without a Windows VM.

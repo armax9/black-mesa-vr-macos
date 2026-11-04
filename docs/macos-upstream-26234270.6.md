@@ -29,4 +29,4 @@ CPU tests cover x86/x64 bridge layout, per-eye tangent transport, separate loadi
 
 FSR wrapper recovery and SPIR-V provenance are recorded in experiments/openxr-fsr/RECOVERY.md. The optional FSR setting stays off unless enabled in the user's configuration.
 
-Status: compiled; offline CPU tests and static game-module validation. No headset or gameplay validation for this build yet. No FPS comparison has been made.
+Status: compiled; offline CPU tests and static game-module validation passed. The user confirmed that the installed update works in the headset on November 4, 2026. Normal Steam launch is configured. No new FPS comparison or full-campaign regression test has been made.
