@@ -25,7 +25,7 @@ Original stable/previous-beta selections are retained where the baseline supplie
 
 Cross-built on macOS with clang-cl/lld-link (LLVM 23.1.4), xwin Microsoft Windows SDK/CRT, Ninja and CMake. The x86 toolchain uses /EHa and disables lifetime markers to preserve guarded asynchronous SEH loads. No Windows VM is needed for the build.
 
-CPU tests cover x86/x64 bridge layout, per-eye tangent transport, separate loading/capability storage, SEH fault recovery, ABI selection and FSR constants. Public D3D9 exports are compared to v70. Game-module checks cover RenderView, CreateMove, CalcViewModelView, the server shot source, material RT access and engine screen-size entry points.
+CPU tests cover x86/x64 bridge layout, per-eye tangent transport, separate loading/capability storage, x86 SEH fault recovery, ABI selection and FSR constants. Public D3D9 exports are compared to v70. Game-module checks cover RenderView, CreateMove, CalcViewModelView, the server shot source, material RT access and engine screen-size entry points.
 
 FSR wrapper recovery and SPIR-V provenance are recorded in experiments/openxr-fsr/RECOVERY.md. The optional FSR setting stays off unless enabled in the user's configuration.
 

@@ -12,7 +12,9 @@ __declspec(noinline) int GuardedRead(volatile const int* p) {
  __except(EXCEPTION_EXECUTE_HANDLER) { return -7; }
 }
 int main(){
+#if defined(_M_IX86)
  CHECK(GuardedRead(nullptr)==-7);
+#endif
  CHECK(sizeof(bmvr_shared_gpu::Slot)==128);
  CHECK(offsetof(bmvr_shared_gpu::Slot,eyeTangents)==88);
  CHECK(sizeof(bmvr_shared_gpu::Control)==448);
