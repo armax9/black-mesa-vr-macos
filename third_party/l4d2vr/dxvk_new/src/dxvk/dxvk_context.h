@@ -9,6 +9,7 @@
 #include "dxvk_objects.h"
 #include "dxvk_queue.h"
 #include "dxvk_util.h"
+#include "../util/util_bmvr_bind_dedup.h"
 
 namespace dxvk {
 
@@ -193,6 +194,11 @@ namespace dxvk {
     void bindIndexBuffer(
             DxvkBufferSlice&&     buffer,
             VkIndexType           indexType) {
+      if (BmvrSkipIdenticalGeometryBind(0,
+          m_state.vi.indexBuffer.matches(buffer) && m_state.vi.indexType == indexType,
+          !buffer.buffer() || !buffer.buffer()->hasGfxStores()))
+        return;
+
       m_state.vi.indexBuffer = std::move(buffer);
       m_state.vi.indexType   = indexType;
 
@@ -211,6 +217,12 @@ namespace dxvk {
             VkDeviceSize          offset,
             VkDeviceSize          length,
             VkIndexType           indexType) {
+      if (BmvrSkipIdenticalGeometryBind(1,
+          m_state.vi.indexBuffer.offset() == offset &&
+          m_state.vi.indexBuffer.length() == length && m_state.vi.indexType == indexType,
+          !m_state.vi.indexBuffer.buffer() || !m_state.vi.indexBuffer.buffer()->hasGfxStores()))
+        return;
+
       m_state.vi.indexBuffer.setRange(offset, length);
       m_state.vi.indexType = indexType;
 
@@ -369,6 +381,12 @@ namespace dxvk {
             uint32_t              binding,
             DxvkBufferSlice&&     buffer,
             uint32_t              stride) {
+      if (BmvrSkipIdenticalGeometryBind(2,
+          m_state.vi.vertexBuffers[binding].matches(buffer) &&
+          m_state.vi.vertexStrides[binding] == stride,
+          !buffer.buffer() || !buffer.buffer()->hasGfxStores()))
+        return;
+
       m_state.vi.vertexBuffers[binding] = std::move(buffer);
       m_state.vi.vertexStrides[binding] = stride;
       m_flags.set(DxvkContextFlag::GpDirtyVertexBuffers);
@@ -388,6 +406,14 @@ namespace dxvk {
             VkDeviceSize          offset,
             VkDeviceSize          length,
             uint32_t              stride) {
+      if (BmvrSkipIdenticalGeometryBind(3,
+          m_state.vi.vertexBuffers[binding].offset() == offset &&
+          m_state.vi.vertexBuffers[binding].length() == length &&
+          m_state.vi.vertexStrides[binding] == stride,
+          !m_state.vi.vertexBuffers[binding].buffer() ||
+          !m_state.vi.vertexBuffers[binding].buffer()->hasGfxStores()))
+        return;
+
       m_state.vi.vertexBuffers[binding].setRange(offset, length);
       m_state.vi.vertexStrides[binding] = stride;
       m_flags.set(DxvkContextFlag::GpDirtyVertexBuffers);

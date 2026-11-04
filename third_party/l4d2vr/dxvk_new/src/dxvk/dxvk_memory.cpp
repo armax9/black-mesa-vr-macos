@@ -3,6 +3,7 @@
 #include <sstream>
 
 #include "../util/util_bit.h"
+#include "../util/util_bmvr_slow.h"
 
 #include "dxvk_device.h"
 #include "dxvk_memory.h"
@@ -921,6 +922,9 @@ namespace dxvk {
     const VkImageCreateInfo&          createInfo,
     const DxvkAllocationInfo&         allocationInfo,
     const void*                       next) {
+    static std::atomic<unsigned> slowBudget{0};
+    BmvrSlowScope slowScope("CreateImageResource", slowBudget);
+
     auto vk = m_device->vkd();
 
     VkImage image = VK_NULL_HANDLE;
@@ -1113,6 +1117,7 @@ namespace dxvk {
     allocation->m_resourceCookie = allocationInfo.resourceCookie;
     allocation->m_size = createInfo.size;
     allocation->m_mapPtr = importInfo.mapPtr;
+    allocation->m_importOwner = importInfo.owner;
     allocation->m_buffer = importInfo.buffer;
     allocation->m_bufferOffset = importInfo.offset;
 

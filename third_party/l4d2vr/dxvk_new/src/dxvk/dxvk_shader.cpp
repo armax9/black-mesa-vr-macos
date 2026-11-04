@@ -1,3 +1,5 @@
+#include "../util/util_bmvr_slow.h"
+#include "../util/util_bmvr_shader_cache.h"
 #include "dxvk_device.h"
 #include "dxvk_pipemanager.h"
 #include "dxvk_shader.h"
@@ -5,6 +7,8 @@
 #include <dxvk_dummy_frag.h>
 
 #include <algorithm>
+#include <cstring>
+#include <spirv-tools/optimizer.hpp>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -1140,6 +1144,53 @@ namespace dxvk {
           VkShaderStageFlagBits   stage,
           SpirvCodeBuffer&&       code,
     const VkSpecializationInfo*   specInfo) {
+    static std::atomic<unsigned> slowBudget{0};
+    BmvrSlowScope slowScope("addStage", slowBudget);
+
+    if (stage == VK_SHADER_STAGE_FRAGMENT_BIT &&
+        m_device->adapter()->devicePropertiesExt().vk12.driverID == VK_DRIVER_ID_MOLTENVK) {
+      std::unordered_map<uint32_t, std::vector<uint32_t>> values;
+      if (specInfo) {
+        for (uint32_t i = 0; i < specInfo->mapEntryCount; i++) {
+          const auto& entry = specInfo->pMapEntries[i];
+          if (!entry.size || entry.size % sizeof(uint32_t) ||
+              entry.offset > specInfo->dataSize || entry.size > specInfo->dataSize - entry.offset)
+            throw DxvkError("BMVR MoltenVK: invalid specialization entry");
+          std::vector<uint32_t> words(entry.size / sizeof(uint32_t));
+          std::memcpy(words.data(), static_cast<const char*>(specInfo->pData) + entry.offset, entry.size);
+          values[entry.constantID] = std::move(words);
+        }
+      }
+      static BmvrShaderCache cache;
+      const auto cacheKey = BmvrShaderCache::key(code.data(),code.dwords(),values);
+      std::vector<uint32_t> optimized;
+      if (!cache.load(cacheKey,optimized)) {
+      spvtools::Optimizer optimizer(SPV_ENV_VULKAN_1_3);
+      optimizer.SetMessageConsumer([](spv_message_level_t level, const char*,
+          const spv_position_t& position, const char* message) {
+        if (level <= SPV_MSG_WARNING)
+          Logger::warn(str::format("BMVR SPIR-V specialization at word ", position.index, ": ", message));
+      });
+      optimizer.RegisterPass(spvtools::CreateSetSpecConstantDefaultValuePass(values));
+      optimizer.RegisterPass(spvtools::CreateFreezeSpecConstantValuePass());
+      optimizer.RegisterPass(spvtools::CreateFoldSpecConstantOpAndCompositePass());
+      optimizer.RegisterPass(spvtools::CreateInlineExhaustivePass());
+      // Freezing specialization constants does not fold ordinary instructions.
+      // Propagate their values before pruning color/depth sampler branches.
+      optimizer.RegisterPass(spvtools::CreateCCPPass());
+      optimizer.RegisterPass(spvtools::CreateSimplificationPass());
+      optimizer.RegisterPass(spvtools::CreateDeadBranchElimPass());
+      optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass());
+      optimizer.RegisterPass(spvtools::CreateEliminateDeadFunctionsPass());
+      if (!optimizer.Run(code.data(), code.dwords(), &optimized))
+        throw DxvkError("BMVR MoltenVK: SPIR-V specialization failed");
+      cache.store(cacheKey,optimized);
+      }
+      code = SpirvCodeBuffer(uint32_t(optimized.size()), optimized.data());
+      // Values have been baked into this pipeline's module, including defaults.
+      specInfo = nullptr;
+    }
+
     // Take ownership of the SPIR-V code buffer
     auto& codeBuffer = m_codeBuffers[m_stageCount];
     codeBuffer = std::move(code);

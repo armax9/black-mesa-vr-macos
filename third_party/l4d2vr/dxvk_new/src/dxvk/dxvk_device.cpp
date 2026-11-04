@@ -1,4 +1,6 @@
 #include "dxvk_device.h"
+#include "../util/util_bmvr_slow.h"
+#include "../util/util_bmvr_shader_cache.h"
 #include "dxvk_instance.h"
 #include "dxvk_latency_builtin.h"
 #include "dxvk_latency_reflex.h"
@@ -24,7 +26,14 @@ namespace dxvk {
     m_perfHints         (getPerfHints()),
     m_objects           (this),
     m_submissionQueue   (this, queueCallback) {
-
+    // Start only after all device members constructed successfully. Meta
+    // pipelines may initialize the cache during m_objects construction.
+    if (m_properties.vk12.driverID == VK_DRIVER_ID_MOLTENVK && bmvrPipelineCache()) {
+      try { m_BmvrCacheWorker = dxvk::thread([this] { runBmvrCacheWorker(); }); }
+      catch (const std::exception& e) {
+        Logger::warn(str::format("[BMVR cache v20] checkpoint worker unavailable: ",e.what()));
+      }
+    }
   }
   
   
@@ -33,8 +42,18 @@ namespace dxvk {
     // from TerminateProcess, etc, our CS threads are already destroyed
     // and we cannot synchronize against them.
     // The best we can do is just wait for the Vulkan device to be idle.
-    if (this_thread::isInModuleDetachment())
+    if (this_thread::isInModuleDetachment()) {
+      // Process shutdown already terminates other threads. Never join them
+      // under the loader lock, and never leave a joinable thread member.
+      if (m_BmvrCacheWorker.joinable()) m_BmvrCacheWorker.detach();
       return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(m_BmvrCacheWorkerMutex);
+      m_BmvrCacheWorkerStop = true;
+    }
+    m_BmvrCacheWorkerWake.notify_one();
+    if (m_BmvrCacheWorker.joinable()) m_BmvrCacheWorker.join();
 
     // Wait for all pending Vulkan commands to be
     // executed before we destroy any resources.
@@ -43,8 +62,130 @@ namespace dxvk {
     // Stop workers explicitly in order to prevent
     // access to structures that are being destroyed.
     m_objects.pipelineManager().stopWorkerThreads();
+    saveBmvrPipelineCache();
+    if (m_BmvrPipelineCache) m_vkd->vkDestroyPipelineCache(m_vkd->device(),m_BmvrPipelineCache,nullptr);
   }
 
+
+  VkPipelineCache DxvkDevice::bmvrPipelineCache() const {
+    if (m_properties.vk12.driverID != VK_DRIVER_ID_MOLTENVK) return VK_NULL_HANDLE;
+    std::call_once(m_BmvrCacheOnce,[this] {
+      try {
+      const auto& props=m_properties.core.properties;
+      std::string uuid;
+      static const char hex[]="0123456789abcdef";
+      for (uint8_t b:props.pipelineCacheUUID) {uuid+=hex[b>>4];uuid+=hex[b&15];}
+      m_BmvrPipelinePath=BmvrShaderCache::directory()/
+        (env::getExeBaseName()+"-"+uuid+"-"+std::to_string(props.driverVersion)+".mvk12");
+      std::vector<uint8_t> bytes;
+      std::ifstream file(m_BmvrPipelinePath,std::ios::binary|std::ios::ate);
+      if (file) {
+        const auto length=file.tellg();
+        if (length>=52 && length<=64*1024*1024) {
+          Sha1Digest digest{};bytes.resize(size_t(length)-20);file.seekg(0);
+          file.read(reinterpret_cast<char*>(digest.data()),20);
+          file.read(reinterpret_cast<char*>(bytes.data()),bytes.size());
+          uint32_t header[4]{};std::memcpy(header,bytes.data(),16);
+          if (!file || Sha1Hash::compute(bytes.data(),bytes.size())!=Sha1Hash(digest) ||
+              header[0]<32 || header[0]>bytes.size() || header[1]!=VK_PIPELINE_CACHE_HEADER_VERSION_ONE ||
+              header[2]!=props.vendorID || header[3]!=props.deviceID ||
+              std::memcmp(bytes.data()+16,props.pipelineCacheUUID,16)) bytes.clear();
+        }
+      }
+      VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+      ci.initialDataSize=bytes.size();ci.pInitialData=bytes.empty()?nullptr:bytes.data();
+      // flags=0 permits Vulkan's internally synchronized concurrent cache use.
+      VkResult result=m_vkd->vkCreatePipelineCache(m_vkd->device(),&ci,nullptr,&m_BmvrPipelineCache);
+      if (result!=VK_SUCCESS && !bytes.empty()) {
+        ci.initialDataSize=0;ci.pInitialData=nullptr;
+        result=m_vkd->vkCreatePipelineCache(m_vkd->device(),&ci,nullptr,&m_BmvrPipelineCache);
+      }
+      if (result!=VK_SUCCESS) m_BmvrPipelineCache=VK_NULL_HANDLE;
+      Logger::warn(str::format("[BMVR cache v20] Vulkan cache initialBytes=",ci.initialDataSize," result=",result));
+
+      } catch (...) {
+        // Optional cache loading must not abort device creation on Win32 OOM.
+        try { Logger::warn("[BMVR cache v20] cache initialization failed; using uncached pipelines"); }
+        catch (...) { }
+      }
+    });
+    return m_BmvrPipelineCache;
+  }
+
+  void DxvkDevice::noteBmvrPipelineCreated() const {
+    if (m_properties.vk12.driverID == VK_DRIVER_ID_MOLTENVK)
+      m_BmvrCacheEpoch.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  void DxvkDevice::runBmvrCacheWorker() const {
+    uint64_t savedEpoch = 0, quietEpoch = 0;
+    auto lastSave = std::chrono::steady_clock::now() - std::chrono::seconds(30);
+    auto delay = std::chrono::seconds(5);
+    for (;;) {
+      std::unique_lock<std::mutex> lock(m_BmvrCacheWorkerMutex);
+      if (m_BmvrCacheWorkerWake.wait_for(lock, delay,
+          [this] { return m_BmvrCacheWorkerStop; })) return;
+      lock.unlock();
+      const uint64_t epoch = m_BmvrCacheEpoch.load(std::memory_order_relaxed);
+      const auto now = std::chrono::steady_clock::now();
+      // MoltenVK serialization briefly takes its shader-cache mutex. Wait
+      // for a quiet compilation interval, and save at most once per 30s.
+      if (epoch != savedEpoch && epoch == quietEpoch
+          && now-lastSave >= std::chrono::seconds(30)
+          && saveBmvrPipelineCache()) { savedEpoch = epoch; lastSave = now; }
+      quietEpoch = epoch;
+      delay = std::chrono::seconds(2);
+    }
+  }
+
+  bool DxvkDevice::saveBmvrPipelineCache() const noexcept {
+    static std::atomic<unsigned> slowBudget{0};
+    BmvrSlowScope slowScope("PipelineCacheSave", slowBudget);
+    try {
+    // flags=0 gives internally synchronized cache access. Vulkan permits
+    // retrieval while pipelines compile; a growth race returns VK_INCOMPLETE.
+    // Only the checkpoint worker (or final teardown after joining it) calls
+    // this. No device-idle wait, frame-thread file IO or render mutex.
+    if (!m_BmvrPipelineCache) return false;
+    std::vector<uint8_t> bytes;
+    size_t size = 0;
+    bool complete = false;
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+      if (m_vkd->vkGetPipelineCacheData(m_vkd->device(),m_BmvrPipelineCache,&size,nullptr)!=VK_SUCCESS
+          || size<32 || size>64*1024*1024) return false;
+      bytes.resize(size);
+      const VkResult result=m_vkd->vkGetPipelineCacheData(
+          m_vkd->device(),m_BmvrPipelineCache,&size,bytes.data());
+      if (result==VK_SUCCESS) { complete=true; break; }
+      if (result!=VK_INCOMPLETE) return false;
+    }
+    if (!complete || size<32) return false;
+    bytes.resize(size);
+    std::error_code error;
+    std::filesystem::create_directories(m_BmvrPipelinePath.parent_path(),error);
+    if (error) return false;
+    auto temp=m_BmvrPipelinePath;
+    temp+=std::to_string(GetCurrentProcessId())+"-"+std::to_string(uintptr_t(this))+".tmp";
+    std::ofstream file(temp,std::ios::binary|std::ios::trunc);
+    const auto digest=Sha1Hash::compute(bytes.data(),bytes.size()).digest();
+    file.write(reinterpret_cast<const char*>(digest.data()),20);
+    file.write(reinterpret_cast<const char*>(bytes.data()),bytes.size());file.close();
+    if (!file) {std::filesystem::remove(temp,error);return false;}
+    const bool saved=MoveFileExW(temp.c_str(),m_BmvrPipelinePath.c_str(),MOVEFILE_REPLACE_EXISTING)!=0;
+    if (!saved) std::filesystem::remove(temp,error);
+    Logger::warn(str::format("[BMVR cache v20] Vulkan cache saved=",saved," bytes=",size));
+    return saved;
+    } catch (...) {
+      // Cache persistence is optional, especially in a Win32 address space.
+      // Never terminate the game or permanently kill the checkpoint worker.
+      static std::atomic<bool> warned{false};
+      if (!warned.exchange(true)) {
+        try { Logger::warn("[BMVR cache v20] checkpoint failed; continuing without this save"); }
+        catch (...) { }
+      }
+      return false;
+    }
+  }
 
   VkSubresourceLayout DxvkDevice::queryImageSubresourceLayout(
     const DxvkImageCreateInfo&        createInfo,

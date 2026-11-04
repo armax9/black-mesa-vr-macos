@@ -2,6 +2,7 @@
 
 #include "d3d9_initializer.h"
 #include "d3d9_device.h"
+#include "../util/util_bmvr_memory.h"
 
 namespace dxvk {
 
@@ -86,6 +87,7 @@ namespace dxvk {
     // If the buffer is mapped, we can write data directly
     // to the mapped memory region instead of doing it on
     // the GPU. Same goes for zero-initialization.
+    BmvrCpuMemoryScope memoryScope(BmvrCpuStagingClear, Slice.length(), Slice.mapPtr(0), nullptr);
     std::memset(
       Slice.mapPtr(0), 0,
       Slice.length());

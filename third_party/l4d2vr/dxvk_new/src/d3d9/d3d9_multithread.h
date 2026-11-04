@@ -1,11 +1,21 @@
 #pragma once
 
 #include "d3d9_include.h"
+#include "../util/util_bmvr_slow.h"
 
 #include <atomic>
+#include <deque>
 #include <thread>
 
 namespace dxvk {
+
+  // Stable thread-local registration for reentrant unprotected D3D9 calls.
+  // Only the outermost reader contributes to the writer's activity count.
+  struct D3D9ThreadActivity {
+    const void* owner = nullptr;
+    uint32_t depth = 0;
+    std::atomic<uint32_t>* activity = nullptr;
+  };
 
   /**
    * \brief Device lock
@@ -23,12 +33,29 @@ namespace dxvk {
 
     D3D9DeviceLock(sync::RecursiveSpinlock& mutex)
       : m_mutex(&mutex) {
-      mutex.lock();
+      // The ordinary protected path was not covered by AcquireExclusiveLock's
+      // timer. Preserve the normal/reentrant first try without reading a clock;
+      // only a failed acquisition needs a duration sample.
+      if (!mutex.try_lock()) {
+        static std::atomic<unsigned> slowBudget{0};
+        BmvrSlowScope slowScope("DeviceMutexWait", slowBudget);
+        mutex.lock();
+      }
     }
 
-    static D3D9DeviceLock Activity(std::atomic<uint32_t>& activity) {
+    static D3D9DeviceLock Activity(D3D9ThreadActivity& reader,
+            std::atomic<uint32_t>& activity) {
       D3D9DeviceLock result;
-      result.m_activity = &activity;
+      reader.activity = &activity;
+      reader.depth += 1;
+      result.m_reader = &reader;
+      return result;
+    }
+
+    static D3D9DeviceLock NestedActivity(D3D9ThreadActivity& reader) {
+      D3D9DeviceLock result;
+      reader.depth += 1;
+      result.m_reader = &reader;
       return result;
     }
 
@@ -53,7 +80,7 @@ namespace dxvk {
 
     D3D9DeviceLock(D3D9DeviceLock&& other)
       : m_mutex(other.m_mutex),
-        m_activity(other.m_activity),
+        m_reader(other.m_reader),
         m_exclusiveRequests(other.m_exclusiveRequests) {
       other.Clear();
     }
@@ -61,7 +88,7 @@ namespace dxvk {
     D3D9DeviceLock& operator = (D3D9DeviceLock&& other) {
       Release();
       m_mutex = other.m_mutex;
-      m_activity = other.m_activity;
+      m_reader = other.m_reader;
       m_exclusiveRequests = other.m_exclusiveRequests;
       other.Clear();
       return *this;
@@ -75,13 +102,13 @@ namespace dxvk {
 
     void Clear() {
       m_mutex = nullptr;
-      m_activity = nullptr;
+      m_reader = nullptr;
       m_exclusiveRequests = nullptr;
     }
 
     void Release() {
-      if (m_activity != nullptr)
-        m_activity->fetch_sub(1, std::memory_order_release);
+      if (m_reader != nullptr && --m_reader->depth == 0)
+        m_reader->activity->fetch_sub(1, std::memory_order_release);
       if (m_mutex != nullptr)
         m_mutex->unlock();
       if (m_exclusiveRequests != nullptr)
@@ -90,7 +117,7 @@ namespace dxvk {
     }
 
     sync::RecursiveSpinlock* m_mutex = nullptr;
-    std::atomic<uint32_t>* m_activity = nullptr;
+    D3D9ThreadActivity* m_reader = nullptr;
     std::atomic<uint32_t>* m_exclusiveRequests = nullptr;
 
   };
@@ -116,6 +143,13 @@ namespace dxvk {
       if (m_protected)
         return D3D9DeviceLock(m_mutex);
 
+      D3D9ThreadActivity& reader = ThreadActivity();
+      // An outer reader already keeps foreign writers from entering. Waiting
+      // on their mutex here would deadlock: the writer waits for this reader.
+      // D3D9 internals regularly recurse (e.g. LockImage -> SynchronizeCsThread).
+      if (reader.depth != 0)
+        return D3D9DeviceLock::NestedActivity(reader);
+
       for (;;) {
         if (m_sourceFrameActive.load(std::memory_order_acquire)
          || m_exclusiveRequests.load(std::memory_order_acquire) != 0)
@@ -124,7 +158,7 @@ namespace dxvk {
         m_unprotectedActivity.fetch_add(1, std::memory_order_acq_rel);
         if (!m_sourceFrameActive.load(std::memory_order_acquire)
          && m_exclusiveRequests.load(std::memory_order_acquire) == 0)
-          return D3D9DeviceLock::Activity(m_unprotectedActivity);
+          return D3D9DeviceLock::Activity(reader, m_unprotectedActivity);
 
         // A writer arrived between the first check and activity publication. Back
         // out and join the exclusive side; the writer waits for this decrement.
@@ -133,6 +167,10 @@ namespace dxvk {
     }
 
     D3D9DeviceLock AcquireExclusiveLock() {
+      // Measure acquisition only: callers can then flush/copy under the lock.
+      // Ordinary unprotected-reader calls do not take this timing path.
+      static std::atomic<unsigned> slowBudget{0};
+      BmvrSlowScope slowScope("DeviceExclusiveLock", slowBudget);
       if (m_protected)
         return D3D9DeviceLock(m_mutex);
 
@@ -192,6 +230,18 @@ namespace dxvk {
     }
 
   private:
+
+    D3D9ThreadActivity& ThreadActivity() {
+      // Usually one device. Deque keeps RAII registrations stable when a
+      // thread enters another device before releasing its first device lock.
+      static thread_local std::deque<D3D9ThreadActivity> readers;
+      for (auto& reader : readers)
+        if (reader.owner == this)
+          return reader;
+      readers.emplace_back();
+      readers.back().owner = this;
+      return readers.back();
+    }
 
     static D3D9Multithread*& SourceFrameOwner() {
       static thread_local D3D9Multithread* owner = nullptr;

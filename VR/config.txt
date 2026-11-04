@@ -27,6 +27,10 @@ WorldRenderAtEyeSize=true
 # VRRenderScale=1.25
 RenderScale=1.0
 
+# Optional FSR 1 EASU+RCAS. Restart after changing.
+# To enable: FSR=true and RenderScale=0.75.
+FSR=false
+
 # Perf: false (default) skips the leftover 16:9 desktop scene render after the
 # stereo pair — saves ~30% frame time. Headset flashlight uses gbmatch eyes.
 # true = proper 16:9 desktop at extra cost.
@@ -163,7 +167,7 @@ HideCrosshair=true
 # so the picture magnifies). 0.28 ≈ HL2's 20°/75°. Range 0.08–1.
 ScopeZoomFovScale=0.28
 # World-space VR reticle on the aim ray. Off by default; true to show it.
-VrCrosshair=false
+VrCrosshair=true
 # MatchHmdHz no longer caps fps_max at the headset rate (that was 90 on G2).
 # fps_max is 0 (uncapped); SteamVR WaitGetPoses still paces compositor submit.
 MatchHmdHz=false
@@ -197,3 +201,20 @@ QuestHandsPoseOffsetMeters=0,0,0
 VrHandsUseHevGloves=true
 VrHandsDebugBoxes=false
 VrHandHud=true
+
+# Menu pointer gain; lower smoothing responds sooner to small movements.
+MenuPointerSensitivity=1.0
+MenuCursorSmoothSec=0.0
+# Reticle eye only; stereo cameras and physical bullet ray remain unchanged.
+# 0=both, 1=left, 2=right.
+VrCrosshairEye=0
+
+MenuForwardMeters=1.30
+
+MenuWidthMeters=2.10
+
+# Seated mode reanchors height when gameplay starts. Restart after editing.
+SeatedMode=false
+# Optional extra height in metres, applied equally to camera and hands.
+SeatedHeightOffsetMeters=0.0
+# Recenter position: hold both thumbstick clicks for 3 seconds.

@@ -4,10 +4,12 @@
 #include "vr.h"
 #include "offsets.h"
 #include "bmvr_flags.h"
+#include "bmvr_stall_capture.h"
 #include "sigscanner.h"
 #include "in_buttons.h"
 #include "trace.h"
 #include "texture.h"
+#include "../third_party/l4d2vr/dxvk_new/src/util/util_bmvr_timing.h"
 #include <Windows.h>
 #include <cctype>
 #include <cmath>
@@ -18,6 +20,9 @@
 
 namespace
 {
+    void ReportEntityDiagnostics();
+    bool EntityDiagnosticsEnabled();
+
     void** SehMaterialSystemVTable(IMaterialSystem* mat)
     {
         void** vt = nullptr;
@@ -401,6 +406,10 @@ namespace
     bool IsOffscreenWorldRtName(const char* name);
     thread_local RtStackEntry g_RtStack[kRtStackMax]{};
     thread_local int g_RtStackDepth = 0;
+    // Pushes past kRtStackMax used to return without a slot, then NotePopRt
+    // still popped a real entry. Aux/world class then tracked the wrong RT
+    // for the rest of the frame.
+    thread_local int g_RtStackOverflow = 0;
     thread_local int g_AuxRtDepth = 0;
     bool g_CostActive = false;
     int g_ShadowPush = 0;
@@ -487,7 +496,16 @@ namespace
     void NotePushRt(const char* name, int w, int h, const RtNameClass* cls = nullptr)
     {
         if (g_RtStackDepth >= kRtStackMax)
+        {
+            ++g_RtStackOverflow;
+            static int s_overflowLog;
+            if (s_overflowLog < 3)
+            {
+                Game::logMsg("RT stack overflow at %d (nested push not tracked)", kRtStackMax);
+                ++s_overflowLog;
+            }
             return;
+        }
         RtStackEntry& e = g_RtStack[g_RtStackDepth++];
         e.w = w;
         e.h = h;
@@ -525,6 +543,11 @@ namespace
 
     void NotePopRt()
     {
+        if (g_RtStackOverflow > 0)
+        {
+            --g_RtStackOverflow;
+            return;
+        }
         if (g_RtStackDepth <= 0)
             return;
         const RtStackEntry e = g_RtStack[--g_RtStackDepth];
@@ -647,15 +670,21 @@ namespace
             || std::strstr(name, "\\V_") != nullptr;
     }
 
+    std::atomic<uint32_t> g_ModelClassEpoch{1};
     bool CachedModelIsViewmodel(void* pModel)
     {
         struct Entry { void* model; bool isVm; bool filled; };
-        static Entry cache[256]{};
+        thread_local Entry cache[256]{};
+        thread_local uint32_t seenEpoch=0;
+        const uint32_t epoch=g_ModelClassEpoch.load(std::memory_order_acquire);
+        if(seenEpoch!=epoch) { std::memset(cache,0,sizeof(cache));seenEpoch=epoch; }
         if (!pModel)
             return false;
         const unsigned i = (static_cast<unsigned>(reinterpret_cast<uintptr_t>(pModel) >> 4)) & 255u;
-        if (cache[i].filled && cache[i].model == pModel)
-            return cache[i].isVm;
+        // Positive entries must be revalidated: Source can recycle a model
+        // address without a map change. Never deform props on cached identity.
+        if (cache[i].filled && cache[i].model == pModel && !cache[i].isVm)
+            return false;
         const char* name = nullptr;
         if (Hooks::m_Game && Hooks::m_Game->m_ModelInfo)
             name = SafeModelName(Hooks::m_Game->m_ModelInfo, pModel);
@@ -697,6 +726,7 @@ namespace
 
     struct StereoCost
     {
+        dxvk::BmvrTimingSnapshot timingStart{};
         long long leftTicks = 0;
         long long rightTicks = 0;
         long long blitTicks = 0;
@@ -731,11 +761,28 @@ namespace
         ++g_Cost.uniqEnt;
     }
 
+    bool PerfDiagnosticsEnabled() {
+        static const bool enabled = [] { char v[8]{}; return GetEnvironmentVariableA("BMVR_PERF_DIAG",v,sizeof(v))==1 && v[0]=='1'; }();
+        return enabled;
+    }
+    struct StereoSourceIdentity {
+        Vector origin{}, angles{}; int width=0,height=0,draw=0; bool valid=false;
+    };
+    thread_local StereoSourceIdentity g_LastStereoSource;
+    bool SameStereoSource(const CViewSetup& v, int draw) {
+        const auto& k=g_LastStereoSource;
+        return k.valid && draw==k.draw && v.width==k.width && v.height==k.height
+            && (v.origin-k.origin).LengthSqr()<0.0001f
+            && fabsf(v.angles.x-k.angles.x)<0.01f && fabsf(v.angles.y-k.angles.y)<0.01f
+            && fabsf(v.angles.z-k.angles.z)<0.01f;
+    }
     void StereoCostBegin()
     {
         g_Cost = StereoCost{};
-        g_Cost.active = true;
-        g_CostActive = true;
+        g_Cost.active = PerfDiagnosticsEnabled();
+        if (g_Cost.active)
+            g_Cost.timingStart = dxvk::BmvrTimingRead();
+        g_CostActive = g_Cost.active;
         g_ShadowPush = 0;
         g_GbDepthPush = 0;
         g_GbLightPush = 0;
@@ -778,6 +825,30 @@ namespace
             g_Cost.dmeEnt, g_Cost.uniqEnt, g_Cost.dmeBones32,
             g_Cost.dmeShadow, g_ShadowPush, g_Cost.dmeVm,
             g_GbDepthPush, g_GbLightPush, g_LsMaskPush, charName);
+        static DWORD lastWaitSummary=0;
+        if (PerfDiagnosticsEnabled() && now-lastWaitSummary>=2000) {
+            static dxvk::BmvrTimingSnapshot previous{};
+            const auto current=dxvk::BmvrTimingRead();
+            if (lastWaitSummary) for (unsigned i=0;i<dxvk::BmvrTimingCount;i++) {
+                const auto calls=current.calls[i]-previous.calls[i];
+                if (calls) Game::logMsg("[BMVR perf v33] %s calls=%llu completedTotalMs=%.3f intervalMs=%lu (nested workers may overlap)",
+                    dxvk::BmvrTimingName(i),static_cast<unsigned long long>(calls),
+                    double(current.ns[i]-previous.ns[i])/1e6,now-lastWaitSummary);
+            }
+            previous=current;lastWaitSummary=now;
+        }
+        if (pairMs >= 1000.0) {
+            // Completed-call totals include concurrent workers and nested
+            // scopes: these are attribution clues, not additive frame costs.
+            const auto end=dxvk::BmvrTimingRead();
+            Game::logMsg("[BMVR stalls v21] pair=%.1fms completed-call totals (nested/worker overlap possible)",pairMs);
+            for (unsigned i=0;i<dxvk::BmvrTimingCount;i++) {
+                const auto calls=end.calls[i]-g_Cost.timingStart.calls[i];
+                const double ms=double(end.ns[i]-g_Cost.timingStart.ns[i])/1000000.0;
+                if (calls) Game::logMsg("[BMVR stalls v21] %s calls=%llu total=%.2fms",dxvk::BmvrTimingName(i),
+                    static_cast<unsigned long long>(calls),ms);
+            }
+        }
     }
 
     // Source DrawModelState_t (x86). CModelRender::DrawModelExecute
@@ -1221,6 +1292,33 @@ namespace
         out[2][0] = f.z; out[2][1] = r.z; out[2][2] = u.z; out[2][3] = origin.z;
     }
 
+    // Source AngleMatrix uses [forward,left,up]. The old helper uses right,
+    // so both reconstructed matrices must flip column 1 together.
+    void BuildSourceModelMatrix(float out[3][4],const Vector& origin,const QAngle& angles)
+    {
+        BuildMatrix3x4FromOrgAngles(out,origin,angles);
+        for (int row=0;row<3;row++) out[row][1] = -out[row][1];
+    }
+
+    bool SehCopyRigidModelMatrix(float out[3][4],const void* pointer)
+    {
+        if (!pointer) return false;
+        float m[3][4]{};
+        __try { std::memcpy(m,pointer,sizeof(m)); }
+        __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+        for (int row=0;row<3;row++) for (int col=0;col<4;col++)
+            if (!std::isfinite(m[row][col])) return false;
+        const Vector x(m[0][0],m[1][0],m[2][0]);
+        const Vector y(m[0][1],m[1][1],m[2][1]);
+        const Vector z(m[0][2],m[1][2],m[2][2]);
+        if (fabsf(x.LengthSqr()-1.f)>.003f || fabsf(y.LengthSqr()-1.f)>.003f
+            || fabsf(z.LengthSqr()-1.f)>.003f || fabsf(x.Dot(y))>.003f
+            || fabsf(x.Dot(z))>.003f || fabsf(y.Dot(z))>.003f
+            || CrossProduct(x,y).Dot(z)<.997f) return false;
+        std::memcpy(out,m,sizeof(m));
+        return true;
+    }
+
     void InvertMatrix3x4TR(const float in[3][4], float out[3][4])
     {
         out[0][0] = in[0][0]; out[0][1] = in[1][0]; out[0][2] = in[2][0];
@@ -1266,12 +1364,78 @@ namespace
         return n;
     }
 
+    const char* StudioRelString(const unsigned char* base, int rel);
+
+    int FindStudioBoneIndex(unsigned char* hdr, const char* name)
+    {
+        if (!hdr || !name || !name[0])
+            return -1;
+        int length = 0;
+        int numbones = 0;
+        int boneindex = 0;
+        __try
+        {
+            length = *reinterpret_cast<int*>(hdr + kStudioHdrLength);
+            numbones = *reinterpret_cast<int*>(hdr + kStudioHdrNumBones);
+            boneindex = *reinterpret_cast<int*>(hdr + kStudioHdrBoneIndex);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return -1;
+        }
+        if (length < 256 || length > 4 * 1024 * 1024)
+            return -1;
+        if (numbones <= 0 || numbones > kMaxStudioBones)
+            return -1;
+        if (boneindex < 0 || boneindex + numbones * kStudioBoneSize > length)
+            return -1;
+        for (int i = 0; i < numbones; ++i)
+        {
+            unsigned char* bone = hdr + boneindex + i * kStudioBoneSize;
+            int szname = 0;
+            __try { szname = *reinterpret_cast<int*>(bone); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+            const char* n = StudioRelString(bone, szname);
+            if (n[0] && _stricmp(n, name) == 0)
+                return i;
+        }
+        return -1;
+    }
+
+    void SampleViewmodelOffhandGrip(unsigned char* hdr, const float* bones12, int nBones)
+    {
+        if (!hdr || !bones12 || nBones <= 0 || !Hooks::m_VR)
+            return;
+        int idx = FindStudioBoneIndex(hdr, "L_Wrist");
+        if (idx < 0)
+            idx = FindStudioBoneIndex(hdr, "L_Hand");
+        if (idx < 0 || idx >= nBones)
+            return;
+        const float* m = bones12 + idx * 12;
+        Vector world{};
+        __try
+        {
+            world.x = m[3];
+            world.y = m[7];
+            world.z = m[11];
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return;
+        }
+        if (!std::isfinite(world.x) || !std::isfinite(world.y) || !std::isfinite(world.z))
+            return;
+        if (world.LengthSqr() <= 1.f)
+            return;
+        Hooks::m_VR->NoteViewmodelOffhandWorld(world);
+    }
+
     bool SehCopyAndFixViewmodelMatrices(float* dst, const void* src, int count,
         const float pivot[3], float scale,
         const float yFixOrigin[3], const float right[3], const float up[3], const float fwd[3],
         float yFix, const float* rigidDelta)
     {
-        if (!dst || !src || count < 1)
+        if (!dst || !src || count < 1 || count > kMaxStudioBones)
             return false;
         __try
         {
@@ -1282,9 +1446,10 @@ namespace
                 auto matrix = reinterpret_cast<float(*)[4]>(m);
                 if (rigidDelta)
                     ApplyMatrix3x4Delta(matrix, reinterpret_cast<const float(*)[4]>(rigidDelta));
-                if (yFix > 0.2f && yFix < 2.f && fabsf(yFix - 1.f) > 0.03f)
+                if (yFixOrigin && right && up && fwd
+                    && yFix > 0.2f && yFix < 2.f && fabsf(yFix - 1.f) > 0.03f)
                     UnstretchMatrix3x4ViewY(matrix, yFixOrigin, right, up, fwd, yFix);
-                if (scale > 0.2f && scale < 1.5f && fabsf(scale - 1.f) > 0.001f)
+                if (pivot && scale > 0.2f && scale < 1.5f && fabsf(scale - 1.f) > 0.001f)
                     ScaleMatrix3x4AroundPivot(matrix, pivot, scale);
             }
             return true;
@@ -1363,7 +1528,7 @@ namespace
         ++g_ArmHdrPatchCount;
     }
 
-    int WeaponRootScore(const char* n)
+    int ComputeWeaponRootScore(const char* n)
     {
         if (!n || !n[0])
             return -1;
@@ -1391,6 +1556,83 @@ namespace
             || std::strstr(buf, "hive") || std::strcmp(buf, "mainbody") == 0)
             return 10;
         return 1;
+    }
+
+    struct WeaponRootScoreCache
+    {
+        struct Entry
+        {
+            const char* namePointer = nullptr;
+            unsigned epoch = 0;
+            int score = -1;
+            char name[128]{};
+        };
+        Entry entries[32]{};
+        unsigned epoch = 0;
+        bool active = false;
+        bool diagnostics = false;
+        unsigned long long hits = 0, misses = 0;
+    };
+    thread_local WeaponRootScoreCache g_WeaponRootScoreCache{};
+
+    struct WeaponRootScoreCacheScope
+    {
+        bool owner = false;
+        WeaponRootScoreCacheScope()
+        {
+            static const bool disabled = [] {
+                char value[8]{};
+                return GetEnvironmentVariableA("BMVR_BONE_NAME_CACHE_DISABLE", value, sizeof(value)) == 1
+                    && value[0] == '1';
+            }();
+            if (disabled)
+                return;
+            auto& cache = g_WeaponRootScoreCache;
+            owner = !cache.active;
+            if (!owner)
+                return;
+            if (++cache.epoch == 0)
+            {
+                for (auto& entry : cache.entries)
+                    entry.epoch = 0;
+                cache.epoch = 1;
+            }
+            cache.diagnostics = EntityDiagnosticsEnabled();
+            cache.active = true;
+        }
+        ~WeaponRootScoreCacheScope()
+        {
+            if (owner)
+                g_WeaponRootScoreCache.active = false;
+        }
+    };
+
+    int WeaponRootScore(const char* name)
+    {
+        auto& cache = g_WeaponRootScoreCache;
+        if (!cache.active || !name || !name[0])
+            return ComputeWeaponRootScore(name);
+        auto& entry = cache.entries[(reinterpret_cast<uintptr_t>(name) >> 3) & 31u];
+        // Only the pure name score is cached. Header parents/positions, the
+        // winning root, and NoteViewmodelWeaponBake still run for every draw.
+        // Owned full names reject mutation and pointer reuse within this pair.
+        if (entry.epoch == cache.epoch && entry.namePointer == name
+            && std::strcmp(entry.name, name) == 0)
+        {
+            if (cache.diagnostics) ++cache.hits;
+            return entry.score;
+        }
+        if (cache.diagnostics) ++cache.misses;
+        const int score = ComputeWeaponRootScore(name);
+        const size_t length = std::strlen(name);
+        if (length < sizeof(entry.name))
+        {
+            entry.namePointer = name;
+            entry.score = score;
+            std::memcpy(entry.name, name, length + 1);
+            entry.epoch = cache.epoch;
+        }
+        return score;
     }
 
     void NoteWeaponRootFromHdr(unsigned char* hdr, const char* modelName)
@@ -1456,6 +1698,103 @@ namespace
         if (bestScore < 1 || bestIndex < 0)
             return;
         Hooks::m_VR->NoteViewmodelWeaponBake(modelName, bestName, rest[0], rest[1], rest[2]);
+    }
+
+    // One snapshot per session, only the Glock. Captures the actual idle
+    // animation rather than mistaking bind-pose bone origins for grip points.
+    // No frame loop file dump, no pause, and no experimental pose change.
+    void CaptureGlockGripMath(unsigned char* hdr, const char* modelName,
+        const ModelRenderInfo_t& info, const void* bones, const float* submittedBones,
+        const Vector& controllerPivot, const QAngle& targetAngles)
+    {
+        static bool captured = false;
+        if (captured || !hdr || !bones || !submittedBones || !modelName
+            || !std::strstr(modelName, "v_glock") || !Hooks::m_VR
+            || !Hooks::m_VR->m_HmdOriginLatched
+            || !Hooks::m_VR->m_PhysicalRightTrackingValid)
+            return;
+        // Ignore the pre-tracking/zero-controller bootstrap draw.
+        if (Hooks::m_VR->m_PhysicalRightPosAbs.LengthSqr() < 0.01f)
+            return;
+        const char* names[] = {"R_Wrist", "R_Index1", "R_Index2", "R_Index3",
+            "R_Middle1", "R_Middle2", "R_Middle3", "R_Pinky1", "R_Pinky2",
+            "R_Pinky3", "bone_gun", "bone.muzzle"};
+        struct Record { char name[64]; int index; float local[3][4]; float final[3][4]; } records[12]{};
+        int count = 0;
+        float entity[3][4]{}, inverse[3][4]{};
+        BuildMatrix3x4FromOrgAngles(entity, info.origin, info.angles);
+        // Source entity local Y is left; AngleVectors' right has opposite sign.
+        for (int k=0;k<3;++k) entity[k][1] = -entity[k][1];
+        InvertMatrix3x4TR(entity,inverse);
+        __try
+        {
+            const int length=*reinterpret_cast<int*>(hdr+kStudioHdrLength);
+            const int nb=*reinterpret_cast<int*>(hdr+kStudioHdrNumBones);
+            const int bi=*reinterpret_cast<int*>(hdr+kStudioHdrBoneIndex);
+            if (length<256 || nb<1 || nb>kMaxStudioBones || bi<0
+                || bi+nb*kStudioBoneSize>length) return;
+            for(int i=0;i<nb;++i) {
+                const auto bone=hdr+bi+i*kStudioBoneSize;
+                const int ni=*reinterpret_cast<const int*>(bone);
+                if (ni<0 || bone+ni>=hdr+length) continue;
+                const char* name=reinterpret_cast<const char*>(bone+ni);
+                for(const char* expected:names) if (std::strcmp(name,expected)==0 && count<12) {
+                    float world[3][4]{};
+                    std::memcpy(world,static_cast<const float*>(bones)+i*12,sizeof(world));
+                    bool finite=true;for(int k=0;k<12;k++)finite=finite&&std::isfinite((&world[0][0])[k]);
+                    if(!finite)return;
+                    auto& out=records[count++];strncpy_s(out.name,name,_TRUNCATE);out.index=i;
+                    MulMatrix3x4(inverse,world,out.local);
+                    std::memcpy(out.final,submittedBones+i*12,sizeof(out.final));
+                    break;
+                }
+            }
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER) { return; }
+        if(count<8)return;
+        captured=true;
+        const auto vr=Hooks::m_VR;
+        Game::logMsg("[GRIP v14] begin model=%s bones=%d idleSeq=%d scale=%.6f pivot=(%.6f,%.6f,%.6f) target=(%.6f,%.6f,%.6f)",
+            modelName,count,g_LastViewmodelIdleSeq,vr->ViewmodelVisualScale(),controllerPivot.x,controllerPivot.y,controllerPivot.z,
+            targetAngles.x,targetAngles.y,targetAngles.z);
+        int sequence=-1;float cycle=-1.f;char sequenceLabel[64]{};
+        __try {
+            // Existing verified viewmodel offsets and renderable=entity+4.
+            if (info.pRenderable) {
+                const auto entityPtr=static_cast<const unsigned char*>(info.pRenderable)-4;
+                sequence=*reinterpret_cast<const int*>(entityPtr+kViewmodelSequence);
+                cycle=*reinterpret_cast<const float*>(entityPtr+kViewmodelCycle);
+                const char* label=StudioSequenceLabel(hdr,sequence);
+                if (label) strncpy_s(sequenceLabel,label,_TRUNCATE);
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) { sequence=-1;cycle=-1.f; }
+        Game::logMsg("[GRIP v20] sequence=%d cycle=%.5f label=%s",sequence,cycle,sequenceLabel);
+        float actual[3][4]{};
+        const bool actualRigid=SehCopyRigidModelMatrix(actual,info.pModelToWorld);
+        float maxDifference=0.f;
+        if (actualRigid) for (int row=0;row<3;row++) for (int col=0;col<4;col++)
+            maxDifference=(std::max)(maxDifference,fabsf(actual[row][col]-entity[row][col]));
+        Game::logMsg("[GRIP v20] sourceMatrixValid=%d sourceVsInfoMax=%.7f originalInfo=(%.4f,%.4f,%.4f;%.4f,%.4f,%.4f)",
+            actualRigid?1:0,maxDifference,info.origin.x,info.origin.y,info.origin.z,
+            info.angles.x,info.angles.y,info.angles.z);
+        if (actualRigid) for (int row=0;row<3;row++)
+            Game::logMsg("[GRIP v20] actualModelToWorld row=%d (%.7f,%.7f,%.7f,%.7f)",row,
+                actual[row][0],actual[row][1],actual[row][2],actual[row][3]);
+        for(int h=0;h<2;h++) {
+            const auto& g=vr->m_OpenXrLastInputState.controllerPoses[h];
+            const auto& a=vr->m_OpenXrLastInputState.controllerAimPoses[h];
+            Game::logMsg("[GRIP v14] hand=%d generation=%u flags=0x%llx gripP=(%.6f,%.6f,%.6f) gripQ=(%.6f,%.6f,%.6f,%.6f) aimP=(%.6f,%.6f,%.6f) aimQ=(%.6f,%.6f,%.6f,%.6f)",
+                h,vr->m_OpenXrLastInputStateGeneration,static_cast<unsigned long long>(g.locationFlags),
+                g.position[0],g.position[1],g.position[2],g.orientation[0],g.orientation[1],g.orientation[2],g.orientation[3],
+                a.position[0],a.position[1],a.position[2],a.orientation[0],a.orientation[1],a.orientation[2],a.orientation[3]);
+        }
+        for(int i=0;i<count;i++) {
+            const auto& v=records[i];const auto& m=v.local;const auto& f=v.final;
+            Game::logMsg("[GRIP v14] bone=%s local=(%.7f,%.7f,%.7f,%.7f;%.7f,%.7f,%.7f,%.7f;%.7f,%.7f,%.7f,%.7f) final=(%.7f,%.7f,%.7f,%.7f;%.7f,%.7f,%.7f,%.7f;%.7f,%.7f,%.7f,%.7f)",
+                v.name,m[0][0],m[0][1],m[0][2],m[0][3],m[1][0],m[1][1],m[1][2],m[1][3],m[2][0],m[2][1],m[2][2],m[2][3],
+                f[0][0],f[0][1],f[0][2],f[0][3],f[1][0],f[1][1],f[1][2],f[1][3],f[2][0],f[2][1],f[2][2],f[2][3]);
+        }
+        Game::logMsg("[GRIP v14] end");
     }
 
     struct HideArmsResult
@@ -1749,10 +2088,28 @@ namespace
         if (!client)
             return;
         using SetVecFn = void(__thiscall*)(void*, const float*);
-        auto setOrigin = reinterpret_cast<SetVecFn>(
-            reinterpret_cast<uintptr_t>(client) + Offsets::kCBaseEntity_SetAbsOrigin);
-        auto setAngles = reinterpret_cast<SetVecFn>(
-            reinterpret_cast<uintptr_t>(client) + Offsets::kCBaseEntity_SetAbsAngles);
+        auto* originCode = reinterpret_cast<const unsigned char*>(client) + Offsets::kCBaseEntity_SetAbsOrigin();
+        auto* anglesCode = reinterpret_cast<const unsigned char*>(client) + Offsets::kCBaseEntity_SetAbsAngles();
+        // Both start by comparing the new vector against the abs field
+        // (ucomiss [esi+0x294] / [esi+0x2D0]). A stale RVA after a client
+        // rebuild lands mid-function; do not call it.
+        static int s_verified = -1;
+        if (s_verified < 0)
+        {
+            static const unsigned char kOrigin[] = { 0x55, 0x8B, 0xEC, 0x56, 0x57, 0x8B, 0x7D, 0x08, 0x8B, 0xF1,
+                0xF3, 0x0F, 0x10, 0x07, 0x0F, 0x2E, 0x86, 0x94, 0x02, 0x00, 0x00 };
+            static const unsigned char kAngles[] = { 0x55, 0x8B, 0xEC, 0x56, 0x57, 0x8B, 0x7D, 0x08, 0x8B, 0xF1,
+                0xF3, 0x0F, 0x10, 0x07, 0x0F, 0x2E, 0x86, 0xD0, 0x02, 0x00, 0x00 };
+            s_verified = (memcmp(originCode, kOrigin, sizeof(kOrigin)) == 0
+                && memcmp(anglesCode, kAngles, sizeof(kAngles)) == 0) ? 1 : 0;
+            Game::logMsg("SetAbsOrigin/SetAbsAngles rva=0x%X/0x%X %s",
+                Offsets::kCBaseEntity_SetAbsOrigin(), Offsets::kCBaseEntity_SetAbsAngles(),
+                s_verified ? "verified" : "bytes mismatch; viewmodel stays on the engine pose");
+        }
+        if (!s_verified)
+            return;
+        auto setOrigin = reinterpret_cast<SetVecFn>(const_cast<unsigned char*>(originCode));
+        auto setAngles = reinterpret_cast<SetVecFn>(const_cast<unsigned char*>(anglesCode));
         __try
         {
             setOrigin(ent, origin);
@@ -2140,6 +2497,8 @@ namespace
     void PatchGluonImpactParticleDefs()
     {
         if (!Hooks::m_VR || !Hooks::m_VR->m_IsVREnabled)
+            return;
+        if (!Offsets::kParticleSystemMgrVerified())
             return;
         HMODULE client = ClientModule();
         if (!client)
@@ -2623,9 +2982,9 @@ namespace
         view.y = 0;
         view.m_nUnscaledX = 0;
         view.m_nUnscaledY = 0;
-        // fl_gbmatch: keep engine 2560 width/height so deferred flashlight
-        // apply matches the G-buffer. Still write HMD fov/aspect (below).
-        if (!bmvr::UseGbMatchViewLock())
+        // HWND blit / gbmatch: keep engine 2560 width/height so deferred
+        // flashlight apply matches the G-buffer. Still write HMD fov/aspect.
+        if (!vr->ShouldHwndBlitStereo())
         {
             view.width = eyeWidth;
             view.height = eyeHeight;
@@ -2693,11 +3052,13 @@ namespace
             && Hooks::m_VR->m_SourceRenderQueueBuildCount.load(std::memory_order_acquire) != 0;
     }
 
-    bool OffscreenStereoSizeLie(int& width, int& height)
+    bool WorldMatchEyeSizeLieAllowed()
     {
         if (!bmvr::OffscreenWorldMatchesEyes() || !Hooks::m_VR)
             return false;
-        if (Hooks::m_VR->HudPaintActive())
+        if (Hooks::m_VR->HudPaintActive() || Hooks::m_VR->Want2dMenuPanel())
+            return false;
+        if (Hooks::m_VR->m_CaptureReentry)
             return false;
         // Flashlight/CSM stay aux so their 8192 views keep atlas size. The
         // deferred apply Viewport/GetScreenSize(2560) while that shadow is
@@ -2707,9 +3068,31 @@ namespace
             return false;
         if (McLeftoverRecording())
             return false;
-        const bool stereo = Hooks::m_VR->StereoWorldPassActive();
-        if (!stereo && !Hooks::m_VR->CachedRt0MatchesEyes()
+        // FullFrame is already eye-sized during HWND pass-through. Using RT0
+        // size alone to lie GetScreenSize made water/refract CopyRT use a
+        // 1280x1408 srcRect into _rt_poweroftwofb 1024 (2026-09-09 bm_c4a2a).
+        if (!Hooks::m_VR->PassThroughWarmupDone())
+            return false;
+        if (!Hooks::m_VR->IsGameplayEligible() || !EngineInGame())
+            return false;
+        return Hooks::m_VR->m_RenderWidth >= 640 && Hooks::m_VR->m_RenderHeight >= 360;
+    }
+
+    bool OffscreenStereoSizeLie(int& width, int& height)
+    {
+        // GetBackBufferDimensions only: the swapchain is still the HWND.
+        // Lying BB size for the whole frame made Present StretchRect 2560²
+        // onto a 2560x1440 backbuffer.
+        if (!bmvr::OffscreenWorldMatchesEyes() || !Hooks::m_VR)
+            return false;
+        if (Hooks::m_VR->HudPaintActive())
+            return false;
+        if (AuxSceneRtBound() && !RtStackTopIsWorldScene()
             && !Hooks::m_VR->D3dRt0IsEyeSized())
+            return false;
+        if (McLeftoverRecording())
+            return false;
+        if (!Hooks::m_VR->StereoWorldPassActive())
             return false;
         const int eyeW = static_cast<int>(Hooks::m_VR->m_RenderWidth);
         const int eyeH = static_cast<int>(Hooks::m_VR->m_RenderHeight);
@@ -2717,6 +3100,19 @@ namespace
             return false;
         width = eyeW;
         height = eyeH;
+        return true;
+    }
+
+    bool OffscreenWorldViewSizeLie(int& width, int& height)
+    {
+        // GetScreenSize builds CViewSetup *before* m_StereoEye is set.
+        // Lying only during StereoWorldPassActive left setup=2560x1440 on a
+        // 2560x2560 eye; D3D then stretched that 16:9 viewport into the
+        // square RT (soft / letterboxed HMD, 2026-09-13 simulator).
+        if (!WorldMatchEyeSizeLieAllowed())
+            return false;
+        width = static_cast<int>(Hooks::m_VR->m_RenderWidth);
+        height = static_cast<int>(Hooks::m_VR->m_RenderHeight);
         return true;
     }
 
@@ -2788,8 +3184,9 @@ namespace
             return;
         // Flashlight apply PushRT/Viewport is 2560 (G-buffer actual). Forcing
         // 1584 here is why the beam never landed in fused eyes. Keep engine
-        // size; squash-blit after RenderView.
-        if (bmvr::UseGbMatchViewLock())
+        // size; squash-blit after RenderView. Same lock when gbmatch was
+        // crash-stickied but eyes still fit in the HWND (simulator).
+        if (Hooks::m_VR->ShouldHwndBlitStereo())
             return;
         const int inX = x;
         const int inY = y;
@@ -2891,7 +3288,9 @@ namespace
             return false;
         if (Hooks::m_VR->HudPaintActive() || Hooks::m_VR->m_CaptureReentry)
             return false;
-        return StereoEyeWorldActive() || Hooks::m_VR->IsGameplayEligible();
+        // Same as PushRT: unpaused pass-through is still a 16:9 HWND view.
+        // Treating it as an eye pass rewrote DSSR/CopyRT into 1280 RTs.
+        return Hooks::m_VR->StereoWorldPassActive();
     }
 
     bool LooksLikeWindowExtent(int w, int h)
@@ -2910,6 +3309,14 @@ namespace
     bool ApplyHwndStereoRtDimLie(int& width, int& height, bool originalWroteNothing)
     {
         if (!Hooks::m_VR || Hooks::m_VR->HudPaintActive())
+            return false;
+        // HWND blit / gbmatch keeps CViewSetup / G-buffer at HWND size and
+        // squash-blits after RenderView. Lying 2560x1440 -> 1280x1408 here
+        // made PushRT and shaders allocate/draw as if RT0 were the eye
+        // (2026-09-09 simulator: first pair done worldMatch=0 mc=0, then
+        // exitCode=1). Gate on eyes-vs-window, not only gbmatch — skip-file
+        // leftover disabled UseGbMatchViewLock and this lie still fired.
+        if (Hooks::m_VR->ShouldHwndBlitStereo())
             return false;
         if (McLeftoverRecording())
             return false;
@@ -3172,6 +3579,115 @@ namespace
             || std::strstr(name, "blur_combine") != nullptr;
     }
 
+    enum DssrMaterialFlag : unsigned
+    {
+        kDssrHud = 1u,
+        kDssrBloom = 2u,
+    };
+
+    unsigned ClassifyDssrMaterialName(const char* name, unsigned requested)
+    {
+        // Preserve the original lazy predicate calls. Bloom-only early returns
+        // do not compute the separate HUD result, nor do uncached HUD queries
+        // run the bloom searches.
+        unsigned flags = 0;
+        if ((requested & kDssrBloom) && StereoBloomMaterial(name))
+            flags |= kDssrBloom;
+        if ((requested & kDssrHud) && HudScreenspaceMaterial(name))
+            flags |= kDssrHud;
+        return flags;
+    }
+
+    struct DssrMaterialCache
+    {
+        struct Entry
+        {
+            IMaterial* material = nullptr;
+            const char* namePointer = nullptr;
+            unsigned epoch = 0;
+            unsigned flags = 0;
+            unsigned known = 0;
+            char name[256]{};
+        };
+        Entry entries[32]{};
+        unsigned epoch = 0;
+        bool active = false;
+        bool diagnostics = false;
+        unsigned long long hits = 0, misses = 0;
+    };
+    thread_local DssrMaterialCache g_DssrMaterialCache{};
+
+    struct DssrMaterialCacheScope
+    {
+        bool owner = false;
+        DssrMaterialCacheScope()
+        {
+            static const bool disabled = [] {
+                char value[8]{};
+                return GetEnvironmentVariableA("BMVR_DSSR_NAME_CACHE_DISABLE", value, sizeof(value)) == 1
+                    && value[0] == '1';
+            }();
+            if (disabled)
+                return;
+            auto& cache = g_DssrMaterialCache;
+            owner = !cache.active;
+            if (!owner)
+                return;
+            if (++cache.epoch == 0)
+            {
+                for (auto& entry : cache.entries)
+                    entry.epoch = 0;
+                cache.epoch = 1;
+            }
+            cache.diagnostics = EntityDiagnosticsEnabled();
+            cache.active = true;
+        }
+        ~DssrMaterialCacheScope()
+        {
+            if (owner)
+                g_DssrMaterialCache.active = false;
+        }
+    };
+
+    unsigned CachedDssrMaterialFlags(IMaterial* material, const char* name, unsigned requested)
+    {
+        auto& cache = g_DssrMaterialCache;
+        if (!cache.active || !name)
+            return ClassifyDssrMaterialName(name, requested);
+        const uintptr_t key = (reinterpret_cast<uintptr_t>(material) >> 4)
+            ^ (reinterpret_cast<uintptr_t>(name) >> 3);
+        auto& entry = cache.entries[key & 31u];
+        const bool same = entry.epoch == cache.epoch && entry.material == material
+            && entry.namePointer == name && std::strcmp(entry.name, name) == 0;
+        if (same)
+        {
+            const unsigned missing = requested & ~entry.known;
+            if (!missing)
+            {
+                if (cache.diagnostics) ++cache.hits;
+                return entry.flags & requested;
+            }
+            if (cache.diagnostics) ++cache.misses;
+            entry.flags |= ClassifyDssrMaterialName(name, missing);
+            entry.known |= missing;
+            return entry.flags & requested;
+        }
+        if (cache.diagnostics) ++cache.misses;
+        const unsigned flags = ClassifyDssrMaterialName(name, requested);
+        const size_t length = std::strlen(name);
+        // Overlong names retain the uncached path, never a truncated key.
+        if (length < sizeof(entry.name))
+        {
+            entry.material = material;
+            entry.namePointer = name;
+            entry.flags = flags;
+            entry.known = requested;
+            std::memcpy(entry.name, name, length + 1);
+            entry.epoch = cache.epoch;
+        }
+        return flags;
+    }
+
     bool QueryTextureSize(ITexture* texture, int& w, int& h)
     {
         w = 0;
@@ -3238,6 +3754,21 @@ namespace
         redirected = true;
     }
 
+    bool SehVguiPaintOriginal(void* vgui, int paintMode)
+    {
+        if (!Hooks::hkVgui_Paint.fOriginal)
+            return false;
+        __try
+        {
+            Hooks::hkVgui_Paint.fOriginal(vgui, paintMode);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
     // L4D2VR PaintToHudOnce: extra VGui_Paint into vrHUD. Engine dest stays
     // untouched so desktop VGUI survives. BM never PushRT `_rt_gui` during
     // stereo gameplay (log: only gbuffer/null), so the PopRT blit never ran
@@ -3253,6 +3784,8 @@ namespace
         // in-game GameUI copies menu chrome onto a cleared-transparent overlay.
         // HEV HUD is client DRAWHUD, not this path.
         if (!vr->WantPauseWorldOverlay())
+            return;
+        if (!vr->AppActivated())
             return;
         if (vr->HudPaintedThisFrame())
             return;
@@ -3288,8 +3821,21 @@ namespace
             vr->PreparePauseHudForVgui(scope.ctx);
         const int paintMode = PAINT_UIPANELS;
         ++g_VguiOverlayReentry;
-        Hooks::hkVgui_Paint.fOriginal(vgui, paintMode);
+        const bool painted = SehVguiPaintOriginal(vgui, paintMode);
         --g_VguiOverlayReentry;
+        if (!painted)
+        {
+            if (!queued)
+                vr->UnbindPauseHudAfterExtraPaint();
+            vr->SetHudPaintActive(false);
+            static int s_paintSeh;
+            if (s_paintSeh < 4)
+            {
+                Game::logMsg("VGui extra-paint overlay SEH");
+                ++s_paintSeh;
+            }
+            return;
+        }
         if (queued)
         {
             if (!vr->QueueMcPauseHudEnd())
@@ -3340,12 +3886,27 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         return;
     }
 
+    // This TLS cache lasts only this outer render (including both eyes).
+    // Queued playback on other threads keeps the uncached predicates.
+    DssrMaterialCacheScope dssrMaterialCacheScope;
+    WeaponRootScoreCacheScope weaponRootScoreCacheScope;
+    // Opt-in counters report here, never from server entity queries.
+    ReportEntityDiagnostics();
+
+    // Register only the outer engine render. Nested reflections retain the
+    // parent's phase; the watchdog starts once and samples only long stalls.
+    bmvr_stall::RenderScope stallRenderScope(m_VR && m_VR->m_IsVREnabled);
+    bmvr_stall::PhaseScope stallPreparation("RenderView preparation");
+
     auto callOriginal = [&](CViewSetup& view, int clearFlags, int drawFlags) {
         hkRenderView.fOriginal(ecx, view, clearFlags, drawFlags);
     };
 
     if (m_VR)
+    {
         m_VR->FlushPendingGameUi();
+        m_VR->TickAudioFocusRecover();
+    }
 
     EnsureServerFlashlightHook();
     if (m_VR)
@@ -3359,14 +3920,44 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
 
     const bool mainView = setup.width >= 640 && setup.height >= 360;
     const bool inGame = m_Game && m_Game->m_EngineClient && m_Game->m_EngineClient->IsInGame();
-
     const bool originOk = std::isfinite(setup.origin.x) && std::isfinite(setup.origin.y)
         && std::isfinite(setup.origin.z)
         && fabsf(setup.origin.x) < 100000.f && fabsf(setup.origin.y) < 100000.f;
     const bool fovOk = std::isfinite(setup.fov) && setup.fov > 10.f && setup.fov < 170.f;
+    // v22 proved that IsInGame becomes true before the eight pass-through
+    // warmup renders and before a live head origin is latched. Admit only the
+    // next real gameplay view after a stereo pair and tracking are ready.
+    // These are existing engine-thread states; pose/render behavior is unchanged.
+    stallRenderScope.SetEligible(mainView && inGame && originOk && fovOk && m_VR
+        && m_VR->IsGameplayEligible() && m_VR->PassThroughWarmupDone()
+        && m_VR->m_DirectEyeSubmit && m_VR->m_HmdOriginLatched
+        && !m_VR->m_StereoEyesDrawnThisFrame && !m_VR->IsMenuUp());
+    // Crossbow zoom lerps CViewSetup.fov through ~43 then down toward the
+    // 2D scope value. fov>10 skipped stereo after the first live frame and
+    // left the last eye texture frozen in the HMD until unscope.
+    const bool scopeFov = m_VR && std::isfinite(setup.fov) && setup.fov > 1.f && setup.fov < 50.f
+        && (m_VR->ScopeZoomActive() || m_VR->ViewmodelIsScoped());
+    const bool fovForStereo = fovOk || scopeFov;
+    if (scopeFov && !fovOk)
+    {
+        static int s_zoomFovGate;
+        if (s_zoomFovGate < 8)
+        {
+            Game::logMsg("Stereo zoom FOV gate engine=%.1f (would have skipped at fov<=10)", setup.fov);
+            ++s_zoomFovGate;
+        }
+    }
 
     if (m_VR && mainView)
+    {
+        // A previous CPU capture may already be ready. Publish it before
+        // spending another full stereo pair on the game render thread.
+        {
+            bmvr_stall::PhaseScope stallPump("CPU readback pump entry");
+            m_VR->PumpCpuReadbacks();
+        }
         m_VR->m_SetupOrigin = setup.origin;
+    }
 
     if (m_VR && m_VR->m_IsVREnabled && m_VR->IsGameplayEligible() && inGame)
         m_VR->WaitPosesForStereoFrame();
@@ -3391,6 +3982,17 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
                                   : m_VR->GetViewOriginRight(setup.origin);
         else
             view.origin = m_VR->GetViewOrigin(setup.origin);
+        if (stereo && leftEye && m_VR->m_OpenXrHelperBridgeActive) {
+            static DWORD lastCameraLog=0;
+            static float lastPitch=10000.f, lastHeight=10000.f;
+            const DWORD now=GetTickCount();
+            if(now-lastCameraLog>=500 &&
+               (fabsf(view.angles.x-lastPitch)>=3.f || fabsf(m_VR->m_HmdPosAbs.z-lastHeight)>=0.75f)) {
+                lastCameraLog=now;lastPitch=view.angles.x;lastHeight=m_VR->m_HmdPosAbs.z;
+                Game::logMsg("[BMVR camera] engineZ=%.3f eyeZ=%.3f trackingZ=%.3f zeroZ=%.3f pitch=%.3f yaw=%.3f",
+                    setup.origin.z,view.origin.z,m_VR->m_HmdPosAbs.z,m_VR->m_HmdPosAbsZero.z,view.angles.x,view.angles.y);
+            }
+        }
     };
 
     auto passThrough = [&]() {
@@ -3402,8 +4004,41 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         if (m_VR && m_VR->IsGameplayEligible() && inGame
             && mainView && m_VR->m_HmdPoseValid)
         {
+            // HWND blit (eyes smaller than the window, or gbmatch lock): do
+            // not rewrite look or shrink the view. Look copy + gluon CopyRT
+            // died in pass-through on OpenXR Simulator (heartbeat in_rel_look).
+            if (m_VR->ShouldHwndBlitStereo())
+            {
+                static int s_ptHwnd;
+                if (s_ptHwnd < 4)
+                {
+                    Game::logMsg("HMD-fb pass-through HWND %dx%d (no look copy; eyes %ux%u)",
+                        setup.width, setup.height, m_VR->m_RenderWidth, m_VR->m_RenderHeight);
+                    ++s_ptHwnd;
+                }
+                callOriginal(setup, nClearFlags, whatToDraw);
+                return;
+            }
             CViewSetup vrView = setup;
             applyL4d2VrHead(vrView, false, true);
+            // WorldRenderAtEyeSize is grow-only. When FullFrame already matches
+            // eyes that are at least as large as this HWND view, keep the
+            // pass-through on the RT size (CopyRT 2560 into 1280 FullFrame
+            // 2026-09-09). Do not shrink a 2560 view down to a leftover 1280
+            // eye — that is the simulator gluon crash path.
+            if (bmvr::OffscreenWorldMatchesEyes()
+                && m_VR->m_RenderWidth + 32 >= static_cast<UINT>(setup.width)
+                && m_VR->m_RenderHeight + 32 >= static_cast<UINT>(setup.height))
+            {
+                NormalizeViewSetupForVREye(vrView, m_VR);
+                static int s_ptEye;
+                if (s_ptEye < 4)
+                {
+                    Game::logMsg("HMD-fb pass-through view %dx%d -> eye %dx%d (world RTs match)",
+                        setup.width, setup.height, vrView.width, vrView.height);
+                    ++s_ptEye;
+                }
+            }
 
             static int s_relLog;
             if (s_relLog < 4)
@@ -3418,18 +4053,27 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
             static int s_relFrames;
             if (s_relFrames == 0)
                 bmvr::BeginRisky(L"rel_look");
-            callOriginal(vrView, nClearFlags, whatToDraw);
+            {
+                bmvr_stall::PhaseScope stallFallback("RenderView pass-through original");
+                callOriginal(vrView, nClearFlags, whatToDraw);
+            }
             ++s_relFrames;
             if (s_relFrames == 8)
                 bmvr::EndRisky(L"rel_look");
             return;
         }
-        callOriginal(setup, nClearFlags, whatToDraw);
+        {
+            bmvr_stall::PhaseScope stallFallback("RenderView fallback original");
+            callOriginal(setup, nClearFlags, whatToDraw);
+        }
     };
 
     if (!m_VR || !m_VR->m_IsVREnabled)
     {
-        callOriginal(setup, nClearFlags, whatToDraw);
+        {
+            bmvr_stall::PhaseScope stallFallback("RenderView fallback original");
+            callOriginal(setup, nClearFlags, whatToDraw);
+        }
         return;
     }
     if (mainView && m_VR->IsGameplayEligible())
@@ -3465,7 +4109,7 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         && inGame
         && mainView
         && originOk
-        && fovOk
+        && fovForStereo
         && m_VR->StereoEyesReady()
         && m_VR->m_PassThroughMainViews < kStereoAfterPassThrough)
     {
@@ -3495,11 +4139,24 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         && inGame
         && mainView
         && originOk
-        && fovOk
+        && fovForStereo
         && m_VR->StereoEyesReady())
     {
         if (m_VR->m_StereoEyesDrawnThisFrame)
         {
+            // Skip only the exact player view already rendered into both eyes.
+            // Match source camera and draw flags; preserve mirrors, portals,
+            // reflections and pause/UI views instead of guessing from aspect.
+            if (!m_VR->IsMenuUp() && bmvr::OffscreenWorldMatchesEyes()
+                && SameStereoSource(setup, whatToDraw)) {
+                static unsigned skipped=0; ++skipped;
+                static DWORD report=0; const DWORD now=GetTickCount();
+                if (PerfDiagnosticsEnabled() && now-report>=5000) {
+                    Game::logMsg("[BMVR perf v33] exact duplicate desktop views skipped=%u",skipped);
+                    skipped=0; report=now;
+                }
+                return;
+            }
             // 47777b5: skip only same-size duplicate player views after the
             // stereo pair. d24bc07 also skipped leftover 16:9 mains
             // (windowed169) — that dropped the deferred flashlight apply that
@@ -3532,6 +4189,7 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
             // No-gbmatch uses DesktopLeftoverRender (default off).
             const bool gbSkipLeftover = bmvr::TryFlashlightGbMatch() && bmvr::TryGbLeftSkip();
             const bool skipLeftover = bmvr::OffscreenWorldMatchesEyes()
+                || m_VR->ShouldHwndBlitStereo()
                 || (bmvr::TryFlashlightGbMatch()
                     ? gbSkipLeftover
                     : !bmvr::g_DesktopLeftoverRender);
@@ -3562,11 +4220,71 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
                     setup.angles.x);
                 ++s_auxLog;
             }
-            callOriginal(setup, nClearFlags, whatToDraw);
+            {
+                bmvr_stall::PhaseScope stallFallback("RenderView fallback original");
+                callOriginal(setup, nClearFlags, whatToDraw);
+            }
             return;
         }
+        g_LastStereoSource.origin=setup.origin;g_LastStereoSource.angles=setup.angles;
+        g_LastStereoSource.width=setup.width;g_LastStereoSource.height=setup.height;
+        g_LastStereoSource.draw=whatToDraw;g_LastStereoSource.valid=true;
         m_VR->m_StereoEyesDrawnThisFrame = true;
         m_VR->BeginStereoFramePose();
+        if (m_VR->ShouldHwndBlitStereo())
+        {
+            // Simulator 1280 eyes / 2560 G-buffer: do not shrink CViewSetup to
+            // 1280 (that plus DRAWHUD exited 1). One HWND view blit to both
+            // eyes was mono and ALTERNATING_VISIBLE_FRAMES — 16:9 fov 106
+            // squashed into a ~square eye the compositor treated as 90°.
+            // Two HWND-sized RVs with IPD + HMD fov/aspect, squash-blit each
+            // after a GPU flush. Do not bind the 1280 eye RTs, gloves overlay,
+            // ColorFill, or a third DRAWHUD pass (those killed gbmatch).
+            static int s_hwndBlit;
+            if (s_hwndBlit == 0)
+                bmvr::BeginRisky(L"hmd_fb");
+            m_VR->NoteEngineScopeFov(setup.fov);
+            CViewSetup leftEyeView = setup;
+            CViewSetup rightEyeView = setup;
+            NormalizeViewSetupForVREye(leftEyeView, m_VR);
+            NormalizeViewSetupForVREye(rightEyeView, m_VR);
+            m_VR->NoteStereoClipPlanes(leftEyeView.zNear, leftEyeView.zFar);
+            applyL4d2VrHead(leftEyeView, true, true);
+            applyL4d2VrHead(rightEyeView, true, false);
+            if (s_hwndBlit < 8)
+            {
+                const float ipd = m_VR->m_Ipd * m_VR->m_IpdScale * m_VR->m_VRScale;
+                Game::logMsg("HWND gbmatch stereo pair setup=%dx%d -> %dx%d fov=%.1f->%.1f aspect=%.3f->%.3f eyes=%ux%u ipd=%.3f",
+                    setup.width, setup.height, leftEyeView.width, leftEyeView.height,
+                    setup.fov, leftEyeView.fov, setup.m_flAspectRatio, leftEyeView.m_flAspectRatio,
+                    m_VR->m_RenderWidth, m_VR->m_RenderHeight, ipd);
+            }
+            m_VR->m_StereoRenderViewActive = false;
+            m_VR->m_StereoBodyOrigin = setup.origin;
+            m_VR->m_HasStereoBodyOrigin = true;
+            m_VR->m_StereoEye = 1;
+            callOriginal(leftEyeView, nClearFlags, whatToDraw);
+            const bool leftOk = m_VR->BlitHmdViewFromBackbuffer(m_VR->m_D9LeftEyeSurface, true);
+            m_VR->m_StereoEye = 2;
+            callOriginal(rightEyeView, nClearFlags, whatToDraw);
+            const bool rightOk = m_VR->BlitHmdViewFromBackbuffer(m_VR->m_D9RightEyeSurface, true);
+            m_VR->m_StereoEye = 0;
+            m_VR->m_DirectEyeSubmit = true;
+            m_VR->FlushStereoBlitGpu();
+            m_VR->m_RenderedNewFrame.store(true, std::memory_order_release);
+            m_VR->m_HasStereoBodyOrigin = false;
+            m_VR->EndStereoFramePose();
+            if (s_hwndBlit < 8)
+            {
+                Game::logMsg("HWND gbmatch stereo done left=%d right=%d", leftOk ? 1 : 0, rightOk ? 1 : 0);
+                ++s_hwndBlit;
+            }
+            else
+                ++s_hwndBlit;
+            if (s_hwndBlit == 120)
+                bmvr::EndRisky(L"hmd_fb");
+            return;
+        }
         static int s_enterLog;
         if (s_enterLog < 4)
         {
@@ -3651,19 +4369,24 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         StereoCostBegin();
         g_Cost.eye = 1;
         m_VR->m_StereoEye = 1;
-        const bool mcLeft = mc && m_VR->QueueMcEyeBind(1, false);
-        if (!mcLeft)
+        if (!mc)
         {
             m_VR->BeginStereoEyeBlit(m_VR->m_D9LeftEyeSurface);
             m_VR->ClearStereoEyeSurfaces();
         }
+        else
+        {
+            m_VR->QueueMcEyeBind(1, false);
+        }
         {
             const int eyeDraw = whatToDraw & ~kRenderViewDrawHud;
-            const long long t0 = QpcNow();
+            const long long t0 = g_Cost.active ? QpcNow() : 0;
+            bmvr_stall::PhaseScope stallEye("RenderView left original");
             callOriginal(leftEyeView, nClearFlags, eyeDraw);
-            g_Cost.leftTicks += QpcNow() - t0;
+            if (g_Cost.active)
+                g_Cost.leftTicks += QpcNow() - t0;
         }
-        if (!mcLeft)
+        if (!mc)
         {
         const bool leftUnbind = m_VR->EndStereoEyeBlit();
         {
@@ -3676,11 +4399,15 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
             bool glovesInBlit = false;
             if (!keepNative)
             {
-                const long long tHands = QpcNow();
+                const long long tHands = g_Cost.active ? QpcNow() : 0;
                 if (!m_VR->IsMenuUp())
+                {
+                    bmvr_stall::PhaseScope stallHands("Draw gloves left blit source");
                     glovesInBlit = m_VR->DrawVrGlovesIntoBlitSource(1);
-                g_Cost.handsTicks += QpcNow() - tHands;
-                const long long t0 = QpcNow();
+                }
+                if (g_Cost.active)
+                    g_Cost.handsTicks += QpcNow() - tHands;
+                const long long t0 = g_Cost.active ? QpcNow() : 0;
                 // Always GPU-wait this copy. Both eyes share _rt_FullFrameFB /
                 // the HWND backbuffer; without a flush the right-eye RenderView
                 // overwrites the source before the left StretchRect lands, so
@@ -3695,7 +4422,8 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
                     m_VR->BlitCurrentGameColorTo(
                         m_VR->m_D9LeftEyeSurface, true);
                 }
-                g_Cost.blitTicks += QpcNow() - t0;
+                if (g_Cost.active)
+                    g_Cost.blitTicks += QpcNow() - t0;
             }
             else
             {
@@ -3708,10 +4436,12 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
                 && (bmvr::g_VrHandsGlovesEnabled || bmvr::g_VrHandsDebugBoxes || bmvr::g_HandHud
                 || m_VR->WeaponMenuOpen() || m_VR->AimCrosshairVisible()))
             {
-                const long long t0 = QpcNow();
+                const long long t0 = g_Cost.active ? QpcNow() : 0;
+                bmvr_stall::PhaseScope stallHands("Draw hand markers left");
                 m_VR->DrawIndependentHandMarkers(
                     m_VR->ColorTargetForStereoEye(1), 1, true, !glovesInBlit);
-                g_Cost.handsTicks += QpcNow() - t0;
+                if (g_Cost.active)
+                    g_Cost.handsTicks += QpcNow() - t0;
             }
         }
         } // !mc left post-RV
@@ -3721,22 +4451,35 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
                 rightEyeView.width, rightEyeView.height);
             ++s_eyeRvLog;
         }
-        g_Cost.eye = 2;
+        // Another nonblocking opportunity after the left eye; pixels keep
+        // their captured pose/FOV even though the current frame pose is newer.
+        {
+            bmvr_stall::PhaseScope stallPump("CPU readback pump between eyes");
+            m_VR->PumpCpuReadbacks();
+        }
         g_Cost.eye = 2;
         m_VR->m_StereoEye = 2;
-        const bool mcRight = mc && m_VR->QueueMcEyeBind(2, true);
-        if (!mcRight)
+        if (!mc)
         {
             m_VR->BeginStereoEyeBlit(m_VR->m_D9RightEyeSurface);
             m_VR->ClearStereoEyeSurfaces();
         }
+        else
+        {
+            // Flush so left's shared FullFrame copy can land on the 1x eye
+            // before the right RenderView reuses it. Do not IMat Viewport
+            // the HWND at eye size (nvogl crash).
+            m_VR->QueueMcEyeBind(2, true);
+        }
         {
             const int eyeDraw = whatToDraw & ~kRenderViewDrawHud;
-            const long long t0 = QpcNow();
+            const long long t0 = g_Cost.active ? QpcNow() : 0;
+            bmvr_stall::PhaseScope stallEye("RenderView right original");
             callOriginal(rightEyeView, nClearFlags, eyeDraw);
-            g_Cost.rightTicks += QpcNow() - t0;
+            if (g_Cost.active)
+                g_Cost.rightTicks += QpcNow() - t0;
         }
-        if (!mcRight)
+        if (!mc)
         {
         const bool rightUnbind = m_VR->EndStereoEyeBlit();
         {
@@ -3746,11 +4489,15 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
             bool glovesInBlit = false;
             if (!keepNative)
             {
-                const long long tHands = QpcNow();
+                const long long tHands = g_Cost.active ? QpcNow() : 0;
                 if (!m_VR->IsMenuUp())
+                {
+                    bmvr_stall::PhaseScope stallHands("Draw gloves right blit source");
                     glovesInBlit = m_VR->DrawVrGlovesIntoBlitSource(2);
-                g_Cost.handsTicks += QpcNow() - tHands;
-                const long long t0 = QpcNow();
+                }
+                if (g_Cost.active)
+                    g_Cost.handsTicks += QpcNow() - tHands;
+                const long long t0 = g_Cost.active ? QpcNow() : 0;
                 const bool rightBb = m_VR->BlitHmdViewFromBackbuffer(
                     m_VR->m_D9RightEyeSurface, false);
                 if (!rightBb)
@@ -3758,21 +4505,24 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
                     glovesInBlit = false;
                     m_VR->BlitCurrentGameColorTo(m_VR->m_D9RightEyeSurface, false);
                 }
-                g_Cost.blitTicks += QpcNow() - t0;
+                if (g_Cost.active)
+                    g_Cost.blitTicks += QpcNow() - t0;
             }
             if (!m_VR->IsMenuUp()
                 && (bmvr::g_VrHandsGlovesEnabled || bmvr::g_VrHandsDebugBoxes || bmvr::g_HandHud
                 || m_VR->WeaponMenuOpen() || m_VR->AimCrosshairVisible()))
             {
-                const long long t0 = QpcNow();
+                const long long t0 = g_Cost.active ? QpcNow() : 0;
+                bmvr_stall::PhaseScope stallHands("Draw hand markers right");
                 m_VR->DrawIndependentHandMarkers(
                     m_VR->ColorTargetForStereoEye(2), 2, true, !glovesInBlit);
-                g_Cost.handsTicks += QpcNow() - t0;
+                if (g_Cost.active)
+                    g_Cost.handsTicks += QpcNow() - t0;
             }
         }
         } // !mc right post-RV
         m_VR->m_StereoEye = 0;
-        if (mcLeft && mcRight)
+        if (mc)
         {
             m_VR->QueueMcCompositeToRing(mcBand);
             m_VR->FinishMcStereoPair();
@@ -3784,17 +4534,22 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         // thread; Present copies it onto the HWND. StretchRect of 1x eyes
         // from this thread races playback. Do not blit onto the swapchain
         // from the mat thread (viewport clobber / Present stall).
-        if (!(mcLeft && mcRight))
+        if (!mc)
         {
+        if (m_VR->ShouldHwndBlitStereo())
+            m_VR->FlushStereoBlitGpu();
         if (bmvr::OffscreenWorldMatchesEyes())
             m_VR->MirrorStereoToDesktopWindow();
-        else if (m_VR->m_IsVREnabled && !m_VR->WantPauseWorldOverlay())
+        else if (m_VR->m_IsVREnabled && !m_VR->WantPauseWorldOverlay()
+            && !m_VR->ShouldHwndBlitStereo())
             m_VR->ClearUnusedDesktopBackbuffer();
         }
         // gbmatch already draws flashlight in the eye passes. A third window
-        // DRAWHUD pass was a 15fps regression. Keep it only for the fused
-        // fallback (eyes stripped HUD).
-        const bool runDrawHudPass = !(mcLeft && mcRight) && !bmvr::TryFlashlightGbMatch() && bmvr::TryDrawHud();
+        // DRAWHUD pass was a 15fps regression and, on OpenXR Simulator with
+        // gbmatch skip-filed, the process exit (heartbeat in_drawhud).
+        // Keep it only for fused fallback (eyes stripped HUD).
+        const bool runDrawHudPass = !mc && !bmvr::TryFlashlightGbMatch()
+            && !m_VR->ShouldHwndBlitStereo() && bmvr::TryDrawHud();
         if (runDrawHudPass)
         {
             static int s_drawHudFrames;
@@ -3805,6 +4560,7 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
             // Keep engine width/height; do not NormalizeViewSetupForVREye.
             CViewSetup hudView = setup;
             applyL4d2VrHead(hudView, false, true);
+            bmvr_stall::PhaseScope stallHud("RenderView HUD original");
             callOriginal(hudView, nClearFlags, whatToDraw | kRenderViewDrawHud);
             ++s_drawHudFrames;
             if (s_drawHudFrames == 120)
@@ -3814,7 +4570,7 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         // rendered into it with depth. Adding the no-depth desktop overlay on
         // top of that put a second, slightly offset copy of each hand on the
         // window, which is what read as the hands being see-through there.
-        if (!(mcLeft && mcRight)
+        if (!mc
             && (bmvr::g_VrHandsGlovesEnabled || bmvr::g_VrHandsDebugBoxes)
             && !m_VR->IsMenuUp()
             && !bmvr::OffscreenWorldMatchesEyes()
@@ -3837,6 +4593,8 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
                 bmvr::OffscreenWorldMatchesEyes() ? 1 : 0, mc ? 1 : 0);
             if (bmvr::OffscreenWorldMatchesEyes())
                 Game::logMsg("offscreen native: FullFrame/G-buffer match eyes %dx%d", eyeW, eyeH);
+            if (bmvr::UseGbMatchViewLock())
+                Game::logMsg("HWND stereo post-pair: no RT dim lie, no BB ColorFill (gbmatch squash blit)");
             ++s_hmdFbDone;
         }
 
@@ -3906,7 +4664,9 @@ bool __fastcall Hooks::dCreateMove(void* ecx, void* edx, float flInputSampleTime
         // Pickup follow uses the grab hand. Weapon fire / flashlight must not:
         // leftover left-Use latch used to keep viewangles and shoot origin on
         // that hand after a door, button, or charger.
-        if (m_VR->UseGrabRedirectsFire() && m_VR->GrabHandTrackingValid())
+        if (m_VR->UseGrabActive() && m_VR->GrabHandTrackingValid()
+            && (m_VR->m_HeldButtons.load(std::memory_order_acquire) & IN_USE)
+            && !(m_VR->m_HeldButtons.load(std::memory_order_acquire) & IN_ATTACK))
         {
             apply(m_VR->GetUseAimAngles());
             return;
@@ -4026,6 +4786,21 @@ bool __fastcall Hooks::dCreateMove(void* ecx, void* edx, float flInputSampleTime
     if (m_VR && m_VR->m_IsVREnabled && cmd->command_number)
         applyVrUserCmd();
 
+    // World vgui_screen (C_VGuiScreen / CMortarControlScreen): hover uses
+    // EyeAngles (HMD). DetermineVguiInputMode uses cmd viewangles, which we
+    // set to controller aim, so IN_ATTACK never becomes a VGUI click.
+    const int buttonsBeforeOriginal = cmd->buttons;
+    if (m_VR && m_VR->m_IsVREnabled && cmd->command_number)
+    {
+        if (m_VR->IsGameplayEligible() && EngineInGame()
+            && m_VR->m_HmdPoseValid && !m_VR->IsMenuUp()
+            && !m_VR->MenuGameplayBlocked())
+        {
+            const Vector hmdVa = m_VR->GetViewAngle();
+            cmd->viewangles.Init(hmdVa.x, hmdVa.y, 0.f);
+        }
+    }
+
     bool result = hkCreateMove.fOriginal(ecx, flInputSampleTime, cmd);
 
     if (m_VR && cmd->command_number && m_VR->IsGameplayEligible())
@@ -4039,7 +4814,13 @@ bool __fastcall Hooks::dCreateMove(void* ecx, void* edx, float flInputSampleTime
     applyControllerAim();
     if (m_VR)
         ZeroPlayerViewRecoil(localPlayer);
+    if (m_VR)
+        m_VR->ApplyWorldVguiTriggerClick(cmd);
+    const bool vguiAteAttack = (buttonsBeforeOriginal & (IN_ATTACK | IN_ATTACK2)) != 0
+        && (cmd->buttons & (IN_ATTACK | IN_ATTACK2)) == 0;
     if (m_VR && m_VR->EmptyHands())
+        cmd->buttons &= ~(IN_ATTACK | IN_ATTACK2);
+    else if (vguiAteAttack || (m_VR && m_VR->WorldVguiSuppressAttack()))
         cmd->buttons &= ~(IN_ATTACK | IN_ATTACK2);
     else
         cmd->buttons |= static_cast<int>(m_VR->HeldButtons());
@@ -4223,6 +5004,7 @@ void __fastcall Hooks::dDrawModelExecute(void* ecx, void* edx, void* state, cons
                 strncpy_s(modelNameBuf, modelName, _TRUNCATE);
                 modelName = modelNameBuf;
             }
+            isViewmodel=ModelNameIsViewmodel(modelName);
         }
         static int s_dmeEnter;
         if (s_dmeEnter < 6)
@@ -4301,12 +5083,14 @@ void __fastcall Hooks::dDrawModelExecute(void* ecx, void* edx, void* state, cons
     if (isViewmodel && m_VR && m_VR->IsMenuUp() && m_VR->IsGameplayEligible() && EngineInGame())
         return;
 
-    if (isViewmodel && m_VR && m_VR->IsGameplayEligible() && EngineInGame())
+    const bool vrViewmodelPass = m_VR && m_VR->PassThroughWarmupDone()
+        && m_VR->StereoWorldPassActive();
+    if (isViewmodel && vrViewmodelPass && m_VR->IsGameplayEligible() && EngineInGame())
         ApplyViewmodelStudioWork(state, modelName, body, skin, hideArms, pCustomBoneToWorld);
 
     void* bonesToDraw = pCustomBoneToWorld;
     const ModelRenderInfo_t* infoToDraw = &info;
-    if (isViewmodel && m_VR && m_VR->m_IsVREnabled && m_VR->IsGameplayEligible()
+    if (isViewmodel && vrViewmodelPass && m_VR->m_IsVREnabled && m_VR->IsGameplayEligible()
         && EngineInGame() && m_VR->m_ControllerPoseValid)
     {
         const float scale = [&]() -> float {
@@ -4380,9 +5164,13 @@ void __fastcall Hooks::dDrawModelExecute(void* ecx, void* edx, void* state, cons
                 float origEntity[3][4]{};
                 float origInv[3][4]{};
                 float targetEntity[3][4]{};
-                BuildMatrix3x4FromOrgAngles(origEntity, info.origin, info.angles);
+                // Source permits OnInternalDrawModel to override pModelToWorld.
+                // Use that authoritative rigid basis when present, rather than
+                // undoing a reconstructed transform that the palette never used.
+                if (!SehCopyRigidModelMatrix(origEntity,info.pModelToWorld))
+                    BuildSourceModelMatrix(origEntity,info.origin,info.angles);
                 InvertMatrix3x4TR(origEntity, origInv);
-                BuildMatrix3x4FromOrgAngles(targetEntity, targetOrigin, targetAng);
+                BuildSourceModelMatrix(targetEntity,targetOrigin,targetAng);
                 MulMatrix3x4(targetEntity, origInv, rigidDelta);
                 rigidPtr = &rigidDelta[0][0];
             }
@@ -4409,6 +5197,7 @@ void __fastcall Hooks::dDrawModelExecute(void* ecx, void* edx, void* state, cons
             {
                 bonesToDraw = g_ScaledViewmodelBones[slot];
                 usedBones = true;
+                SampleViewmodelOffhandGrip(hdr, &g_ScaledViewmodelBones[slot][0][0][0], nBones);
             }
             else if (needScale)
                 SehWriteModelScale(info.pRenderable, scale);
@@ -4435,6 +5224,31 @@ void __fastcall Hooks::dDrawModelExecute(void* ecx, void* edx, void* state, cons
                 scaledInfo->pModelToWorld = reinterpret_cast<const matrix3x4_t*>(g_ScaledViewmodelModelToWorld[slot]);
             }
             infoToDraw = scaledInfo;
+            if (usedBones && eyePass)
+                CaptureGlockGripMath(hdr,modelName,info,pCustomBoneToWorld,
+                    &g_ScaledViewmodelBones[slot][0][0][0],pivot,targetAng);
+            // v_glock.mdl v48: attachment "muzzle" uses bone 4, identity
+            // attachment rotation (verified from installed VPK, 2026-10-13).
+            // Compare the actual submitted bone basis with the requested aim.
+            if(usedBones && nBones>4 && modelName && std::strstr(modelName,"v_glock")) {
+                static DWORD lastAxisLog=0;
+                static unsigned axisBudget=60;
+                const DWORD now=GetTickCount();
+                if(axisBudget && now-lastAxisLog>=1000) {
+                    lastAxisLog=now;--axisBudget;
+                    const auto& bone=g_ScaledViewmodelBones[slot][4];
+                    Vector muzzleForward(bone[0][0],bone[1][0],bone[2][0]);
+                    Vector muzzleUp(bone[0][2],bone[1][2],bone[2][2]);
+                    VectorNormalize(muzzleForward);VectorNormalize(muzzleUp);
+                    QAngle muzzleAng{};QAngle::VectorAngles(muzzleForward,muzzleUp,muzzleAng);
+                    Vector targetForward;QAngle::AngleVectors(targetAng,&targetForward,nullptr,nullptr);
+                    const float dot=(std::max)(-1.f,(std::min)(1.f,muzzleForward.Dot(targetForward)));
+                    Game::logMsg("[BMVR axes v10] targetPitch=%.3f actualMuzzlePitch=%.3f muzzleAimErrorDeg=%.3f originalEntityPitch=%.3f yFix=%.4f scale=%.3f muzzleForward=(%.4f,%.4f,%.4f)",
+                        targetAng.x,muzzleAng.x,RAD2DEG(acosf(dot)),info.angles.x,yFix,scale,
+                        muzzleForward.x,muzzleForward.y,muzzleForward.z);
+                }
+            }
+
             static int s_scaleLog;
             if (s_scaleLog < 8)
             {
@@ -4470,12 +5284,31 @@ void __fastcall Hooks::dDrawModelExecute(void* ecx, void* edx, void* state, cons
 
 void* __cdecl Hooks::dLightcacheFindNearest(int x, int y, int z, int flags)
 {
+    // public-beta lightcache nodes are not stride 0x1E0. The walker treated
+    // a real next index (45106) as a cycle, wrote the sentinel into the pool,
+    // and engine.dll faulted on bm_c1a0a. Call the engine lookup.
+    if (hkLightcacheFindNearest.fOriginal)
+        return hkLightcacheFindNearest.fOriginal(x, y, z, flags);
     if (!g_LcLockReady)
         return LightcacheFindNearestImpl(x, y, z, flags);
     EnterCriticalSection(&g_LcLock);
     void* found = LightcacheFindNearestImpl(x, y, z, flags);
     LeaveCriticalSection(&g_LcLock);
     return found;
+}
+
+void Hooks::InvalidateLevelModelCaches()
+{
+    g_ModelClassEpoch.fetch_add(1,std::memory_order_acq_rel);
+    g_LastViewmodelStudioHdr=nullptr;
+    g_LastViewmodelIdleHdr=nullptr;
+    g_LastViewmodelIdleSeq=-1;
+    g_HaveCachedLocalPlayer=false;
+    // PollMapFromEngine notices a transition after the engine may have
+    // unloaded the prior studio data. Forget old patch addresses; do not write
+    // saved mesh counts back into potentially recycled allocations.
+    for(int i=0;i<g_ArmHdrPatchCount;++i)g_ArmHdrPatches[i]={};
+    g_ArmHdrPatchCount=0;
 }
 
 void Hooks::RestoreViewmodelArmHides()
@@ -4506,10 +5339,14 @@ void __fastcall Hooks::dPushRenderTargetAndViewport(void* ecx, void* edx, ITextu
     // Grow world G-buffer viewports before NotePushRt so the stack records
     // 3168, and so a `_rt_gb*` push while flashlight is still parent is not
     // skipped by AuxSceneRtBound().
+    // Only during an actual eye pass. GameUI-dismiss used to arm this during
+    // the 2560 pass-through warmup (2026-09-09: world flashed, then
+    // exitCode=1, heartbeat in_rel_look, no stereo enter). FullFrame/GB are
+    // already 1280x1408; rewriting PushRT onto them while CViewSetup is still
+    // HWND 16:9 kills the next RenderView.
     if (m_VR && bmvr::OffscreenWorldMatchesEyes()
         && !m_VR->HudPaintActive()
-        && (m_VR->StereoWorldPassActive()
-            || (m_VR->IsGameplayEligible() && !m_VR->WantPauseWorldOverlay())))
+        && m_VR->StereoWorldPassActive())
     {
         const int eyeW = static_cast<int>(m_VR->m_RenderWidth);
         const int eyeH = static_cast<int>(m_VR->m_RenderHeight);
@@ -4604,7 +5441,8 @@ void __fastcall Hooks::dPushRenderTargetAndViewport(void* ecx, void* edx, ITextu
     }
     if (hkPushRenderTargetAndViewport.fOriginal)
         hkPushRenderTargetAndViewport.fOriginal(ecx, pTexture, pDepthTexture, nViewX, nViewY, nViewW, nViewH);
-    if (m_VR && !m_VR->HudPaintActive() && nViewW > 0 && nViewH > 0
+    if (m_VR && !m_VR->HudPaintActive() && !m_VR->ShouldHwndBlitStereo()
+        && nViewW > 0 && nViewH > 0
         && static_cast<UINT>(nViewW) == m_VR->m_RenderWidth
         && static_cast<UINT>(nViewH) == m_VR->m_RenderHeight)
         m_VR->NoteCachedRt0Size(static_cast<UINT>(nViewW), static_cast<UINT>(nViewH));
@@ -4634,6 +5472,17 @@ void __fastcall Hooks::dDrawScreenSpaceRectangle(void* ecx, void* edx, IMaterial
     const int eyeW = m_VR ? static_cast<int>(m_VR->m_RenderWidth) : 0;
     const int eyeH = m_VR ? static_cast<int>(m_VR->m_RenderHeight) : 0;
     const char* matName = SafeMaterialName(material);
+    unsigned materialFlags = 0;
+    unsigned knownMaterialFlags = 0;
+    auto screenMaterialFlags = [&](unsigned requested) {
+        const unsigned missing = requested & ~knownMaterialFlags;
+        if (missing)
+        {
+            materialFlags |= CachedDssrMaterialFlags(material, matName, missing);
+            knownMaterialFlags |= missing;
+        }
+        return materialFlags;
+    };
     if (m_VR && m_VR->RpgLaserActive())
     {
         static int s_laserDssr;
@@ -4654,7 +5503,8 @@ void __fastcall Hooks::dDrawScreenSpaceRectangle(void* ecx, void* edx, IMaterial
             || (m_VR && m_VR->McOriginIsRingBand(destX, destY)));
     const bool windowUv = LooksLikeWindowUv(srcX0, srcY0, srcX1, srcY1);
     const bool potSrc = SrcLooksLikePowerOfTwoFb(srcWidth, srcHeight, eyeW, eyeH);
-    if (StereoEyeWorldActive() && StereoBloomMaterial(matName))
+    const bool waterWarp = matName && std::strstr(matName, "water_warp") != nullptr;
+    if (StereoEyeWorldActive() && (screenMaterialFlags(kDssrBloom) & kDssrBloom))
     {
         static int s_skipBloom;
         if (s_skipBloom < 12)
@@ -4666,8 +5516,54 @@ void __fastcall Hooks::dDrawScreenSpaceRectangle(void* ecx, void* edx, IMaterial
         return;
     }
     int expanded = 0;
-    if (OffscreenEyePassActive() && (windowDest || windowUv)
-        && !HudScreenspaceMaterial(matName) && !potSrc && eyeW >= 640)
+    // Underwater overlay is screenspace water_warp from _rt_poweroftwofb.
+    // GetScreenSize eye-lie can leave dest at 1024 (or HWND 16:9) on the
+    // square eye — a magnified inset in one corner that pops fullscreen
+    // when dest happens to match. Planar water uses the Water shader, not
+    // this DSSR path.
+    if (waterWarp && OffscreenEyePassActive() && eyeW >= 640 && eyeH >= 360
+        && width >= 256 && height >= 256
+        && (width + 64 < eyeW || height + 64 < eyeH || windowDest))
+    {
+        int ox = 0;
+        int oy = 0;
+        bool rewrite = true;
+        if (m_VR->D3dRt0IsMcRing())
+        {
+            if (!m_VR->McResolveRingEyeOrigin(origX, origY, origW, origH, ox, oy))
+            {
+                int cx = 0, cy = 0, cw = 0, ch = 0;
+                if (m_VR->McClipAmbiguousWindowVp(origX, origY, origW, origH, cx, cy, cw, ch))
+                {
+                    destX = cx;
+                    destY = cy;
+                    width = cw;
+                    height = ch;
+                    rewrite = false;
+                    expanded = 1;
+                }
+                else
+                    rewrite = false;
+            }
+        }
+        if (rewrite)
+        {
+            destX = ox;
+            destY = oy;
+            width = eyeW;
+            height = eyeH;
+            expanded = 1;
+        }
+        static int s_warp;
+        if (s_warp < 8)
+        {
+            Game::logMsg("DSSR water_warp dest %d,%d %dx%d -> %d,%d %dx%d",
+                origX, origY, origW, origH, destX, destY, width, height);
+            ++s_warp;
+        }
+    }
+    if (expanded == 0 && OffscreenEyePassActive() && (windowDest || windowUv)
+        && !(screenMaterialFlags(kDssrHud) & kDssrHud) && !potSrc && eyeW >= 640)
     {
         const bool ringDest = m_VR->D3dRt0IsMcRing() && McViewportDestIsRing();
         int ox = 0;
@@ -4792,7 +5688,13 @@ void __fastcall Hooks::dCopyRenderTargetToTextureEx(void* ecx, void* edx, ITextu
     if (!srcEye && destEye && OffscreenEyePassActive())
         srcEye = true;
     int grew = 0;
-    if (srcRect && windowSrc && !destWindow && srcEye && OffscreenEyePassActive())
+    const bool refractDest = DestLooksLikeRefractCopy(SafeTextureName(texture))
+        || (destW >= 256 && destH >= 256 && destW == destH && destW <= 2048
+            && eyeW >= 640 && destW + 32 < eyeW);
+    // Do not grow a HWND srcRect to eye size when the dest is the 1024
+    // underwater / refract RT. That copy must downsample the whole view.
+    if (srcRect && windowSrc && !destWindow && srcEye && OffscreenEyePassActive()
+        && !refractDest)
     {
         int ox = 0;
         int oy = 0;
@@ -4885,6 +5787,65 @@ void __fastcall Hooks::dCopyRenderTargetToTextureEx(void* ecx, void* edx, ITextu
         if (StereoEyeWorldActive())
             ++s_stereoCopyLog;
     }
+    // Clip src to the source RT and dst to the dest texture. Clipping src to
+    // dest turned a legal 1280→1024 stretch (_rt_poweroftwofb refract) into a
+    // crop, and a 2560 srcRect into a 1280 FullFrame is illegal only when the
+    // *source* is smaller than srcRect (2026-09-09).
+    auto clipToBounds = [&](SourceRect_t*& rect, SourceRect_t& storage, int maxW, int maxH, const char* tag) {
+        if (!rect || maxW < 1 || maxH < 1)
+            return;
+        if (rect->x >= 0 && rect->y >= 0 && rect->width > 0 && rect->height > 0
+            && rect->x + rect->width <= maxW && rect->y + rect->height <= maxH)
+            return;
+        storage = *rect;
+        if (storage.x < 0)
+            storage.x = 0;
+        if (storage.y < 0)
+            storage.y = 0;
+        if (storage.x >= maxW || storage.y >= maxH)
+        {
+            storage.x = 0;
+            storage.y = 0;
+            storage.width = maxW;
+            storage.height = maxH;
+        }
+        else
+        {
+            if (storage.width > maxW - storage.x)
+                storage.width = maxW - storage.x;
+            if (storage.height > maxH - storage.y)
+                storage.height = maxH - storage.y;
+        }
+        static int s_clip;
+        if (s_clip < 8)
+        {
+            Game::logMsg("CopyRTEx clip %s %d,%d %dx%d -> %dx%d",
+                tag, rect->x, rect->y, rect->width, rect->height, maxW, maxH);
+            ++s_clip;
+        }
+        rect = &storage;
+    };
+    if (srcW >= 1 && srcH >= 1)
+        clipToBounds(srcRect, expanded, srcW, srcH, "src");
+    else if (refractDest && srcRect
+        && (srcRect->width > destW || srcRect->height > destH))
+    {
+        // Source RT size unknown. Clipping srcRect to dest cropped the
+        // underwater copy to the top-left 1024 of a 2544 eye after
+        // GetScreenSize returned eye size (magnified corner overlay that
+        // then water_warp stretched fullscreen — same look as scope zoom).
+        static int s_refractStretch;
+        if (s_refractStretch < 8)
+        {
+            Game::logMsg("CopyRTEx refract stretch drop srcRect %d,%d %dx%d into dest %dx%d",
+                srcRect->x, srcRect->y, srcRect->width, srcRect->height, destW, destH);
+            ++s_refractStretch;
+        }
+        srcRect = nullptr;
+    }
+    else
+        clipToBounds(srcRect, expanded, destW, destH, "src-unk");
+    clipToBounds(dstRect, expandedDst, destW, destH, "dst");
     if (hkCopyRenderTargetToTextureEx.fOriginal)
         hkCopyRenderTargetToTextureEx.fOriginal(ecx, texture, renderTargetId, srcRect, dstRect);
 }
@@ -5016,21 +5977,24 @@ void Hooks::EnsureClientFlashlightHook()
     HMODULE client = GetModuleHandleA("client.dll");
     if (!client)
         return;
-    auto* p = reinterpret_cast<unsigned char*>(client) + Offsets::kUpdateFlashlightState;
+    auto* p = reinterpret_cast<unsigned char*>(client) + Offsets::kUpdateFlashlightState();
     MEMORY_BASIC_INFORMATION mbi{};
-    if (!VirtualQuery(p, &mbi, sizeof(mbi)) || !(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+    static const unsigned char kFlashPrologue[] = { 0x55, 0x8B, 0xEC, 0x51, 0x53, 0x8B, 0xD9 };
+    if (!VirtualQuery(p, &mbi, sizeof(mbi)) || !(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+        || memcmp(p, kFlashPrologue, sizeof(kFlashPrologue)) != 0)
     {
-        Game::logMsg("UpdateFlashlightState RVA 0x%X not executable", Offsets::kUpdateFlashlightState);
+        Game::logMsg("UpdateFlashlightState skipped (bytes/rva 0x%X)", Offsets::kUpdateFlashlightState());
+        hkUpdateFlashlightState.pTarget = p;
         return;
     }
     if (hkUpdateFlashlightState.createHook(p, &dUpdateFlashlightState) != 0
         || hkUpdateFlashlightState.enableHook() != 0)
     {
-        Game::logMsg("UpdateFlashlightState hook failed rva=0x%X", Offsets::kUpdateFlashlightState);
+        Game::logMsg("UpdateFlashlightState hook failed rva=0x%X", Offsets::kUpdateFlashlightState());
         return;
     }
     Game::logMsg("Hook enabled: UpdateFlashlightState rva=0x%X (HMD origin/forward for VR eyes)",
-        Offsets::kUpdateFlashlightState);
+        Offsets::kUpdateFlashlightState());
 }
 
 void __fastcall Hooks::dUpdateFlashlightState(void* ecx, void* edx, void* flashlightState)
@@ -5156,8 +6120,218 @@ namespace
         return FindPatternInModule(mod, hex);
     }
 
+    // Diagnostic only: preserve the existing ent+8/slot9 query until its
+    // runtime exception rate and returned IDs are known. No per-call logging.
+    bool EntityDiagnosticsEnabled()
+    {
+        static const bool enabled = [] {
+            char value[8]{};
+            return GetEnvironmentVariableA("BMVR_ENTITY_DIAG", value, sizeof(value)) == 1
+                && value[0] == '1';
+        }();
+        return enabled;
+    }
+
+    struct EntityExecutableRanges
+    {
+        struct Range { uintptr_t begin = 0, end = 0; };
+        Range sections[16]{};
+        unsigned count = 0;
+        bool ready = false;
+    };
+
+    void CacheEntityExecutableRanges(EntityExecutableRanges& cached, const char* moduleName)
+    {
+        if (cached.ready)
+            return;
+        HMODULE module = GetModuleHandleA(moduleName);
+        if (!module)
+            return; // A later query retries a module not loaded yet.
+        cached.ready = true;
+        __try
+        {
+            const auto base = reinterpret_cast<uintptr_t>(module);
+            const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(module);
+            if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0
+                || dos->e_lfanew > 1024 * 1024)
+                return;
+            const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(base + dos->e_lfanew);
+            if (nt->Signature != IMAGE_NT_SIGNATURE
+                || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC
+                || nt->FileHeader.NumberOfSections > 96)
+                return;
+            const auto* sections = IMAGE_FIRST_SECTION(nt);
+            const uintptr_t imageBytes = nt->OptionalHeader.SizeOfImage;
+            for (unsigned i = 0; i < nt->FileHeader.NumberOfSections && cached.count < 16; ++i)
+            {
+                const auto& section = sections[i];
+                if (!(section.Characteristics & IMAGE_SCN_MEM_EXECUTE)
+                    || section.VirtualAddress >= imageBytes)
+                    continue;
+                uintptr_t bytes = section.Misc.VirtualSize > section.SizeOfRawData
+                    ? section.Misc.VirtualSize : section.SizeOfRawData;
+                if (bytes > imageBytes - section.VirtualAddress)
+                    bytes = imageBytes - section.VirtualAddress;
+                if (bytes)
+                    cached.sections[cached.count++] = {base + section.VirtualAddress,
+                        base + section.VirtualAddress + bytes};
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            cached.count = 0; // Unknown image layout retains the old SEH route.
+        }
+    }
+
+    bool EntityVtableIsKnownCode(const void* pointer)
+    {
+        // client/server stay loaded for the engine lifetime. TLS avoids races
+        // between server/render queries, with no hot loader lock or VirtualQuery.
+        thread_local EntityExecutableRanges client{}, server{};
+        CacheEntityExecutableRanges(client, "client.dll");
+        CacheEntityExecutableRanges(server, "server.dll");
+        const auto address = reinterpret_cast<uintptr_t>(pointer);
+        for (unsigned i = 0; i < client.count; ++i)
+            if (address >= client.sections[i].begin && address < client.sections[i].end)
+                return true;
+        for (unsigned i = 0; i < server.count; ++i)
+            if (address >= server.sections[i].begin && address < server.sections[i].end)
+                return true;
+        return false;
+    }
+
+    struct EntityDiagnostics
+    {
+        volatile LONG calls = 0, nulls = 0, returnedPositive = 0;
+        volatile LONG returnedZero = 0, returnedNegative = 0, catches = 0, av = 0;
+        volatile LONG preventedNullVtable = 0, preventedNullFn = 0, preventedCodeVtable = 0;
+        volatile LONG lastIndex = 0, lastStage = 0, lastException = 0;
+        volatile LONG lastEnt = 0, lastVtable = 0, lastFunction = 0;
+    };
+    EntityDiagnostics g_EntityDiagnostics;
+
+    LONG EntityDiagRead(volatile LONG& value)
+    {
+        return InterlockedCompareExchange(&value, 0, 0);
+    }
+
+    void ReportEntityDiagnostics()
+    {
+        if (!EntityDiagnosticsEnabled())
+            return;
+        static DWORD lastMs = 0;
+        static bool reported = false;
+        const DWORD now = GetTickCount();
+        if (reported && now - lastMs < 5000)
+            return;
+        reported = true;
+        lastMs = now;
+        auto& d = g_EntityDiagnostics;
+        // Snapshots are approximate if a server query runs concurrently; all
+        // fields use atomic operations and never affect the query's result.
+        Game::logMsg("[BMVR entity-diag] calls=%ld null=%ld positive=%ld zero=%ld negative=%ld caught=%ld av=%ld preventedNullVtable=%ld preventedNullFn=%ld preventedCodeVtable=%ld lastIndex=%ld faultStage=%ld code=0x%08lX ent=%p vtable=%p function=%p",
+            EntityDiagRead(d.calls), EntityDiagRead(d.nulls), EntityDiagRead(d.returnedPositive),
+            EntityDiagRead(d.returnedZero), EntityDiagRead(d.returnedNegative),
+            EntityDiagRead(d.catches), EntityDiagRead(d.av),
+            EntityDiagRead(d.preventedNullVtable), EntityDiagRead(d.preventedNullFn),
+            EntityDiagRead(d.preventedCodeVtable), EntityDiagRead(d.lastIndex),
+            EntityDiagRead(d.lastStage), static_cast<unsigned long>(EntityDiagRead(d.lastException)),
+            reinterpret_cast<void*>(static_cast<uintptr_t>(static_cast<DWORD>(EntityDiagRead(d.lastEnt)))),
+            reinterpret_cast<void*>(static_cast<uintptr_t>(static_cast<DWORD>(EntityDiagRead(d.lastVtable)))),
+            reinterpret_cast<void*>(static_cast<uintptr_t>(static_cast<DWORD>(EntityDiagRead(d.lastFunction)))));
+        const auto& materials = g_DssrMaterialCache;
+        Game::logMsg("[BMVR dssr-cache] hits=%llu misses=%llu scopeActive=%d capacity=32 nameLimit=255",
+            materials.hits, materials.misses, materials.active ? 1 : 0);
+        const auto& bones = g_WeaponRootScoreCache;
+        Game::logMsg("[BMVR bone-name-cache] hits=%llu misses=%llu scopeActive=%d capacity=32 nameLimit=127",
+            bones.hits, bones.misses, bones.active ? 1 : 0);
+    }
+
+    __declspec(noinline) int DiagnosticServerEntityIndex(void* ent)
+    {
+        constexpr bool diagnostics = true;
+        if (diagnostics)
+            InterlockedIncrement(&g_EntityDiagnostics.calls);
+        if (!ent)
+        {
+            if (diagnostics)
+                InterlockedIncrement(&g_EntityDiagnostics.nulls);
+            return 0;
+        }
+        int idx = 0;
+        volatile LONG stage = 0;
+        bool caught = false;
+        void** volatile vt = nullptr;
+        using Fn = int(__thiscall*)(void*);
+        Fn volatile fn = nullptr;
+        __try
+        {
+            unsigned char* net = reinterpret_cast<unsigned char*>(ent) + 8;
+            if (diagnostics) stage = 1; // Reading the interface's vtable.
+            vt = *reinterpret_cast<void***>(net);
+            // Runtime v46: every query read a null vtable, then caught an AV
+            // reading slot 0x24. Preserve that zero result without throwing.
+            if (!vt)
+            {
+                InterlockedIncrement(&g_EntityDiagnostics.preventedNullVtable);
+                InterlockedIncrement(&g_EntityDiagnostics.returnedZero);
+                InterlockedExchange(&g_EntityDiagnostics.lastIndex, 0);
+                return 0;
+            }
+            // Shipped server.dll RVA 0x5DA90 is an entity callback stored at
+            // +8, not a vtable; its instruction bytes at +0x24 became 0x7050FF06.
+            if (EntityVtableIsKnownCode(vt))
+            {
+                InterlockedIncrement(&g_EntityDiagnostics.preventedCodeVtable);
+                InterlockedIncrement(&g_EntityDiagnostics.returnedZero);
+                InterlockedExchange(&g_EntityDiagnostics.lastIndex, 0);
+                return 0;
+            }
+            if (diagnostics) stage = 2; // Reading vtable slot 0x24.
+            fn = reinterpret_cast<Fn>(vt[0x24 / 4]);
+            if (!fn)
+            {
+                InterlockedIncrement(&g_EntityDiagnostics.preventedNullFn);
+                InterlockedIncrement(&g_EntityDiagnostics.returnedZero);
+                InterlockedExchange(&g_EntityDiagnostics.lastIndex, 0);
+                return 0;
+            }
+            if (diagnostics) stage = 3; // Executing the original virtual call.
+            idx = fn(net);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            idx = 0;
+            if (diagnostics)
+            {
+                caught = true;
+                auto& d = g_EntityDiagnostics;
+                const DWORD code = GetExceptionCode();
+                InterlockedIncrement(&d.catches);
+                if (code == EXCEPTION_ACCESS_VIOLATION)
+                    InterlockedIncrement(&d.av);
+                InterlockedExchange(&d.lastStage, stage);
+                InterlockedExchange(&d.lastException, static_cast<LONG>(code));
+                InterlockedExchange(&d.lastEnt, static_cast<LONG>(reinterpret_cast<uintptr_t>(ent)));
+                InterlockedExchange(&d.lastVtable, static_cast<LONG>(reinterpret_cast<uintptr_t>(vt)));
+                InterlockedExchange(&d.lastFunction, static_cast<LONG>(reinterpret_cast<uintptr_t>(fn)));
+            }
+        }
+        if (diagnostics && !caught)
+        {
+            auto& d = g_EntityDiagnostics;
+            InterlockedExchange(&d.lastIndex, idx);
+            if (idx > 0) InterlockedIncrement(&d.returnedPositive);
+            else if (idx < 0) InterlockedIncrement(&d.returnedNegative);
+            else InterlockedIncrement(&d.returnedZero);
+        }
+        return idx;
+    }
+
     int ServerEntityIndex(void* ent)
     {
+        if (EntityDiagnosticsEnabled())
+            return DiagnosticServerEntityIndex(ent);
         if (!ent)
             return 0;
         int idx = 0;
@@ -5165,8 +6339,14 @@ namespace
         {
             unsigned char* net = reinterpret_cast<unsigned char*>(ent) + 8;
             void** vt = *reinterpret_cast<void***>(net);
+            // Match the previous SEH fallback without raising a predictable AV.
+            if (!vt || EntityVtableIsKnownCode(vt))
+                return 0;
             using Fn = int(__thiscall*)(void*);
-            idx = reinterpret_cast<Fn>(vt[0x24 / 4])(net);
+            const Fn fn = reinterpret_cast<Fn>(vt[0x24 / 4]);
+            if (!fn)
+                return 0;
+            idx = fn(net);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -5237,7 +6417,11 @@ namespace
         if (!player || !out || !ShouldRewriteShootAngles(player) || !Hooks::m_VR)
             return;
         QAngle aim{};
-        if (!Hooks::m_VR->TryGetFireAim(aim))
+        Vector meleeOrigin{};
+        // The server can call GetShootAngles after the client aim latch.
+        // Use the same active contact direction as either shoot-origin slot.
+        if (!Hooks::m_VR->TryGetMeleeAim(meleeOrigin,aim)
+            && !Hooks::m_VR->TryGetFireAim(aim))
             return;
         out->x = aim.x;
         out->y = aim.y;
@@ -5266,7 +6450,7 @@ namespace
             return out;
         Vector muzzle{};
         QAngle meleeAim{};
-        if (!grabHold && Hooks::m_VR->TryGetMeleeAim(muzzle, meleeAim))
+        if (Hooks::m_VR->TryGetMeleeAim(muzzle, meleeAim))
         {
             *out = muzzle;
             return out;
@@ -5289,7 +6473,9 @@ namespace
             }
             return out;
         }
-        if (Hooks::m_VR->UseGrabRedirectsFire() && Hooks::m_VR->TryGetVrUseOrigin(muzzle))
+        const uint32_t held = Hooks::m_VR->m_HeldButtons.load(std::memory_order_acquire);
+        if (Hooks::m_VR->UseGrabActive() && (held & IN_USE) && !(held & IN_ATTACK)
+            && Hooks::m_VR->TryGetVrUseOrigin(muzzle))
         {
             *out = muzzle;
             return out;
@@ -5321,58 +6507,58 @@ void Hooks::EnsureWeaponShootOriginHooks()
     HMODULE client = GetModuleHandleA("client.dll");
     if (client && !hkClientWeaponShootPosition.pTarget)
     {
-        auto* p = reinterpret_cast<unsigned char*>(client) + Offsets::kCBasePlayer_Weapon_ShootPosition;
+        auto* p = reinterpret_cast<unsigned char*>(client) + Offsets::kCBasePlayer_Weapon_ShootPosition();
         MEMORY_BASIC_INFORMATION mbi{};
         if (VirtualQuery(p, &mbi, sizeof(mbi)) && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
             && CodeBytesMatch(p, "558BEC8B11FF7508FF9268020000"))
         {
             if (hkClientWeaponShootPosition.createHook(p, &dClientWeaponShootPosition) == 0
                 && hkClientWeaponShootPosition.enableHook() == 0)
-                Game::logMsg("Hook enabled: client Weapon_ShootPosition rva=0x%X", Offsets::kCBasePlayer_Weapon_ShootPosition);
+                Game::logMsg("Hook enabled: client Weapon_ShootPosition rva=0x%X", Offsets::kCBasePlayer_Weapon_ShootPosition());
             else
                 Game::logMsg("client Weapon_ShootPosition hook failed");
         }
         else if (!hkClientWeaponShootPosition.pTarget)
         {
-            Game::logMsg("client Weapon_ShootPosition skipped (bytes/rva 0x%X)", Offsets::kCBasePlayer_Weapon_ShootPosition);
+            Game::logMsg("client Weapon_ShootPosition skipped (bytes/rva 0x%X)", Offsets::kCBasePlayer_Weapon_ShootPosition());
             hkClientWeaponShootPosition.pTarget = p;
         }
     }
     if (client && !hkGetAttachmentVec.pTarget)
     {
-        auto* p = reinterpret_cast<unsigned char*>(client) + Offsets::kCBaseAnimating_GetAttachmentVec;
+        auto* p = reinterpret_cast<unsigned char*>(client) + Offsets::kCBaseAnimating_GetAttachmentVec();
         MEMORY_BASIC_INFORMATION mbi{};
         if (VirtualQuery(p, &mbi, sizeof(mbi)) && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
             && CodeBytesMatch(p, "558BEC56578B7D088BF183FF01"))
         {
             if (hkGetAttachmentVec.createHook(p, &dGetAttachmentVec) == 0
                 && hkGetAttachmentVec.enableHook() == 0)
-                Game::logMsg("Hook enabled: GetAttachment vec rva=0x%X", Offsets::kCBaseAnimating_GetAttachmentVec);
+                Game::logMsg("Hook enabled: GetAttachment vec rva=0x%X", Offsets::kCBaseAnimating_GetAttachmentVec());
             else
                 Game::logMsg("GetAttachment vec hook failed");
         }
         else
         {
-            Game::logMsg("GetAttachment vec skipped (bytes/rva 0x%X)", Offsets::kCBaseAnimating_GetAttachmentVec);
+            Game::logMsg("GetAttachment vec skipped (bytes/rva 0x%X)", Offsets::kCBaseAnimating_GetAttachmentVec());
             hkGetAttachmentVec.pTarget = p;
         }
     }
     if (client && !hkGetAttachmentMatrix.pTarget)
     {
-        auto* p = reinterpret_cast<unsigned char*>(client) + Offsets::kCBaseAnimating_GetAttachmentMatrix;
+        auto* p = reinterpret_cast<unsigned char*>(client) + Offsets::kCBaseAnimating_GetAttachmentMatrix();
         MEMORY_BASIC_INFORMATION mbi{};
         if (VirtualQuery(p, &mbi, sizeof(mbi)) && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
             && CodeBytesMatch(p, "558BEC568B7508578BF983FE01"))
         {
             if (hkGetAttachmentMatrix.createHook(p, &dGetAttachmentMatrix) == 0
                 && hkGetAttachmentMatrix.enableHook() == 0)
-                Game::logMsg("Hook enabled: GetAttachment matrix rva=0x%X", Offsets::kCBaseAnimating_GetAttachmentMatrix);
+                Game::logMsg("Hook enabled: GetAttachment matrix rva=0x%X", Offsets::kCBaseAnimating_GetAttachmentMatrix());
             else
                 Game::logMsg("GetAttachment matrix hook failed");
         }
         else
         {
-            Game::logMsg("GetAttachment matrix skipped (bytes/rva 0x%X)", Offsets::kCBaseAnimating_GetAttachmentMatrix);
+            Game::logMsg("GetAttachment matrix skipped (bytes/rva 0x%X)", Offsets::kCBaseAnimating_GetAttachmentMatrix());
             hkGetAttachmentMatrix.pTarget = p;
         }
     }
@@ -5380,65 +6566,78 @@ void Hooks::EnsureWeaponShootOriginHooks()
     HMODULE server = GetModuleHandleA("server.dll");
     if (server && !hkServerWeaponShootPosition.pTarget)
     {
-        auto* p = reinterpret_cast<unsigned char*>(server) + Offsets::kCBasePlayer_Weapon_ShootPosition_Server;
+        auto* p = reinterpret_cast<unsigned char*>(server) + Offsets::kCBasePlayer_Weapon_ShootPosition_Server();
         MEMORY_BASIC_INFORMATION mbi{};
         if (VirtualQuery(p, &mbi, sizeof(mbi)) && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
             && CodeBytesMatch(p, "558BEC8B11FF7508FF9230020000"))
         {
             if (hkServerWeaponShootPosition.createHook(p, &dServerWeaponShootPosition) == 0
                 && hkServerWeaponShootPosition.enableHook() == 0)
-                Game::logMsg("Hook enabled: server Weapon_ShootPosition rva=0x%X", Offsets::kCBasePlayer_Weapon_ShootPosition_Server);
+                Game::logMsg("Hook enabled: server Weapon_ShootPosition rva=0x%X", Offsets::kCBasePlayer_Weapon_ShootPosition_Server());
             else
                 Game::logMsg("server Weapon_ShootPosition hook failed");
         }
         else
         {
-            Game::logMsg("server Weapon_ShootPosition skipped (bytes/rva 0x%X)", Offsets::kCBasePlayer_Weapon_ShootPosition_Server);
+            Game::logMsg("server Weapon_ShootPosition skipped (bytes/rva 0x%X)", Offsets::kCBasePlayer_Weapon_ShootPosition_Server());
             hkServerWeaponShootPosition.pTarget = p;
         }
+    }
+    if (server && !hkServerMeleeOrigin.pTarget) {
+        // Shipped server.dll RTTI CBlackMesaPlayer vtable10726358 +474
+        // points to1047c810, which calls1012f2c0 -> EyePosition(+230).
+        // 77240 is a different function; do not repurpose its grab hook.
+        auto* p=reinterpret_cast<unsigned char*>(server)+bmvr::abi::Select(0x47C810,0x47D1E0);
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(p,&mbi,sizeof mbi) && (mbi.Protect & (PAGE_EXECUTE|PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY))
+            && CodeBytesMatch(p,bmvr::abi::Beta()?"558BECFF7508E86521CBFF8B45085DC20400":"558BECFF7508E8A52ACBFF8B45085DC20400")) {
+            if(hkServerMeleeOrigin.createHook(p,&dServerMeleeOrigin)==0 && hkServerMeleeOrigin.enableHook()==0)
+                Game::logMsg("Hook enabled: server actual melee origin rva=0x%X",bmvr::abi::Select(0x47C810,0x47D1E0));
+            else Game::logMsg("server actual melee origin hook failed");
+        } else {hkServerMeleeOrigin.pTarget=p;Game::logMsg("server actual melee origin skipped (build mismatch)");}
     }
     if (server && !hkServerGrabHoldOrigin.pTarget)
     {
         // CGrabController::UpdateObject calls player vtable +0x474, not +0x23C.
-        auto* p = reinterpret_cast<unsigned char*>(server) + Offsets::kCBasePlayer_GrabHoldOrigin_Server;
+        auto* p = reinterpret_cast<unsigned char*>(server) + Offsets::kCBasePlayer_GrabHoldOrigin_Server();
         MEMORY_BASIC_INFORMATION mbi{};
         if (VirtualQuery(p, &mbi, sizeof(mbi)) && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
             && CodeBytesMatch(p, "558BEC83EC24578BF98D4DE86A00516A008B078BCFFF904C020000"))
         {
             if (hkServerGrabHoldOrigin.createHook(p, &dServerGrabHoldOrigin) == 0
                 && hkServerGrabHoldOrigin.enableHook() == 0)
-                Game::logMsg("Hook enabled: server grab hold origin rva=0x%X", Offsets::kCBasePlayer_GrabHoldOrigin_Server);
+                Game::logMsg("Hook enabled: server grab hold origin rva=0x%X", Offsets::kCBasePlayer_GrabHoldOrigin_Server());
             else
                 Game::logMsg("server grab hold origin hook failed");
         }
         else
         {
-            Game::logMsg("server grab hold origin skipped (bytes/rva 0x%X)", Offsets::kCBasePlayer_GrabHoldOrigin_Server);
+            Game::logMsg("server grab hold origin skipped (bytes/rva 0x%X)", Offsets::kCBasePlayer_GrabHoldOrigin_Server());
             hkServerGrabHoldOrigin.pTarget = p;
         }
     }
     if (server && !hkGrabSetTarget.pTarget)
     {
-        auto* p = reinterpret_cast<unsigned char*>(server) + Offsets::kCGrabController_SetTargetPosition;
+        auto* p = reinterpret_cast<unsigned char*>(server) + Offsets::kCGrabController_SetTargetPosition();
         MEMORY_BASIC_INFORMATION mbi{};
         if (VirtualQuery(p, &mbi, sizeof(mbi)) && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
             && CodeBytesMatch(p, "558BEC8B45088BD1D900D95A04"))
         {
             if (hkGrabSetTarget.createHook(p, &dGrabSetTarget) == 0
                 && hkGrabSetTarget.enableHook() == 0)
-                Game::logMsg("Hook enabled: server grab SetTargetPosition rva=0x%X", Offsets::kCGrabController_SetTargetPosition);
+                Game::logMsg("Hook enabled: server grab SetTargetPosition rva=0x%X", Offsets::kCGrabController_SetTargetPosition());
             else
                 Game::logMsg("server grab SetTargetPosition hook failed");
         }
         else
         {
-            Game::logMsg("server grab SetTargetPosition skipped (bytes/rva 0x%X)", Offsets::kCGrabController_SetTargetPosition);
+            Game::logMsg("server grab SetTargetPosition skipped (bytes/rva 0x%X)", Offsets::kCGrabController_SetTargetPosition());
             hkGrabSetTarget.pTarget = p;
         }
     }
     if (server && !hkGetShootAngles.pTarget)
     {
-        auto* p = reinterpret_cast<unsigned char*>(server) + Offsets::kBlackMesaPlayer_GetShootAngles_Server;
+        auto* p = reinterpret_cast<unsigned char*>(server) + Offsets::kBlackMesaPlayer_GetShootAngles_Server();
         MEMORY_BASIC_INFORMATION mbi{};
         // prologue, mov esi/ecx, call vtable+0x234 (EyeAngles), fetch the out arg
         if (VirtualQuery(p, &mbi, sizeof(mbi)) && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
@@ -5446,13 +6645,13 @@ void Hooks::EnsureWeaponShootOriginHooks()
         {
             if (hkGetShootAngles.createHook(p, &dGetShootAngles) == 0
                 && hkGetShootAngles.enableHook() == 0)
-                Game::logMsg("Hook enabled: server GetShootAngles rva=0x%X", Offsets::kBlackMesaPlayer_GetShootAngles_Server);
+                Game::logMsg("Hook enabled: server GetShootAngles rva=0x%X", Offsets::kBlackMesaPlayer_GetShootAngles_Server());
             else
                 Game::logMsg("server GetShootAngles hook failed");
         }
         else
         {
-            Game::logMsg("server GetShootAngles skipped (bytes/rva 0x%X)", Offsets::kBlackMesaPlayer_GetShootAngles_Server);
+            Game::logMsg("server GetShootAngles skipped (bytes/rva 0x%X)", Offsets::kBlackMesaPlayer_GetShootAngles_Server());
             hkGetShootAngles.pTarget = p;
         }
     }
@@ -5474,14 +6673,14 @@ void Hooks::EnsureWeaponShootOriginHooks()
         {
             Game::logMsg("client GetShootAngles pattern not found");
             hkClientGetShootAngles.pTarget = reinterpret_cast<unsigned char*>(client)
-                + Offsets::kCBasePlayer_Weapon_ShootPosition;
+                + Offsets::kCBasePlayer_Weapon_ShootPosition();
         }
     }
     const bool vfxDone = EnsureWeaponVfxHooks();
     s_done = vfxDone
         && hkClientWeaponShootPosition.pTarget && hkGetAttachmentVec.pTarget
         && hkGetAttachmentMatrix.pTarget && hkServerWeaponShootPosition.pTarget
-        && hkServerGrabHoldOrigin.pTarget && hkGrabSetTarget.pTarget
+        && hkServerGrabHoldOrigin.pTarget && hkServerMeleeOrigin.pTarget && hkGrabSetTarget.pTarget
         && hkGetShootAngles.pTarget && hkClientGetShootAngles.pTarget;
 }
 
@@ -5512,6 +6711,20 @@ Vector* __fastcall Hooks::dServerWeaponShootPosition(void* ecx, void* edx, Vecto
 {
     (void)edx;
     return RewriteShootOrigin(ecx, out, hkServerWeaponShootPosition.fOriginal, false);
+}
+
+Vector* __fastcall Hooks::dServerMeleeOrigin(void* ecx, void* edx, Vector* out)
+{
+    (void)edx;
+    if (hkServerMeleeOrigin.fOriginal && out) hkServerMeleeOrigin.fOriginal(ecx,out);
+    if (!out || !ShouldRewriteShootOrigin(ecx,out) || !m_VR) return out;
+    Vector contact{};QAngle aim{};
+    if (m_VR->TryGetMeleeAim(contact,aim)) {
+        *out=contact;
+        static unsigned budget=16;
+        if(budget) {--budget;Game::logMsg("Crowbar server origin contact=(%.1f,%.1f,%.1f) aim=(%.1f,%.1f)",contact.x,contact.y,contact.z,aim.x,aim.y);}
+    }
+    return out;
 }
 
 Vector* __fastcall Hooks::dServerGrabHoldOrigin(void* ecx, void* edx, Vector* out)
@@ -5590,69 +6803,69 @@ bool Hooks::EnsureWeaponVfxHooks()
     MEMORY_BASIC_INFORMATION mbi{};
     if (!hkTauBeamView.pTarget)
     {
-        auto* p = reinterpret_cast<unsigned char*>(client) + Offsets::kCTauBeam_ViewMuzzle;
+        auto* p = reinterpret_cast<unsigned char*>(client) + Offsets::kCTauBeam_ViewMuzzle();
         if (VirtualQuery(p, &mbi, sizeof(mbi)) && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
             && CodeBytesMatch(p, "558BEC83EC60807D14008B550856578B"))
         {
             if (hkTauBeamView.createHook(p, &dTauBeamView) == 0 && hkTauBeamView.enableHook() == 0)
-                Game::logMsg("Hook enabled: TAU Fire02 beam rva=0x%X", Offsets::kCTauBeam_ViewMuzzle);
+                Game::logMsg("Hook enabled: TAU Fire02 beam rva=0x%X", Offsets::kCTauBeam_ViewMuzzle());
             else
                 Game::logMsg("TAU Fire02 beam hook failed");
         }
         else
         {
-            Game::logMsg("TAU Fire02 beam skipped (bytes/rva 0x%X)", Offsets::kCTauBeam_ViewMuzzle);
+            Game::logMsg("TAU Fire02 beam skipped (bytes/rva 0x%X)", Offsets::kCTauBeam_ViewMuzzle());
             hkTauBeamView.pTarget = p;
         }
     }
     if (!hkTauBeamWorld.pTarget)
     {
-        auto* p = reinterpret_cast<unsigned char*>(client) + Offsets::kCTauBeam_WorldBeam;
+        auto* p = reinterpret_cast<unsigned char*>(client) + Offsets::kCTauBeam_WorldBeam();
         if (VirtualQuery(p, &mbi, sizeof(mbi)) && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
             && CodeBytesMatch(p, "558BEC83EC788B45080F57C956578B7D"))
         {
             if (hkTauBeamWorld.createHook(p, &dTauBeamWorld) == 0 && hkTauBeamWorld.enableHook() == 0)
-                Game::logMsg("Hook enabled: TAU impact glow rva=0x%X", Offsets::kCTauBeam_WorldBeam);
+                Game::logMsg("Hook enabled: TAU impact glow rva=0x%X", Offsets::kCTauBeam_WorldBeam());
             else
                 Game::logMsg("TAU impact glow hook failed");
         }
         else
         {
-            Game::logMsg("TAU impact glow skipped (bytes/rva 0x%X)", Offsets::kCTauBeam_WorldBeam);
+            Game::logMsg("TAU impact glow skipped (bytes/rva 0x%X)", Offsets::kCTauBeam_WorldBeam());
             hkTauBeamWorld.pTarget = p;
         }
     }
     if (!hkTauBeamFireTrace.pTarget)
     {
-        auto* p = reinterpret_cast<unsigned char*>(client) + Offsets::kCTauBeam_FireTrace;
+        auto* p = reinterpret_cast<unsigned char*>(client) + Offsets::kCTauBeam_FireTrace();
         if (VirtualQuery(p, &mbi, sizeof(mbi)) && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
             && CodeBytesMatch(p, "538BDC83EC0883E4F083C404558B6B04896C24048BEC81ECEC000000"))
         {
             if (hkTauBeamFireTrace.createHook(p, &dTauBeamFireTrace) == 0 && hkTauBeamFireTrace.enableHook() == 0)
-                Game::logMsg("Hook enabled: TAU fire trace rva=0x%X", Offsets::kCTauBeam_FireTrace);
+                Game::logMsg("Hook enabled: TAU fire trace rva=0x%X", Offsets::kCTauBeam_FireTrace());
             else
                 Game::logMsg("TAU fire trace hook failed");
         }
         else
         {
-            Game::logMsg("TAU fire trace skipped (bytes/rva 0x%X)", Offsets::kCTauBeam_FireTrace);
+            Game::logMsg("TAU fire trace skipped (bytes/rva 0x%X)", Offsets::kCTauBeam_FireTrace());
             hkTauBeamFireTrace.pTarget = p;
         }
     }
     if (!hkGluonImpactTrace.pTarget)
     {
-        auto* p = reinterpret_cast<unsigned char*>(client) + Offsets::kCWeaponGluon_ImpactTrace;
+        auto* p = reinterpret_cast<unsigned char*>(client) + Offsets::kCWeaponGluon_ImpactTrace();
         if (VirtualQuery(p, &mbi, sizeof(mbi)) && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
             && CodeBytesMatch(p, "538BDC83EC0883E4F083C404558B6B04896C24048BEC81ECD8000000"))
         {
             if (hkGluonImpactTrace.createHook(p, &dGluonImpactTrace) == 0 && hkGluonImpactTrace.enableHook() == 0)
-                Game::logMsg("Hook enabled: gluon impact trace rva=0x%X", Offsets::kCWeaponGluon_ImpactTrace);
+                Game::logMsg("Hook enabled: gluon impact trace rva=0x%X", Offsets::kCWeaponGluon_ImpactTrace());
             else
                 Game::logMsg("gluon impact trace hook failed");
         }
         else
         {
-            Game::logMsg("gluon impact trace skipped (bytes/rva 0x%X)", Offsets::kCWeaponGluon_ImpactTrace);
+            Game::logMsg("gluon impact trace skipped (bytes/rva 0x%X)", Offsets::kCWeaponGluon_ImpactTrace());
             hkGluonImpactTrace.pTarget = p;
         }
     }
@@ -5660,7 +6873,7 @@ bool Hooks::EnsureWeaponVfxHooks()
     {
         constexpr const char* kBytes =
             "558BEC81ECD0000000A1????????33C58945FC56578BF9";
-        auto* p = ResolveCode(client, Offsets::kCWeaponGluon_BeamUpdate, kBytes);
+        auto* p = ResolveCode(client, Offsets::kCWeaponGluon_BeamUpdate(), kBytes);
         if (p)
         {
             if (hkGluonBeamUpdate.createHook(p, &dGluonBeamUpdate) == 0
@@ -5672,15 +6885,15 @@ bool Hooks::EnsureWeaponVfxHooks()
         }
         else
         {
-            Game::logMsg("gluon beam update skipped (bytes/rva 0x%X)", Offsets::kCWeaponGluon_BeamUpdate);
+            Game::logMsg("gluon beam update skipped (bytes/rva 0x%X)", Offsets::kCWeaponGluon_BeamUpdate());
             hkGluonBeamUpdate.pTarget = reinterpret_cast<unsigned char*>(client)
-                + Offsets::kCWeaponGluon_BeamUpdate;
+                + Offsets::kCWeaponGluon_BeamUpdate();
         }
     }
     if (!hkGluonBeamFxSet.pTarget)
     {
         constexpr const char* kBytes = "558BEC8B450C568BF1C6460C01";
-        auto* p = ResolveCode(client, Offsets::kCGluonBeamFx_SetBeam, kBytes);
+        auto* p = ResolveCode(client, Offsets::kCGluonBeamFx_SetBeam(), kBytes);
         if (p)
         {
             if (hkGluonBeamFxSet.createHook(p, &dGluonBeamFxSet) == 0
@@ -5692,16 +6905,16 @@ bool Hooks::EnsureWeaponVfxHooks()
         }
         else
         {
-            Game::logMsg("gluon beam set skipped (bytes/rva 0x%X)", Offsets::kCGluonBeamFx_SetBeam);
+            Game::logMsg("gluon beam set skipped (bytes/rva 0x%X)", Offsets::kCGluonBeamFx_SetBeam());
             hkGluonBeamFxSet.pTarget = reinterpret_cast<unsigned char*>(client)
-                + Offsets::kCGluonBeamFx_SetBeam;
+                + Offsets::kCGluonBeamFx_SetBeam();
         }
     }
     if (!hkGluonBeamFxDraw.pTarget)
     {
         constexpr const char* kBytes =
             "538BDC83EC0883E4F083C404558B6B04896C24048BEC81EC68050000";
-        auto* p = ResolveCode(client, Offsets::kCGluonBeamFx_Draw, kBytes);
+        auto* p = ResolveCode(client, Offsets::kCGluonBeamFx_Draw(), kBytes);
         if (p)
         {
             if (hkGluonBeamFxDraw.createHook(p, &dGluonBeamFxDraw) == 0
@@ -5713,15 +6926,15 @@ bool Hooks::EnsureWeaponVfxHooks()
         }
         else
         {
-            Game::logMsg("gluon beam draw skipped (bytes/rva 0x%X)", Offsets::kCGluonBeamFx_Draw);
+            Game::logMsg("gluon beam draw skipped (bytes/rva 0x%X)", Offsets::kCGluonBeamFx_Draw());
             hkGluonBeamFxDraw.pTarget = reinterpret_cast<unsigned char*>(client)
-                + Offsets::kCGluonBeamFx_Draw;
+                + Offsets::kCGluonBeamFx_Draw();
         }
     }
     if (!hkParticleSetControlPoint.pTarget)
     {
         constexpr const char* kBytes = "558BEC538B5D0C578BF983BF541B0000FF";
-        auto* p = ResolveCode(client, Offsets::kParticleSetControlPoint, kBytes);
+        auto* p = ResolveCode(client, Offsets::kParticleSetControlPoint(), kBytes);
         if (p)
         {
             if (hkParticleSetControlPoint.createHook(p, &dParticleSetControlPoint) == 0
@@ -5734,28 +6947,28 @@ bool Hooks::EnsureWeaponVfxHooks()
         else
         {
             Game::logMsg("particle SetControlPoint skipped (bytes/rva 0x%X)",
-                Offsets::kParticleSetControlPoint);
+                Offsets::kParticleSetControlPoint());
             hkParticleSetControlPoint.pTarget = reinterpret_cast<unsigned char*>(client)
-                + Offsets::kParticleSetControlPoint;
+                + Offsets::kParticleSetControlPoint();
         }
     }
     if (!hkParticleMgrAddEffect.pTarget)
     {
-        auto* p = reinterpret_cast<unsigned char*>(client) + Offsets::kParticleMgr_AddEffect;
+        auto* p = reinterpret_cast<unsigned char*>(client) + Offsets::kParticleMgr_AddEffect();
         if (VirtualQuery(p, &mbi, sizeof(mbi)) && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
             && CodeBytesMatch(p, "558BEC8B414C53568B7508"))
         {
             if (hkParticleMgrAddEffect.createHook(p, &dParticleMgrAddEffect) == 0
                 && hkParticleMgrAddEffect.enableHook() == 0)
                 Game::logMsg("Hook enabled: particle AddEffect rva=0x%X",
-                    Offsets::kParticleMgr_AddEffect);
+                    Offsets::kParticleMgr_AddEffect());
             else
                 Game::logMsg("particle AddEffect hook failed");
         }
         else
         {
             Game::logMsg("particle AddEffect skipped (bytes/rva 0x%X)",
-                Offsets::kParticleMgr_AddEffect);
+                Offsets::kParticleMgr_AddEffect());
             hkParticleMgrAddEffect.pTarget = p;
         }
     }
@@ -5763,7 +6976,7 @@ bool Hooks::EnsureWeaponVfxHooks()
     {
         constexpr const char* kRpgLaserBytes =
             "558BEC83EC44A1????????33C58945FC8BC1568945D0";
-        auto* p = ResolveCode(client, Offsets::kCWeaponRpg_UpdateLaser, kRpgLaserBytes);
+        auto* p = ResolveCode(client, Offsets::kCWeaponRpg_UpdateLaser(), kRpgLaserBytes);
         if (p)
         {
             if (hkRpgUpdateLaser.createHook(p, &dRpgUpdateLaser) == 0 && hkRpgUpdateLaser.enableHook() == 0)
@@ -5774,16 +6987,16 @@ bool Hooks::EnsureWeaponVfxHooks()
         }
         else
         {
-            Game::logMsg("RPG laser skipped (bytes/rva 0x%X)", Offsets::kCWeaponRpg_UpdateLaser);
+            Game::logMsg("RPG laser skipped (bytes/rva 0x%X)", Offsets::kCWeaponRpg_UpdateLaser());
             hkRpgUpdateLaser.pTarget = reinterpret_cast<unsigned char*>(client)
-                + Offsets::kCWeaponRpg_UpdateLaser;
+                + Offsets::kCWeaponRpg_UpdateLaser();
         }
     }
     if (!hkHudCrosshairPaint.pTarget)
     {
         constexpr const char* kHudCrosshairBytes =
             "558BEC5153568B35????????8BD9578BCE8B06FF5070";
-        auto* p = ResolveCode(client, Offsets::kCHudCrosshair_Paint, kHudCrosshairBytes);
+        auto* p = ResolveCode(client, Offsets::kCHudCrosshair_Paint(), kHudCrosshairBytes);
         if (p)
         {
             if (hkHudCrosshairPaint.createHook(p, &dHudCrosshairPaint) == 0
@@ -5795,16 +7008,16 @@ bool Hooks::EnsureWeaponVfxHooks()
         }
         else
         {
-            Game::logMsg("HUD crosshair skipped (bytes/rva 0x%X)", Offsets::kCHudCrosshair_Paint);
+            Game::logMsg("HUD crosshair skipped (bytes/rva 0x%X)", Offsets::kCHudCrosshair_Paint());
             hkHudCrosshairPaint.pTarget = reinterpret_cast<unsigned char*>(client)
-                + Offsets::kCHudCrosshair_Paint;
+                + Offsets::kCHudCrosshair_Paint();
         }
     }
     if (!hkSpriteRendererDraw.pTarget)
     {
         constexpr const char* kDrawSpriteBytes =
             "558BEC83EC48894DF88B0D????????FF15????????8845FF";
-        auto* p = ResolveCode(client, Offsets::kCSpriteRenderer_DrawSprite, kDrawSpriteBytes);
+        auto* p = ResolveCode(client, Offsets::kCSpriteRenderer_DrawSprite(), kDrawSpriteBytes);
         if (p)
         {
             if (hkSpriteRendererDraw.createHook(p, &dSpriteRendererDraw) == 0
@@ -5816,16 +7029,16 @@ bool Hooks::EnsureWeaponVfxHooks()
         }
         else
         {
-            Game::logMsg("DrawSprite skipped (bytes/rva 0x%X)", Offsets::kCSpriteRenderer_DrawSprite);
+            Game::logMsg("DrawSprite skipped (bytes/rva 0x%X)", Offsets::kCSpriteRenderer_DrawSprite());
             hkSpriteRendererDraw.pTarget = reinterpret_cast<unsigned char*>(client)
-                + Offsets::kCSpriteRenderer_DrawSprite;
+                + Offsets::kCSpriteRenderer_DrawSprite();
         }
     }
     if (!hkViewRenderBeamsDraw.pTarget)
     {
         constexpr const char* kDrawBeamBytes =
             "558BEC83EC2CA1????????33C58945FC894DE88B0D????????568B7508";
-        auto* p = ResolveCode(client, Offsets::kCViewRenderBeams_DrawBeam, kDrawBeamBytes);
+        auto* p = ResolveCode(client, Offsets::kCViewRenderBeams_DrawBeam(), kDrawBeamBytes);
         if (p)
         {
             if (hkViewRenderBeamsDraw.createHook(p, &dViewRenderBeamsDraw) == 0
@@ -5837,16 +7050,16 @@ bool Hooks::EnsureWeaponVfxHooks()
         }
         else
         {
-            Game::logMsg("DrawBeam skipped (bytes/rva 0x%X)", Offsets::kCViewRenderBeams_DrawBeam);
+            Game::logMsg("DrawBeam skipped (bytes/rva 0x%X)", Offsets::kCViewRenderBeams_DrawBeam());
             hkViewRenderBeamsDraw.pTarget = reinterpret_cast<unsigned char*>(client)
-                + Offsets::kCViewRenderBeams_DrawBeam;
+                + Offsets::kCViewRenderBeams_DrawBeam();
         }
     }
     if (!hkSpriteRenderableDraw.pTarget)
     {
         constexpr const char* kSprBytes =
             "558BEC83EC64538B5D088BCB568B03FF5004";
-        auto* p = ResolveCode(client, Offsets::kCSpriteRenderable_Draw, kSprBytes);
+        auto* p = ResolveCode(client, Offsets::kCSpriteRenderable_Draw(), kSprBytes);
         if (p)
         {
             if (hkSpriteRenderableDraw.createHook(p, &dSpriteRenderableDraw) == 0
@@ -5859,16 +7072,16 @@ bool Hooks::EnsureWeaponVfxHooks()
         else
         {
             Game::logMsg("SpriteRenderableDraw skipped (bytes/rva 0x%X)",
-                Offsets::kCSpriteRenderable_Draw);
+                Offsets::kCSpriteRenderable_Draw());
             hkSpriteRenderableDraw.pTarget = reinterpret_cast<unsigned char*>(client)
-                + Offsets::kCSpriteRenderable_Draw;
+                + Offsets::kCSpriteRenderable_Draw();
         }
     }
     if (!hkEnvLaserDotDraw.pTarget)
     {
         constexpr const char* kDotBytes =
-            "558BEC83ECA0A1????????33C58945FCF745080000004E";
-        auto* p = ResolveCode(client, Offsets::kCEnvLaserDot_Draw, kDotBytes);
+            "558BEC81ECA0000000A1????????33C58945FCF745080000004E";
+        auto* p = ResolveCode(client, Offsets::kCEnvLaserDot_Draw(), kDotBytes);
         if (p)
         {
             if (hkEnvLaserDotDraw.createHook(p, &dEnvLaserDotDraw) == 0
@@ -5880,16 +7093,16 @@ bool Hooks::EnsureWeaponVfxHooks()
         }
         else
         {
-            Game::logMsg("EnvLaserDot draw skipped (bytes/rva 0x%X)", Offsets::kCEnvLaserDot_Draw);
+            Game::logMsg("EnvLaserDot draw skipped (bytes/rva 0x%X)", Offsets::kCEnvLaserDot_Draw());
             hkEnvLaserDotDraw.pTarget = reinterpret_cast<unsigned char*>(client)
-                + Offsets::kCEnvLaserDot_Draw;
+                + Offsets::kCEnvLaserDot_Draw();
         }
     }
     if (!hkSpriteQuad.pTarget)
     {
         constexpr const char* kQuadBytes =
             "538BDC83EC0883E4F083C404558B6B04896C24048BEC81EC58020000";
-        auto* p = ResolveCode(client, Offsets::kSpriteQuad, kQuadBytes);
+        auto* p = ResolveCode(client, Offsets::kSpriteQuad(), kQuadBytes);
         if (p)
         {
             if (hkSpriteQuad.createHook(p, &dSpriteQuad) == 0
@@ -5901,9 +7114,9 @@ bool Hooks::EnsureWeaponVfxHooks()
         }
         else
         {
-            Game::logMsg("sprite quad skipped (bytes/rva 0x%X)", Offsets::kSpriteQuad);
+            Game::logMsg("sprite quad skipped (bytes/rva 0x%X)", Offsets::kSpriteQuad());
             hkSpriteQuad.pTarget = reinterpret_cast<unsigned char*>(client)
-                + Offsets::kSpriteQuad;
+                + Offsets::kSpriteQuad();
         }
     }
     s_done = hkTauBeamView.pTarget && hkTauBeamWorld.pTarget && hkTauBeamFireTrace.pTarget
@@ -6489,7 +7702,7 @@ void __fastcall Hooks::dGetScreenSize(void* ecx, void* edx, int& width, int& hei
     }
     const int origW = width;
     const int origH = height;
-    if (OffscreenStereoSizeLie(width, height))
+    if (OffscreenWorldViewSizeLie(width, height))
     {
         static int s_ssLie;
         if (s_ssLie < 8 && (origW != width || origH != height))
@@ -6556,10 +7769,12 @@ float __fastcall Hooks::dGetScreenAspectRatio(void* ecx, void* edx)
     // the gun used 16:9 in a ~square eye RT (stretch along view-up, and the
     // grip rides the look plane when you nod).
     if (m_VR && m_VR->m_IsVREnabled && m_VR->IsGameplayEligible() && EngineInGame()
-        && m_VR->StereoWorldPassActive()
         && m_VR->m_RenderWidth >= 640 && m_VR->m_RenderHeight >= 360
-        && (bmvr::OffscreenWorldMatchesEyes() || m_VR->CachedRt0MatchesEyes()
-            || m_VR->D3dRt0IsEyeSized()))
+        && (WorldMatchEyeSizeLieAllowed()
+            || (m_VR->StereoWorldPassActive()
+                && (bmvr::OffscreenWorldMatchesEyes() || bmvr::UseGbMatchViewLock()
+                    || m_VR->CachedRt0MatchesEyes()
+                    || m_VR->D3dRt0IsEyeSized()))))
     {
         const float eyeAspect = static_cast<float>(m_VR->m_RenderWidth)
             / static_cast<float>(m_VR->m_RenderHeight);
@@ -6626,11 +7841,24 @@ ITexture* __fastcall Hooks::dCreateNamedRTEx(void* ecx, void* edx, const char* n
         growW = gbW;
         growH = gbH;
     }
-    const bool wantGrow = wantGrowFb || wantGrowGb;
+    bool wantGrow = wantGrowFb || wantGrowGb;
+    const int oldW = w;
+    const int oldH = h;
+    if (wantGrow && oldW >= 640 && oldH >= 360
+        && growW <= static_cast<uint32_t>(oldW)
+        && growH <= static_cast<uint32_t>(oldH))
+    {
+        static int s_shrinkLog;
+        if (s_shrinkLog < 8)
+        {
+            Game::logMsg("CreateNamedRT %s skip shrink %dx%d -> %ux%u (keep engine size)",
+                name ? name : "?", oldW, oldH, growW, growH);
+            ++s_shrinkLog;
+        }
+        wantGrow = false;
+    }
     if (wantGrow)
     {
-        const int oldW = w;
-        const int oldH = h;
         const int oldMode = sizeMode;
         w = static_cast<int>(growW);
         h = static_cast<int>(growH);
@@ -6701,7 +7929,59 @@ ITexture* __fastcall Hooks::dCreateNamedRTEx(void* ecx, void* edx, const char* n
     }
     if (!hkCreateNamedRTEx.fOriginal)
         return nullptr;
+    const bool sceneName = name && (std::strstr(name, "_rt_FullFrame")
+        || std::strstr(name, "_rt_Resolved")
+        || (std::strstr(name, "_rt_gb")
+            && !std::strstr(name, "shadow") && !std::strstr(name, "Shadow")
+            && !std::strstr(name, "flashlight") && !std::strstr(name, "Flashlight")
+            && !std::strstr(name, "csm") && !std::strstr(name, "CSM")));
+    const bool separateDepth = depth == MATERIAL_RT_DEPTH_SEPARATE || depth == MATERIAL_RT_DEPTH_ONLY;
+    if (sceneName && !separateDepth)
+    {
+        static int s_sharedDepth;
+        if (s_sharedDepth < 8)
+        {
+            Game::logMsg("HL2VR MSAA skip %s depth=%d (needs a separate depth buffer)", name, depth);
+            ++s_sharedDepth;
+        }
+    }
+    const bool msaaScope = sceneName && separateDepth && bmvr::g_MsaaAllowed
+        && bmvr::NormalizeMsaa(static_cast<int>(bmvr::g_Msaa)) >= 2
+        && !skipGrow;
+    if (msaaScope)
+    {
+        static int s_scopeLog;
+        if (s_scopeLog < 12)
+        {
+            Game::logMsg("HL2VR MSAA %s %dx%d depth=%d samples=%u",
+                name, w, h, depth, bmvr::g_Msaa);
+            ++s_scopeLog;
+        }
+    }
+    const uint32_t scopeW = w > 0 ? static_cast<uint32_t>(w) : 0;
+    const uint32_t scopeH = h > 0 ? static_cast<uint32_t>(h) : 0;
+    // No C++ guard here: this function uses __try, and MSVC rejects
+    // unwinding objects in the same function.
+    if (msaaScope)
+    {
+        if (bmvr::Hl2vrMsaaScope::Depth() == 0)
+        {
+            bmvr::Hl2vrMsaaScope::Width() = scopeW;
+            bmvr::Hl2vrMsaaScope::Height() = scopeH;
+        }
+        ++bmvr::Hl2vrMsaaScope::Depth();
+    }
+    static bool s_msaaArmed;
+    if (msaaScope && !s_msaaArmed)
+    {
+        s_msaaArmed = true;
+        bmvr::BeginRisky(L"msaa");
+    }
     ITexture* tex = hkCreateNamedRTEx.fOriginal(ecx, name, w, h, sizeMode, format, depth, textureFlags, renderTargetFlags);
+    if (msaaScope && bmvr::Hl2vrMsaaScope::Depth() > 0)
+        --bmvr::Hl2vrMsaaScope::Depth();
+    if (msaaScope && s_msaaArmed)
+        bmvr::EndRisky(L"msaa");
     if (tex && name && (fullMode || namedFb || namedGb || wantGrow))
     {
         int aw = 0, ah = 0;
@@ -6799,10 +8079,10 @@ void bmvr::InstallEarlyFramebufferHook()
         return;
     }
 
-    int off = SigScanner::VerifyOffset("materialsystem.dll", 0x52d20,
+    int off = SigScanner::VerifyOffset("materialsystem.dll", 0x53EF0,
         "55 8B EC 8B 0D ? ? ? ? 8B 01 8B 80 58 04 00 00 5D FF E0");
     if (off < 0)
-        off = SigScanner::VerifyOffset("MaterialSystem.dll", 0x52d20,
+        off = SigScanner::VerifyOffset("MaterialSystem.dll", 0x53EF0,
             "55 8B EC 8B 0D ? ? ? ? 8B 01 8B 80 58 04 00 00 5D FF E0");
     if (off == -1)
     {
@@ -6810,7 +8090,7 @@ void bmvr::InstallEarlyFramebufferHook()
         return;
     }
     if (off == 0)
-        off = 0x52d20;
+        off = 0x53EF0;
     void* target = reinterpret_cast<uint8_t*>(mat) + off;
     if (Hooks::hkGetBackBufferDimensions.createHook(target, &Hooks::dGetBackBufferDimensions) != 0
         || Hooks::hkGetBackBufferDimensions.enableHook() != 0)
@@ -6827,7 +8107,7 @@ void bmvr::InstallEarlyFramebufferHook()
         Log("GetScreenSize: engine.dll not loaded yet");
         return;
     }
-    int screenOff = SigScanner::VerifyOffset("engine.dll", 0xA6BD0,
+    int screenOff = SigScanner::VerifyOffset("engine.dll", 0xA6D00,
         "55 8B EC 8B 0D ? ? ? ? 56 8B 01 FF 90 9C 01 00 00");
     if (screenOff == -1)
     {
@@ -6835,7 +8115,7 @@ void bmvr::InstallEarlyFramebufferHook()
         return;
     }
     if (screenOff == 0)
-        screenOff = 0xA6BD0;
+        screenOff = 0xA6D00;
     void* screenTarget = reinterpret_cast<uint8_t*>(eng) + screenOff;
     if (!Hooks::hkGetScreenSize.pTarget)
     {
@@ -6849,14 +8129,14 @@ void bmvr::InstallEarlyFramebufferHook()
     }
     if (!Hooks::hkGetScreenAspectRatio.pTarget)
     {
-        int aspectOff = SigScanner::VerifyOffset("engine.dll", 0x1012D0,
+        int aspectOff = SigScanner::VerifyOffset("engine.dll", 0x101490,
             "55 8B EC 8B 0D ? ? ? ? 83 EC 0C 81 F9 ? ? ? ? 75 16 F3 0F 10 0D");
         if (aspectOff == -1)
             Log("GetScreenAspectRatio signature not found");
         else
         {
             if (aspectOff == 0)
-                aspectOff = 0x1012D0;
+                aspectOff = 0x101490;
             void* aspectTarget = reinterpret_cast<uint8_t*>(eng) + aspectOff;
             if (Hooks::hkGetScreenAspectRatio.createHook(aspectTarget, &Hooks::dGetScreenAspectRatio) != 0
                 || Hooks::hkGetScreenAspectRatio.enableHook() != 0)

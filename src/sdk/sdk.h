@@ -126,7 +126,13 @@ public:
 	virtual void* sub_1005D2A0() = 0;
 	virtual void* sub_1005D2C0() = 0;
 	virtual void* sub_1005D2D0() = 0;
-	virtual bool IsInGame() = 0;
+	// public-beta buildid 25844216 (2026-10-10) inserted this slot.
+	// The old IsInGame slot is now a 1-arg ret 4. Calling it with no
+	// argument corrupts the stack on the first Present (exit 0xC0000374).
+	// IsInGame is the next slot: cmp signonState, 6; setz al; ret.
+	virtual void* sub_beta20261010_slot26() = 0;
+	virtual bool AbiUnused_IsInGame() = 0;
+	bool IsInGame() { using Fn = bool(__thiscall*)(void*); return reinterpret_cast<Fn>((*reinterpret_cast<void***>(this))[bmvr::abi::Select(26,27)])(this); }
 	virtual void* sub_1005F150() = 0;
 	virtual void* sub_1005D2F0() = 0;
 	virtual void* sub_1005D300() = 0;
@@ -151,11 +157,13 @@ public:
 	virtual void* sub_1005D880() = 0;
 	virtual void* sub_1005D890() = 0;
 	virtual void* sub_1005D8A0() = 0;
-	// CEngineClient vtable in engine.dll (image 0x10000000): slot 51 at
-	// 0x100A6860 returns "Dedicated Server" or cl.m_szLevelName; slot 52 at
-	// 0x100A6890 returns "dedicated" or the short map name (background01).
-	virtual const char* GetLevelName() = 0;
-	virtual const char* GetLevelNameShort() = 0;
+	// CEngineClient vtable in engine.dll. Build 25607072: GetLevelName slot 51,
+	// GetLevelNameShort slot 52. Build 25844216 (2026-10-10): those are 52 and
+	// 53 because of the slot inserted above IsInGame.
+	virtual const char* AbiUnused_GetLevelName() = 0;
+	const char* GetLevelName() { using Fn = const char*(__thiscall*)(void*); return reinterpret_cast<Fn>((*reinterpret_cast<void***>(this))[bmvr::abi::Select(51,52)])(this); }
+	virtual const char* AbiUnused_GetLevelNameShort() = 0;
+	const char* GetLevelNameShort() { using Fn = const char*(__thiscall*)(void*); return reinterpret_cast<Fn>((*reinterpret_cast<void***>(this))[bmvr::abi::Select(52,53)])(this); }
 	virtual void* sub_1005F190() = 0;
 	virtual void* sub_1005DA90() = 0;
 	virtual void* sub_1005DAA0() = 0;
@@ -190,7 +198,8 @@ public:
 	virtual void* sub_1005DE00() = 0;
 	virtual void* sub_1005DE10() = 0;
 	virtual void* sub_1005DE20() = 0;
-	virtual bool IsPaused() = 0;
+	virtual bool AbiUnused_IsPaused() = 0;
+	bool IsPaused() { using Fn = bool(__thiscall*)(void*); return reinterpret_cast<Fn>((*reinterpret_cast<void***>(this))[bmvr::abi::Select(87,88)])(this); }
 	virtual void* sub_1005DD90() = 0;
 	virtual void* sub_1005DDA0() = 0;
 	virtual void* sub_1005DE30() = 0;
@@ -214,7 +223,8 @@ public:
 	// (slot 108) with "gameui_activate" (Ghidra FUN_101f0550). Slot 107 (0x1AC)
 	// SEH'd every pause press from ProcessInput (bmvr_log 2026-08-18).
 	virtual void* ClientCmd_Unrestricted_V014() = 0;
-	virtual void* ClientCmd_Unrestricted(const char* szCmdString) = 0;
+	virtual void* AbiUnused_ClientCmd_Unrestricted(const char* szCmdString) = 0;
+	void* ClientCmd_Unrestricted(const char* szCmdString) { using Fn = void*(__thiscall*)(void*, const char*); return reinterpret_cast<Fn>((*reinterpret_cast<void***>(this))[bmvr::abi::Select(108,109)])(this, szCmdString); }
 };
 
 class IGameEvent
@@ -1080,7 +1090,13 @@ public:
 	virtual void sub_10017780() = 0;
 	virtual void sub_10018180() = 0;
 	virtual void sub_10028B00() = 0;
-	virtual void OverrideAlphaWriteEnable(bool bEnable, bool bAlphaWriteEnable) = 0;
+	// public-beta materialsystem inserted one virtual below this. Slot 180
+	// (+0x2D0) is now a 0-arg `ret 0`; calling it as (bool, bool) left
+	// ESP 8 bytes off and corrupted EDI in the pause HUD paint.
+	// OverrideAlphaWriteEnable is slot 181 (ret 8) in both contexts.
+	virtual void sub_beta_matsys_inserted() = 0;
+	virtual void AbiUnused_OverrideAlphaWriteEnable(bool bEnable, bool bAlphaWriteEnable) = 0;
+	void OverrideAlphaWriteEnable(bool enable, bool write) { using Fn = void(__thiscall*)(void*, bool, bool); reinterpret_cast<Fn>((*reinterpret_cast<void***>(this))[bmvr::abi::Select(180,181)])(this,enable,write); }
 };
 
 class CMatRenderContextPtr : public CRefPtr<IMatRenderContext>

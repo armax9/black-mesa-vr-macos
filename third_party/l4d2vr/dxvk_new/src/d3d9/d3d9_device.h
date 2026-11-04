@@ -1089,6 +1089,9 @@ namespace dxvk {
     uint32_t GetInstanceCount() const;
 
     void PrepareDraw(D3DPRIMITIVETYPE PrimitiveType, bool UploadVBOs, bool UploadIBOs);
+    void BmvrApplyHl2vrMsaa(D3D9_COMMON_TEXTURE_DESC& desc);
+    void BmvrNoteMsaaAttachmentsWritten();
+    void BmvrResolveMsaaForSample(D3D9CommonTexture* tex);
 
     void EnsureSamplerLimit();
 
@@ -1296,6 +1299,9 @@ namespace dxvk {
 
     void DrawQueuedEyeSubmitOverlays(VR* vr);
     void UpdateReShadeVrDepthAtlas(VR* vr);
+    // v50: ordinary ordered CS, not InjectCs's high-priority queue.
+    HRESULT CopyHostReadbackPair(IDirect3DSurface9* left, IDirect3DSurface9* right,
+      const Rc<DxvkBuffer>& target, UINT width, UINT height, VkDeviceSize eyeBytes);
 
   private:
 

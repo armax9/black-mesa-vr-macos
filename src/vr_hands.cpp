@@ -5,6 +5,7 @@
 #include "vr.h"
 #include "vr_hand_asset_loader.h"
 #include "vr_hand_math.h"
+#include "bmvr_grip_math.h"
 #include "vr_hand_renderer_d3d9.h"
 
 #include "openvr.h"
@@ -105,6 +106,8 @@ namespace
         bool built = false;
         bool valid = false;
         bool valveBiped = false;
+        bool gripFrameValid = false;
+        float gripFrame[3][4]{};
         int fingerJoint[vr::VRFinger_Count][3]{};
         std::vector<VrHandMatrix4> bindLocal;
         std::vector<int> order;
@@ -186,6 +189,15 @@ namespace
         rig.valveBiped = AssetUsesValveBipedCurl(asset);
         rig.scratchLocal.resize(n);
         rig.scratchModel.resize(n);
+        const int wrist = FindNameIndex(asset.jointNames, rightHand ? "wrist_r" : "wrist_l");
+        if (rig.valveBiped && wrist >= 0) {
+            auto point = [&](int j) { const auto& m=asset.bindMatrices[size_t(j)];
+                return bmvr_grip::V{VrHandMath::Get(m,0,3),VrHandMath::Get(m,1,3),VrHandMath::Get(m,2,3)}; };
+            rig.gripFrameValid = bmvr_grip::frame(point(wrist),
+                point(rig.fingerJoint[vr::VRFinger_Index][0]),
+                point(rig.fingerJoint[vr::VRFinger_Middle][0]),
+                point(rig.fingerJoint[vr::VRFinger_Pinky][0]),rig.gripFrame);
+        }
         rig.valid = true;
     }
 
@@ -669,8 +681,8 @@ bool BmVrGloves::DrawForEye(
     Impl::Hand* pair = nullptr;
     int gpuBase = 0;
     const char* source = "hev";
-    // Blue Shift is Calhoun in a security uniform — never HEV gloves.
-    const bool forceBare = bmvr::IsBlueShift();
+    // Blue Shift / Azure Sheep: security uniform — never HEV gloves.
+    const bool forceBare = bmvr::IsBlueShift() || bmvr::IsAzureSheep();
     if (m_Impl->bareLoaded && (forceBare || !wearingSuit))
     {
         pair = m_Impl->bare;
@@ -705,8 +717,9 @@ bool BmVrGloves::DrawForEye(
 
         Impl::Hand& hand = pair[i];
         vr::VRSkeletalSummaryData_t summary{};
-        const bool gripCurl = rightHand && g_Game && g_Game->m_VR
-            && g_Game->m_VR->WantsRightGloveWeaponGripCurl();
+        const bool gripCurl = g_Game && g_Game->m_VR && (
+            (rightHand && g_Game->m_VR->WantsRightGloveWeaponGripCurl())
+            || (!rightHand && g_Game->m_VR->WantsOffhandGloveWeaponGripCurl()));
         if (TryGetSummary(input, actions[i], summary))
         {
             if (!BuildSummaryCurlPalette(hand.asset, hand.rig, summary, hand.palette, gripCurl ? 0.40f : 0.f))
@@ -739,13 +752,26 @@ bool BmVrGloves::DrawForEye(
             posOffset.y += bmvr::g_VrHandsRightPoseOffY;
             posOffset.z += bmvr::g_VrHandsRightPoseOffZ;
         }
-        const VrHandMatrix4 world = VrHandMath::BuildControllerWorld(
+        VrHandMatrix4 world = VrHandMath::BuildControllerWorld(
             *origins[i],
             *angles[i],
             sourceUnitsPerMeter,
             scale,
             posOffset,
             rotOffset);
+        if (g_Game && g_Game->m_VR && g_Game->m_VR->m_OpenXrHelperBridgeActive
+            && family==L4D2VR_OPENXR_CONTROLLER_FAMILY_TOUCH && hand.rig.gripFrameValid) {
+            // Asset-defined palm frame, not the legacy GLB yaw/roll calibration.
+            // Corrected frame uses knuckles->wrist for +Y (v17 used its inverse).
+            Vector f,r,u; QAngle::AngleVectors(*angles[i],&f,&r,&u);
+            const float k=sourceUnitsPerMeter*scale;
+            const float controller[3][4]={{r.x*k,u.x*k,-f.x*k,origins[i]->x},
+                {r.y*k,u.y*k,-f.y*k,origins[i]->y},{r.z*k,u.z*k,-f.z*k,origins[i]->z}};
+            float inv[3][4]{},model[3][4]{};
+            bmvr_grip::inverse(hand.rig.gripFrame,inv);bmvr_grip::mul(controller,inv,model);
+            world=VrHandMath::Identity();
+            for(int row=0;row<3;row++)for(int col=0;col<4;col++)VrHandMath::Set(world,row,col,model[row][col]);
+        }
         const VrHandMatrix4 wvp = VrHandMath::Multiply(projection, VrHandMath::Multiply(camera, world));
 
         // GetLightForPoint + flashlight cone once per hand per frame; the

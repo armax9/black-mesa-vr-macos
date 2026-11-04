@@ -1,3 +1,4 @@
+#include "../util/util_bmvr_slow.h"
 #include "d3d9_query.h"
 
 #include "d3d9_device.h"
@@ -127,6 +128,15 @@ namespace dxvk {
 
 
   HRESULT STDMETHODCALLTYPE D3D9Query::GetData(void* pData, DWORD dwSize, DWORD dwGetDataFlags) {
+    // Count all exits, including cached/S_OK results and device-lock waits.
+    // Pending-only counters below cannot detect a slow successful driver call.
+    static std::atomic<unsigned> slowBudget[3]{};
+    static const char* const names[3] = {
+      "QueryEventGetData", "QueryOcclusionGetData", "QueryOtherGetData" };
+    const unsigned kind = m_queryType == D3DQUERYTYPE_EVENT ? 0u
+      : m_queryType == D3DQUERYTYPE_OCCLUSION ? 1u : 2u;
+    BmvrSlowScope slowScope(names[kind], slowBudget[kind]);
+
     D3D9DeviceLock lock = m_parent->LockDevice();
 
     bool flush = dwGetDataFlags & D3DGETDATA_FLUSH;
@@ -150,6 +160,12 @@ namespace dxvk {
     }
 
     HRESULT hr = this->GetQueryData(pData, dwSize);
+    if (hr == S_FALSE && BmvrSlowScope::enabled()) {
+      const unsigned tag = m_queryType == D3DQUERYTYPE_EVENT ? 9
+        : m_queryType == D3DQUERYTYPE_OCCLUSION ? 10 : 11;
+      // Count retries only; no extra clock calls or changed query results.
+      BmvrTimingAdd(tag,0);
+    }
 
     // If we get S_FALSE and it's not from the fact
     // they didn't call end, do some flushy stuff...

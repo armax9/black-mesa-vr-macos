@@ -9,6 +9,21 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 
+# Freeze pipeline specialization constants before MoltenVK translates aliased
+# D3D9 color/depth sampler declarations to Metal resources.
+include(FetchContent)
+set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)
+set(SPIRV_SKIP_EXECUTABLES ON CACHE BOOL "" FORCE)
+set(SPIRV_TOOLS_BUILD_STATIC ON CACHE BOOL "" FORCE)
+set(SPIRV_TOOLS_INSTALL OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(bmvr_spirv_headers
+  URL https://github.com/KhronosGroup/SPIRV-Headers/archive/refs/tags/vulkan-sdk-1.3.296.0.tar.gz)
+FetchContent_MakeAvailable(bmvr_spirv_headers)
+set(SPIRV-Headers_SOURCE_DIR "${bmvr_spirv_headers_SOURCE_DIR}" CACHE PATH "" FORCE)
+FetchContent_Declare(bmvr_spirv_tools
+  URL https://github.com/KhronosGroup/SPIRV-Tools/archive/refs/tags/vulkan-sdk-1.3.296.0.tar.gz)
+FetchContent_MakeAvailable(bmvr_spirv_tools)
+
 set(ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 set(DXVK "${ROOT}/third_party/l4d2vr/dxvk_new")
 set(SRC_LIST "${ROOT}/tools/dxvk_sources.txt")
@@ -32,6 +47,7 @@ set(BMVR_SOURCES
   src/game.cpp
   src/hooks.cpp
   src/vr.cpp
+  src/vr_audio_focus.cpp
   src/vr_crowbar.cpp
   src/vr_weapon_menu.cpp
   src/vr_hands.cpp
@@ -40,6 +56,7 @@ set(BMVR_SOURCES
   src/openxr_helper_bridge.cpp
   src/openxr_loader_util.cpp
   src/bmvr_flags.cpp
+  src/bmvr_stall_capture.cpp
   src/sdk/checksum_crc.cpp
   third_party/l4d2vr/L4D2VR/vr_hands/vr_hand_asset_loader.cpp
   third_party/minhook/src/buffer.c
@@ -126,6 +143,7 @@ target_link_libraries(d3d9 PRIVATE
 set_target_properties(d3d9 PROPERTIES
   LINK_FLAGS "/DEF:\"${DXVK}/src/d3d9/d3d9.def\" /INCREMENTAL:NO"
 )
+target_link_options(d3d9 PRIVATE /MAP)
 
 if(MSVC)
   set_source_files_properties(
@@ -151,3 +169,11 @@ if(MSVC)
     COMPILE_DEFINITIONS "static_array=;ssize_t=intptr_t"
   )
 endif()
+
+# Static optimizer dependency; no additional runtime DLL is required.
+target_link_libraries(d3d9 PRIVATE SPIRV-Tools-opt)
+
+# Opt-in local diagnostics observer: Win32 target, no debugger attach/injection.
+add_executable(BMVRStallProbe src/bmvr_stall_probe.cpp)
+target_compile_definitions(BMVRStallProbe PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
+target_compile_options(BMVRStallProbe PRIVATE /W3 /O2)

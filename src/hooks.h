@@ -157,6 +157,7 @@ public:
     static inline Hook<tWeaponShootPosition> hkClientWeaponShootPosition;
     static inline Hook<tWeaponShootPosition> hkServerWeaponShootPosition;
     static inline Hook<tWeaponShootPosition> hkServerGrabHoldOrigin;
+    static inline Hook<tWeaponShootPosition> hkServerMeleeOrigin;
     static inline Hook<tGrabSetTarget> hkGrabSetTarget;
     static inline Hook<tGetShootAngles> hkGetShootAngles;
     static inline Hook<tGetShootAngles> hkClientGetShootAngles;
@@ -222,6 +223,7 @@ public:
     static Vector* __fastcall dClientWeaponShootPosition(void* ecx, void* edx, Vector* out);
     static Vector* __fastcall dServerWeaponShootPosition(void* ecx, void* edx, Vector* out);
     static Vector* __fastcall dServerGrabHoldOrigin(void* ecx, void* edx, Vector* out);
+    static Vector* __fastcall dServerMeleeOrigin(void* ecx, void* edx, Vector* out);
     static void __fastcall dGrabSetTarget(void* ecx, void* edx, Vector* pos, QAngle* ang);
     static void __fastcall dGetShootAngles(void* ecx, void* edx, QAngle* out);
     static void __fastcall dClientGetShootAngles(void* ecx, void* edx, QAngle* out);
@@ -252,4 +254,5 @@ public:
     // Returns true once every VFX hook target is resolved (installed or skipped).
     static bool EnsureWeaponVfxHooks();
     static void RestoreViewmodelArmHides();
+    static void InvalidateLevelModelCaches();
 };

@@ -1,4 +1,8 @@
 #pragma once
+#include <mutex>
+#include <filesystem>
+#include <condition_variable>
+#include "../util/thread.h"
 
 #include "dxvk_adapter.h"
 #include "dxvk_buffer.h"
@@ -87,6 +91,8 @@ namespace dxvk {
       const DxvkQueueCallback&        queueCallback);
       
     ~DxvkDevice();
+    VkPipelineCache bmvrPipelineCache() const;
+    void noteBmvrPipelineCreated() const;
     
     /**
      * \brief Vulkan device functions
@@ -648,6 +654,17 @@ namespace dxvk {
     DxvkDeviceInfo              m_properties;
     
     DxvkDevicePerfHints         m_perfHints;
+    // Initialized before DxvkObjects, which may compile pipelines in its ctor.
+    mutable std::once_flag       m_BmvrCacheOnce;
+    mutable VkPipelineCache      m_BmvrPipelineCache = VK_NULL_HANDLE;
+    mutable std::filesystem::path m_BmvrPipelinePath;
+    mutable std::atomic<uint64_t> m_BmvrCacheEpoch{0};
+    mutable std::mutex           m_BmvrCacheWorkerMutex;
+    mutable std::condition_variable m_BmvrCacheWorkerWake;
+    mutable bool                m_BmvrCacheWorkerStop = false;
+    mutable dxvk::thread        m_BmvrCacheWorker;
+    bool saveBmvrPipelineCache() const noexcept;
+    void runBmvrCacheWorker() const;
     DxvkObjects                 m_objects;
 
     sync::Spinlock              m_statLock;

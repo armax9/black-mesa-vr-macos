@@ -1,3 +1,6 @@
+#include "../util/util_bmvr_slow.h"
+#include "../util/util_bmvr_memory.h"
+#include "../util/util_bmvr_input_layout.h"
 #include "d3d9_device.h"
 
 #include "d3d9_annotation.h"
@@ -158,6 +161,26 @@ namespace dxvk {
                 ++s_log;
             }
             params->Windowed = TRUE;
+        }
+
+        static void BmvrStripSwapchainMsaa(D3DPRESENT_PARAMETERS* params)
+        {
+            if (!params)
+                return;
+            if (params->MultiSampleType == D3DMULTISAMPLE_NONE && params->MultiSampleQuality == 0)
+                return;
+            static int s_log;
+            if (s_log < 4)
+            {
+                Logger::info(str::format(
+                    "BMVR stripping swapchain MSAA ",
+                    static_cast<int>(params->MultiSampleType),
+                    " q=", params->MultiSampleQuality,
+                    " (scene MSAA is HL2VR-scoped, not the backbuffer)"));
+                ++s_log;
+            }
+            params->MultiSampleType = D3DMULTISAMPLE_NONE;
+            params->MultiSampleQuality = 0;
         }
 
         static void BmvrForceHmdAspectWindowedBackbuffer(D3DPRESENT_PARAMETERS* params)
@@ -1221,6 +1244,12 @@ namespace dxvk {
     , m_d3d9On12           ( this )
     , m_d3d8Bridge         ( this ) {
 
+    try {
+      Logger::warn(str::format("[BMVR locks v22] D3D9 creationFlags=0x", std::hex,
+        BehaviorFlags, " protected=", (BehaviorFlags & D3DCREATE_MULTITHREADED) != 0,
+        " mutexTiming=contended-only"));
+    } catch (...) { }
+
     // If we can SWVP, then we use an extended constant set
     // as SWVP has many more slots available than HWVP.
     bool canSWVP = CanSWVP();
@@ -1660,25 +1689,17 @@ namespace dxvk {
 
     D3DPRESENT_PARAMETERS* caller = pPresentationParameters;
     D3DPRESENT_PARAMETERS local = *pPresentationParameters;
+    BmvrStripSwapchainMsaa(&local);
     BmvrKeepDesktopWindowed(&local);
     BmvrForceHmdAspectWindowedBackbuffer(&local);
     BmvrSyncCallerBackbufferSize(caller, &local);
-    if (BmvrShouldSkipIdenticalWindowedReset(m_implicitSwapchain.ptr(), &local)
-     || BmvrShouldSkipWindowedSizeReset(m_implicitSwapchain.ptr(), &local)) {
-      static int s_skipLog;
-      if (s_skipLog < 4) {
-        Logger::info(str::format(
-          "BMVR skipping identical windowed Reset ",
-          local.BackBufferWidth, "x", local.BackBufferHeight));
-        ++s_skipLog;
-      }
-      m_deviceLostState = D3D9DeviceLostState::Ok;
-      return D3D_OK;
-    }
-
+    // IDirect3DDevice9::Reset resets device state even if dimensions match.
+    // Returning success without ResetState leaves menu shaders/blending/streams
+    // live while Source assumes defaults. Keep the ordinary Reset path below.
+    // ResetEx has different preservation rules and remains separate.
     pPresentationParameters = &local;
 
-    VR* vr = (g_Game != nullptr) ? g_Game->m_VR : nullptr;
+    VR* vr = (static_cast<IDirect3DDevice9*>(this) == g_BmvrSourceDevice9 && g_Game != nullptr) ? g_Game->m_VR : nullptr;
     if (vr) {
       vr->ReleaseVRRenderTargetsForDeviceReset();
       VrForceSwapchainBackBufferToEyeSize(vr, pPresentationParameters);
@@ -1749,7 +1770,7 @@ namespace dxvk {
     */
     if (unlikely(m_losableResourceCounter.load() != 0 && !IsExtended() && m_d3d9Options.countLosableResources)) {
       const uint32_t remainingLosableResources = m_losableResourceCounter.load();
-      if (g_Game && g_Game->m_VR) {
+      if (static_cast<IDirect3DDevice9*>(this) == g_BmvrSourceDevice9 && g_Game && g_Game->m_VR) {
         Logger::warn(str::format(
           "Device reset continuing after L4D2VR texture cleanup despite remaining losable resources: ",
           remainingLosableResources));
@@ -1778,7 +1799,7 @@ namespace dxvk {
 
     // RefreshBackBufferTexture takes the VR texture mutex and re-enters D3D9.
     lock = D3D9DeviceLock();
-    if (g_Game && g_Game->m_VR)
+    if (static_cast<IDirect3DDevice9*>(this) == g_BmvrSourceDevice9 && g_Game && g_Game->m_VR)
       g_Game->m_VR->RefreshBackBufferTexture(true);
 
     return D3D_OK;
@@ -1880,12 +1901,7 @@ namespace dxvk {
                             || (Usage & D3DUSAGE_DYNAMIC)
                             || IsVendorFormat(EnumerateFormat(Format));
 
-    if (g_Game && g_Game->m_VR
-     && (g_Game->m_VR->m_CreatingTextureID == VR::Texture_LeftEye
-      || g_Game->m_VR->m_CreatingTextureID == VR::Texture_RightEye)) {
-      dxvk::Logger::info(str::format("Creating texture with MSAA ", g_Game->m_VR->m_AntiAliasing));
-      desc.MultiSample = MapToMultisampleType(g_Game->m_VR->m_AntiAliasing);
-    }
+    BmvrApplyHl2vrMsaa(desc);
 
     if (FAILED(D3D9CommonTexture::NormalizeTextureProperties(this, D3DRTYPE_TEXTURE, &desc)))
       return D3DERR_INVALIDCALL;
@@ -1906,7 +1922,7 @@ namespace dxvk {
 
       HANDLE openXrSharedHandle = nullptr;
       HANDLE* effectiveSharedHandle = pSharedHandle;
-      if (pSharedHandle == nullptr && Pool == D3DPOOL_DEFAULT && g_Game && g_Game->m_VR)
+      if (pSharedHandle == nullptr && Pool == D3DPOOL_DEFAULT && static_cast<IDirect3DDevice9*>(this) == g_BmvrSourceDevice9 && g_Game && g_Game->m_VR)
       {
         const VR::TextureID texID = g_Game->m_VR->m_CreatingTextureID;
         const uint32_t submitSampleCount = desc.MultiSample == D3DMULTISAMPLE_NONE ? 1u : 0u;
@@ -1919,7 +1935,7 @@ namespace dxvk {
       m_initializer->InitTexture(texture->GetCommonTexture(), initialData);
       *ppTexture = texture.ref();
 
-      if (g_Game && g_Game->m_VR && g_Game->m_VR->m_CreatingTextureID != VR::Texture_None && g_D3DVR9) {
+      if (static_cast<IDirect3DDevice9*>(this) == g_BmvrSourceDevice9 && g_Game && g_Game->m_VR && g_Game->m_VR->m_CreatingTextureID != VR::Texture_None && g_D3DVR9) {
         SharedTextureHolder* textureTarget = nullptr;
         D3D9_TEXTURE_VR_DESC texDesc = { };
         VR::TextureID texID = g_Game->m_VR->m_CreatingTextureID;
@@ -2504,6 +2520,48 @@ namespace dxvk {
   }
 
 
+  HRESULT D3D9DeviceEx::CopyHostReadbackPair(IDirect3DSurface9* left, IDirect3DSurface9* right,
+      const Rc<DxvkBuffer>& target, UINT width, UINT height, VkDeviceSize eyeBytes) {
+    D3D9DeviceLock lock = LockDeviceExclusive();
+    if (IsDeviceLost() || !left || !right || !target || !width || !height
+        || eyeBytes != VkDeviceSize(width) * height * 4
+        || target->info().size < 128 + 2 * eyeBytes)
+      return D3DERR_INVALIDCALL;
+    std::array<Rc<DxvkImage>, 2> images;
+    std::array<VkImageSubresourceLayers, 2> layers;
+    IDirect3DSurface9* surfaces[2] = { left, right };
+    for (unsigned eye = 0; eye < 2; ++eye) {
+      auto* surface = static_cast<D3D9Surface*>(surfaces[eye]);
+      auto* texture = surface->GetCommonTexture();
+      if (texture->Device() != this || texture->Desc()->Width != width || texture->Desc()->Height != height
+          || texture->Desc()->Format != D3D9Format::A8R8G8B8)
+        return D3DERR_INVALIDCALL;
+      images[eye] = texture->GetImage();
+      if (!images[eye] || images[eye]->info().sampleCount != VK_SAMPLE_COUNT_1_BIT
+          || (images[eye]->info().format != VK_FORMAT_B8G8R8A8_UNORM && images[eye]->info().format != VK_FORMAT_B8G8R8A8_SRGB))
+        return D3DERR_INVALIDCALL;
+      const auto subresource = texture->GetSubresourceFromIndex(VK_IMAGE_ASPECT_COLOR_BIT, surface->GetSubresource());
+      layers[eye] = { VK_IMAGE_ASPECT_COLOR_BIT, subresource.mipLevel, subresource.arrayLayer, 1 };
+      if (texture->GetExtentMip(surface->GetMipLevel()) != VkExtent3D{width, height, 1})
+        return D3DERR_INVALIDCALL;
+    }
+    // Validate BOTH eyes before recording anything. One normal CS command owns
+    // the pair and its imported buffer through DXVK GPU command-list retirement.
+    EmitCs([buffer = target, images, layers, width, height, eyeBytes](DxvkContext* ctx) {
+      for (unsigned eye = 0; eye < 2; ++eye)
+        ctx->copyImageToBuffer(buffer, 128 + eye * eyeBytes, 4, 0, VK_FORMAT_UNDEFINED,
+          images[eye], layers[eye], VkOffset3D{0, 0, 0}, VkExtent3D{width, height, 1});
+      ctx->emitBufferBarrier(buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+      // emitBufferBarrier may defer its barrier. This public method explicitly
+      // flushes pending barriers BEFORE the subsequent D3D EVENT is recorded.
+      ctx->emitGraphicsBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+    });
+    return D3D_OK;
+  }
+
+
   HRESULT STDMETHODCALLTYPE D3D9DeviceEx::GetFrontBufferData(UINT iSwapChain, IDirect3DSurface9* pDestSurface) {
     if (unlikely(iSwapChain != 0))
       return D3DERR_INVALIDCALL;
@@ -2913,6 +2971,9 @@ namespace dxvk {
 
     if (dstTextureInfo->IsAutomaticMip())
       MarkTextureMipsDirty(dstTextureInfo);
+
+    if (dstTextureInfo->Desc()->MultiSample != D3DMULTISAMPLE_NONE)
+      dstTextureInfo->MarkMsaaDirty();
 
     return D3D_OK;
   }
@@ -3359,6 +3420,7 @@ namespace dxvk {
       }
     }
 
+    BmvrNoteMsaaAttachmentsWritten();
     return D3D_OK;
   }
 
@@ -3408,7 +3470,7 @@ namespace dxvk {
 
     // Do not call IEngineClient or IMaterialSystem from SetViewport.
     // Only rewrite when RT0 is one of our private eye/HUD surfaces.
-    if (g_Game && g_Game->m_VR && m_state.renderTargets[0] != nullptr) {
+    if (static_cast<IDirect3DDevice9*>(this) == g_BmvrSourceDevice9 && g_Game && g_Game->m_VR && m_state.renderTargets[0] != nullptr) {
       VR* vr = g_Game->m_VR;
       IDirect3DSurface9* currentRt =
         static_cast<IDirect3DSurface9*>(m_state.renderTargets[0].ptr());
@@ -4406,6 +4468,7 @@ namespace dxvk {
       ctx->draw(1u, &draw);
     });
 
+    BmvrNoteMsaaAttachmentsWritten();
     return D3D_OK;
   }
 
@@ -4459,6 +4522,7 @@ namespace dxvk {
       ctx->drawIndexed(1u, &draw);
     });
 
+    BmvrNoteMsaaAttachmentsWritten();
     return D3D_OK;
   }
 
@@ -4468,6 +4532,9 @@ namespace dxvk {
           UINT             PrimitiveCount,
     const void*            pVertexStreamZeroData,
           UINT             VertexStreamZeroStride) {
+    static std::atomic<unsigned> slowBudget{0};
+    BmvrSlowScope slowScope("DrawPrimitiveUP", slowBudget);
+
     D3D9DeviceLock lock = LockDevice();
 
     if (unlikely(!VertexStreamZeroStride))
@@ -4478,6 +4545,25 @@ namespace dxvk {
 
     if (unlikely(!PrimitiveCount))
       return D3D_OK;
+
+    // Test stale POSITIONT constants separately from the world shaders.
+    // A state-block restore can change the fixed-function path while retaining
+    // the same viewport. Re-upload its constants before immediate UI draws.
+    const bool positionT = !m_state.vertexShader &&
+      m_state.vertexDecl->TestFlag(D3D9VertexDeclFlag::HasPositionT);
+    if (positionT) {
+      m_dirty.set(D3D9DeviceDirtyFlag::FFViewport);
+      m_dirty.set(D3D9DeviceDirtyFlag::FFVertexData);
+      static unsigned uiBudget = 0;
+      if (uiBudget < 12 && pVertexStreamZeroData && VertexStreamZeroStride >= 16) {
+        const float* p = static_cast<const float*>(pVertexStreamZeroData);
+        const auto& vp = m_state.viewport;
+        Logger::warn(str::format("[BMVR UI] POSITIONT vp=", vp.Width, "x", vp.Height,
+          " origin=", vp.X, ",", vp.Y, " vertex=", p[0], ",", p[1], ",", p[2], ",", p[3],
+          " stride=", VertexStreamZeroStride));
+        ++uiBudget;
+      }
+    }
 
     PrepareDraw(PrimitiveType, false, false);
 
@@ -4511,6 +4597,7 @@ namespace dxvk {
     m_state.vertexBuffers[0].offset       = 0;
     m_state.vertexBuffers[0].length       = 0;
     m_state.vertexBuffers[0].stride       = 0;
+    BmvrNoteMsaaAttachmentsWritten();
     return D3D_OK;
   }
 
@@ -4583,6 +4670,7 @@ namespace dxvk {
     m_state.vertexBuffers[0].stride       = 0;
 
     m_state.indices = nullptr;
+    BmvrNoteMsaaAttachmentsWritten();
     return D3D_OK;
   }
 
@@ -4900,6 +4988,11 @@ namespace dxvk {
         || newShader->GetMeta().maxConstIndexB > oldShader->GetMeta().maxConstIndexB;
     }
 
+    // BindInputLayout uses the ordered input semantics, not shader identity.
+    // Declaration/stream frequency changes independently dirty the layout.
+    const bool keepLayout = BmvrInputLayoutOptEnabled() && oldShader && newShader
+      && BmvrSameInputSemantics(oldShader->GetIsgn(), newShader->GetIsgn());
+    BmvrCountInputLayouts(keepLayout, m_dirty.test(D3D9DeviceDirtyFlag::InputLayout));
     m_state.vertexShader = shader;
 
     if (shader != nullptr) {
@@ -4910,7 +5003,9 @@ namespace dxvk {
       UpdateTextureTypeMismatchesForShader(newShader, VSShaderMasks().samplerMask, FirstVSSamplerSlot);
     }
 
-    m_dirty.set(D3D9DeviceDirtyFlag::InputLayout);
+    // Do not clear a dirty bit set by a declaration/frequency/reset change.
+    if (!keepLayout)
+      m_dirty.set(D3D9DeviceDirtyFlag::InputLayout);
 
     return D3D_OK;
   }
@@ -5649,7 +5744,7 @@ namespace dxvk {
         static thread_local DWORD s_lastPresentSpikeReportMs = 0;
         static thread_local PresentSpikeSample s_worstPresentSpike{};
 
-        VR* const presentSpikeVr = (g_Game != nullptr) ? g_Game->m_VR : nullptr;
+        VR* const presentSpikeVr = (static_cast<IDirect3DDevice9*>(this) == g_BmvrSourceDevice9 && g_Game != nullptr) ? g_Game->m_VR : nullptr;
         const bool presentSpikeDiagnostics =
             presentSpikeVr != nullptr && presentSpikeVr->m_PresentSpikeDebugLog;
         const auto presentSpikeEntry = presentSpikeDiagnostics
@@ -5774,7 +5869,7 @@ namespace dxvk {
         const DWORD presentThreadId = ::GetCurrentThreadId();
         VR* postPresentVR = nullptr;
 
-        if (g_Game && g_Game->m_VR && g_Game->m_VR->m_CreatedVRTextures &&
+        if (static_cast<IDirect3DDevice9*>(this) == g_BmvrSourceDevice9 && g_Game && g_Game->m_VR && g_Game->m_VR->m_CreatedVRTextures &&
             g_Game->m_VR->m_StereoRenderViewActive) {
             VR* vr = g_Game->m_VR;
             const bool inGame = (g_Game->m_EngineClient && g_Game->m_EngineClient->IsInGame());
@@ -5851,7 +5946,7 @@ namespace dxvk {
         HRESULT result = D3D_OK;
         {
             D3D9DeviceLock queuedPresentLock;
-            if (g_Game && g_Game->m_VR && g_Game->GetMatQueueMode() != 0) {
+            if (static_cast<IDirect3DDevice9*>(this) == g_BmvrSourceDevice9 && g_Game && g_Game->m_VR && g_Game->GetMatQueueMode() != 0) {
                 // Swapchain Present is outside Source's material call queue. Drain
                 // already-active Source calls and isolate only this transaction rather
                 // than making every draw in the rendered frame contend on one spinlock.
@@ -5902,7 +5997,7 @@ namespace dxvk {
             }
         }
 
-        if (g_Game && g_Game->m_VR) {
+        if (static_cast<IDirect3DDevice9*>(this) == g_BmvrSourceDevice9 && g_Game && g_Game->m_VR) {
             VR* const timingVr = g_Game->m_VR;
             static thread_local bool s_presentTimingWasEnabled = false;
             static thread_local std::chrono::steady_clock::time_point
@@ -5937,7 +6032,7 @@ namespace dxvk {
             }
         }
 
-        if (g_Game && g_Game->m_VR && g_Game->m_VR->m_CreatedVRTextures) {
+        if (static_cast<IDirect3DDevice9*>(this) == g_BmvrSourceDevice9 && g_Game && g_Game->m_VR && g_Game->m_VR->m_CreatedVRTextures) {
             VR* vr = g_Game->m_VR;
             const bool inGame = (g_Game->m_EngineClient && g_Game->m_EngineClient->IsInGame());
             const bool queued = (g_Game->GetMatQueueMode() != 0);
@@ -6116,7 +6211,7 @@ namespace dxvk {
         const auto presentSpikeUpdateStart = presentSpikeDiagnostics
             ? PresentSpikeClock::now()
             : PresentSpikeClock::time_point{};
-        if (g_Game && g_Game->m_VR)
+        if (static_cast<IDirect3DDevice9*>(this) == g_BmvrSourceDevice9 && g_Game && g_Game->m_VR)
             g_Game->m_VR->Update();
         if (presentSpikeDiagnostics) {
             const auto presentSpikeUpdateEnd = PresentSpikeClock::now();
@@ -6128,7 +6223,7 @@ namespace dxvk {
         const auto presentSpikeRestoreStart = presentSpikeDiagnostics
             ? PresentSpikeClock::now()
             : PresentSpikeClock::time_point{};
-        if (g_Game && g_Game->m_VR && g_Game->GetMatQueueMode() == 0)
+        if (static_cast<IDirect3DDevice9*>(this) == g_BmvrSourceDevice9 && g_Game && g_Game->m_VR && g_Game->GetMatQueueMode() == 0)
             VrAimLineRestoreOverlayBackups(this, g_Game->m_VR);
         if (presentSpikeDiagnostics) {
             const auto presentSpikeRestoreEnd = PresentSpikeClock::now();
@@ -6405,6 +6500,7 @@ namespace dxvk {
     desc.IsBackBuffer       = FALSE;
     desc.IsAttachmentOnly   = TRUE;
     desc.IsLockable         = Lockable;
+    BmvrApplyHl2vrMsaa(desc);
 
     // Because they are always lockable, image surfaces / offscreen plain surfaces
     // are restricted to using lockable depth stencil formats.
@@ -6540,18 +6636,15 @@ namespace dxvk {
     desc.IsAttachmentOnly   = TRUE;
     desc.IsLockable         = IsLockableDepthStencilFormat(desc.Format);
 
-    VR* vr = (g_Game != nullptr) ? g_Game->m_VR : nullptr;
+    VR* vr = (static_cast<IDirect3DDevice9*>(this) == g_BmvrSourceDevice9 && g_Game != nullptr) ? g_Game->m_VR : nullptr;
     const VR::TextureID creatingTextureId = vr ? vr->m_CreatingTextureID : VR::Texture_None;
     const bool creatingVrEyeDepth =
         creatingTextureId == VR::Texture_LeftEye ||
         creatingTextureId == VR::Texture_RightEye;
 
-    if (creatingVrEyeDepth) {
-      dxvk::Logger::info(str::format("Creating depth/stencil surface with MSAA ", vr->m_AntiAliasing));
-      desc.MultiSample = MapToMultisampleType(vr->m_AntiAliasing);
-      if (vr->m_ReShadeVRCompat)
-        desc.IsAttachmentOnly = FALSE;
-    }
+    BmvrApplyHl2vrMsaa(desc);
+    if (creatingVrEyeDepth && vr->m_ReShadeVRCompat)
+      desc.IsAttachmentOnly = FALSE;
 
     if (FAILED(D3D9CommonTexture::NormalizeTextureProperties(this, D3DRTYPE_SURFACE, &desc)))
       return D3DERR_INVALIDCALL;
@@ -6594,6 +6687,7 @@ namespace dxvk {
 
     D3DPRESENT_PARAMETERS* caller = pPresentationParameters;
     D3DPRESENT_PARAMETERS local = *pPresentationParameters;
+    BmvrStripSwapchainMsaa(&local);
     BmvrKeepDesktopWindowed(&local);
     BmvrForceHmdAspectWindowedBackbuffer(&local);
     BmvrSyncCallerBackbufferSize(caller, &local);
@@ -6604,7 +6698,7 @@ namespace dxvk {
     }
     pPresentationParameters = &local;
 
-    VR* vr = (g_Game != nullptr) ? g_Game->m_VR : nullptr;
+    VR* vr = (static_cast<IDirect3DDevice9*>(this) == g_BmvrSourceDevice9 && g_Game != nullptr) ? g_Game->m_VR : nullptr;
     if (vr) {
       vr->ReleaseVRRenderTargetsForDeviceReset();
       VrForceSwapchainBackBufferToEyeSize(vr, pPresentationParameters, pFullscreenDisplayMode);
@@ -6625,7 +6719,7 @@ namespace dxvk {
       return hr;
 
     lock = D3D9DeviceLock();
-    if (g_Game && g_Game->m_VR)
+    if (static_cast<IDirect3DDevice9*>(this) == g_BmvrSourceDevice9 && g_Game && g_Game->m_VR)
       g_Game->m_VR->RefreshBackBufferTexture(true);
 
     return D3D_OK;
@@ -7058,8 +7152,11 @@ namespace dxvk {
     }
 
     // Wait for staging memory to get recycled.
-    if (stagingBufferAllocated > MaxMemoryInFlight)
+    if (stagingBufferAllocated > MaxMemoryInFlight) {
+      static std::atomic<unsigned> slowBudget{0};
+      BmvrSlowScope slowScope("ThrottleAllocationFence", slowBudget);
       m_dxvkDevice->waitForFence(*m_stagingBufferFence, stagingBufferAllocated - MaxMemoryInFlight);
+    }
   }
 
 
@@ -7087,6 +7184,9 @@ namespace dxvk {
     const DxvkPagedResource&                Resource,
           uint64_t                          SequenceNumber,
           DWORD                             MapFlags) {
+    static std::atomic<unsigned> slowBudget{0};
+    BmvrSlowScope slowScope("WaitForResource", slowBudget);
+
     // Wait for the any pending D3D9 command to be executed
     // on the CS thread so that we can determine whether the
     // resource is currently in use or not.
@@ -7159,6 +7259,8 @@ namespace dxvk {
             D3DLOCKED_BOX*          pLockedBox,
       const D3DBOX*                 pBox,
             DWORD                   Flags) {
+    static std::atomic<unsigned> slowBudget{0};
+    BmvrSlowScope slowScope("LockImage", slowBudget);
     D3D9DeviceLock lock = LockDevice();
 
     UINT Subresource = pResource->CalcSubresource(Face, MipLevel);
@@ -7563,9 +7665,12 @@ namespace dxvk {
       VkDeviceSize dirtySize = extentBlockCount.width * extentBlockCount.height * extentBlockCount.depth * formatInfo->elementSize;
       D3D9BufferSlice slice = AllocStagingBuffer(dirtySize);
       const void* srcData = reinterpret_cast<const uint8_t*>(mapPtr) + copySrcOffset;
-      util::packImageData(
-        slice.mapPtr, srcData, extentBlockCount, formatInfo->elementSize,
-        pitch, pitch * srcTexLevelExtentBlockCount.height);
+      {
+        BmvrCpuMemoryScope memoryScope(BmvrCpuTexturePack, dirtySize, slice.mapPtr, srcData);
+        util::packImageData(
+          slice.mapPtr, srcData, extentBlockCount, formatInfo->elementSize,
+          pitch, pitch * srcTexLevelExtentBlockCount.height);
+      }
 
       VkFormat packedDSFormat = GetPackedDepthStencilFormat(pDestTexture->Desc()->Format);
 
@@ -7618,9 +7723,14 @@ namespace dxvk {
       const DxvkFormatInfo* convertedFormatInfo = lookupFormatInfo(convertFormat.FormatColor);
       VkImageSubresourceLayers convertedDstLayers = { convertedFormatInfo->aspectMask, dstSubresource.mipLevel, dstSubresource.arrayLayer, 1 };
 
-      util::packImageData(
-        slice.mapPtr, mapPtr, srcBlockCount, formatElementSize,
-        pitch, std::min(pSrcTexture->GetPlaneCount(), 2u) * pitch * srcBlockCount.height);
+      {
+        const uint64_t packedBytes = uint64_t(srcBlockCount.width) * srcBlockCount.height
+          * srcBlockCount.depth * formatElementSize;
+        BmvrCpuMemoryScope memoryScope(BmvrCpuTexturePack, packedBytes, slice.mapPtr, mapPtr);
+        util::packImageData(
+          slice.mapPtr, mapPtr, srcBlockCount, formatElementSize,
+          pitch, std::min(pSrcTexture->GetPlaneCount(), 2u) * pitch * srcBlockCount.height);
+      }
 
       EmitCs([this,
         cConvertFormat    = convertFormat,
@@ -7658,6 +7768,8 @@ namespace dxvk {
           UINT                    SizeToLock,
           void**                  ppbData,
           DWORD                   Flags) {
+    static std::atomic<unsigned> slowBudget{0};
+    BmvrSlowScope slowScope("LockBuffer", slowBudget);
     D3D9DeviceLock lock = LockDevice();
 
     if (unlikely(ppbData == nullptr))
@@ -8091,6 +8203,9 @@ namespace dxvk {
 
 
   void D3D9DeviceEx::SynchronizeCsThread(uint64_t SequenceNumber) {
+    static std::atomic<unsigned> slowBudget{0};
+    BmvrSlowScope slowScope("SynchronizeCsThread", slowBudget);
+
     D3D9DeviceLock lock = LockDevice();
 
     // Dispatch current chunk so that all commands
@@ -8299,7 +8414,10 @@ namespace dxvk {
     size = align(size, alignment);
 
     auto mapPtr = dstBuffer.Alloc(size);
-    std::memcpy(mapPtr, src, size);
+    {
+      BmvrCpuMemoryScope memoryScope(BmvrCpuConstantCopy, size, mapPtr, src);
+      std::memcpy(mapPtr, src, size);
+    }
     return mapPtr;
   }
 
@@ -8334,16 +8452,23 @@ namespace dxvk {
     // Determine amount of floats and buffer size based on highest used float constant and alignment
     const uint32_t alignment = constSet.buffer.GetAlignment();
     const uint32_t bufferSize = align(std::max(floatDataSize + intRange, alignment), alignment);
+    // Restore upstream's padded copy: bytes inside the aligned UBO range
+    // are addressable by relative-indexed shaders. Robustness only covers
+    // reads OUTSIDE the bound range, not uninitialized padding within it.
     floatDataSize = bufferSize - intRange;
 
     void* mapPtr = constSet.buffer.Alloc(bufferSize);
     auto* dst = reinterpret_cast<HardwareLayoutType*>(mapPtr);
 
     const uint32_t intDataSize = constSet.meta.maxConstIndexI * sizeof(Vector4i);
-    if (constSet.meta.maxConstIndexI != 0)
+    if (constSet.meta.maxConstIndexI != 0) {
+      BmvrCpuMemoryScope memoryScope(BmvrCpuConstantCopy, intDataSize, dst->iConsts, Src.iConsts);
       std::memcpy(dst->iConsts, Src.iConsts, intDataSize);
-    if (constSet.meta.maxConstIndexF != 0)
+    }
+    if (constSet.meta.maxConstIndexF != 0) {
+      BmvrCpuMemoryScope memoryScope(BmvrCpuConstantCopy, floatDataSize, dst->fConsts, Src.fConsts);
       std::memcpy(dst->fConsts, Src.fConsts, floatDataSize);
+    }
 
     if (constSet.meta.needsConstantCopies) {
       // Copy shader defined constants over so they can be accessed
@@ -9679,6 +9804,94 @@ namespace dxvk {
   }
 
 
+  void D3D9DeviceEx::BmvrApplyHl2vrMsaa(D3D9_COMMON_TEXTURE_DESC& desc) {
+    if (!bmvr::g_MsaaAllowed || !bmvr::Hl2vrMsaaScope::Active())
+      return;
+    const uint32_t samples = bmvr::NormalizeMsaa(static_cast<int>(bmvr::g_Msaa));
+    if (samples < 2)
+      return;
+    const uint32_t wantW = bmvr::Hl2vrMsaaScope::Width();
+    const uint32_t wantH = bmvr::Hl2vrMsaaScope::Height();
+    if (wantW != 0 && (desc.Width != wantW || desc.Height != wantH))
+      return;
+    const bool renderable = (desc.Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) != 0
+      || desc.IsAttachmentOnly;
+    if (!renderable)
+      return;
+    if (desc.IsLockable || desc.Pool == D3DPOOL_SYSTEMMEM || desc.Pool == D3DPOOL_SCRATCH)
+      return;
+    if (desc.MipLevels != 1)
+      return;
+    const D3DMULTISAMPLE_TYPE ms = MapToMultisampleType(static_cast<int>(samples));
+    if (ms == D3DMULTISAMPLE_NONE)
+      return;
+    VkSampleCountFlagBits sampleCount = VK_SAMPLE_COUNT_1_BIT;
+    if (FAILED(DecodeMultiSampleType(m_dxvkDevice, ms, 0, &sampleCount))
+        || sampleCount == VK_SAMPLE_COUNT_1_BIT)
+      return;
+    desc.MultiSample = ms;
+    desc.MultisampleQuality = 0;
+  }
+
+
+  void D3D9DeviceEx::BmvrNoteMsaaAttachmentsWritten() {
+    auto note = [](D3D9Surface* surf) {
+      if (!surf)
+        return;
+      D3D9CommonTexture* tex = surf->GetCommonTexture();
+      if (!tex || tex->Desc()->MultiSample == D3DMULTISAMPLE_NONE)
+        return;
+      tex->MarkMsaaDirty();
+    };
+    for (uint32_t i = 0; i < m_state.renderTargets.size(); i++)
+      note(m_state.renderTargets[i].ptr());
+    note(m_state.depthStencil.ptr());
+  }
+
+
+  void D3D9DeviceEx::BmvrResolveMsaaForSample(D3D9CommonTexture* tex) {
+    if (!tex || !tex->MsaaNeedsResolve())
+      return;
+    const Rc<DxvkImage>& srcRef = tex->GetImage();
+    if (srcRef == nullptr || srcRef->info().sampleCount == VK_SAMPLE_COUNT_1_BIT) {
+      tex->MarkMsaaResolved();
+      return;
+    }
+    const Rc<DxvkImage> src = srcRef;
+    const Rc<DxvkImage> dst = tex->GetResolveImage();
+    const DxvkFormatInfo* fmt = lookupFormatInfo(src->info().format);
+    const bool depth = tex->IsDepthStencil();
+    VkImageAspectFlags aspects = fmt ? fmt->aspectMask : VK_IMAGE_ASPECT_COLOR_BIT;
+    if (!depth)
+      aspects &= VK_IMAGE_ASPECT_COLOR_BIT;
+
+    VkImageResolve region = { };
+    region.srcSubresource.aspectMask = aspects;
+    region.srcSubresource.mipLevel = 0;
+    region.srcSubresource.baseArrayLayer = 0;
+    region.srcSubresource.layerCount = std::max(src->info().numLayers, 1u);
+    region.dstSubresource = region.srcSubresource;
+    region.srcOffset = VkOffset3D { 0, 0, 0 };
+    region.dstOffset = VkOffset3D { 0, 0, 0 };
+    region.extent = src->mipLevelExtent(0);
+
+    const VkFormat format = src->info().format;
+    const VkResolveModeFlagBits mode = depth
+      ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT
+      : VK_RESOLVE_MODE_AVERAGE_BIT;
+    EmitCs([
+      cDst = dst,
+      cSrc = src,
+      cRegion = region,
+      cFormat = format,
+      cMode = mode
+    ] (DxvkContext* ctx) {
+      ctx->resolveImage(cDst, cSrc, cRegion, cFormat, cMode, VK_RESOLVE_MODE_SAMPLE_ZERO_BIT);
+    });
+    tex->MarkMsaaResolved();
+  }
+
+
   void D3D9DeviceEx::BindTexture(DWORD StateSampler) {
     auto shaderSampler = RemapStateSamplerShader(StateSampler);
 
@@ -9691,7 +9904,14 @@ namespace dxvk {
     D3D9CommonTexture* commonTex =
       GetCommonTexture(m_state.textures[StateSampler]);
 
-    Rc<DxvkImageView> imageView = commonTex->GetSampleView(srgb);
+    const bool msaa = commonTex != nullptr
+      && commonTex->Desc()->MultiSample != D3DMULTISAMPLE_NONE;
+    if (msaa)
+      BmvrResolveMsaaForSample(commonTex);
+
+    Rc<DxvkImageView> imageView = msaa
+      ? commonTex->GetResolveSampleView(srgb)
+      : commonTex->GetSampleView(srgb);
 
     EmitCs([
       cSlot = slot,
@@ -10266,6 +10486,9 @@ namespace dxvk {
         VkShaderStageFlagBits ShaderStage,
   const DWORD*                pShaderBytecode,
   const DxsoModuleInfo*       pModuleInfo) {
+    static std::atomic<unsigned> slowBudget{0};
+    BmvrSlowScope slowScope("CreateShaderModule", slowBudget);
+
     try {
       m_shaderModules->GetShaderModule(this, pShaderModule,
         pLength, ShaderStage, pModuleInfo, pShaderBytecode);
@@ -10313,6 +10536,38 @@ namespace dxvk {
         StartRegister,
         pConstantData,
         Count);
+
+    // Reapplying identical HW shader constants has no state side effect.
+    // Keep recording/SWVP on original paths; preserve NaN-emulation values.
+    // Compare bytes, so signed zero and NaN payload changes remain changes.
+    if (!CanSWVP()) {
+      const auto same = [&](const auto& current) {
+        if constexpr (ConstantType == D3D9ConstantType::Float) {
+          if (m_d3d9Options.d3d9FloatEmulation != D3D9FloatEmulation::Enabled)
+            return std::memcmp(current->fConsts[StartRegister].data, pConstantData, size_t(Count)*sizeof(Vector4)) == 0;
+          // Compare exactly what UpdateStateConstants would store in emulated mode.
+          for (UINT i=0;i<Count;i++) {
+            const Vector4 normalized=replaceNaN(pConstantData+i*4);
+            if (std::memcmp(current->fConsts[StartRegister+i].data, normalized.data, sizeof(Vector4))!=0) return false;
+          }
+          return true;
+        } else if constexpr (ConstantType == D3D9ConstantType::Int) {
+          return std::memcmp(current->iConsts[StartRegister].data, pConstantData, size_t(Count)*sizeof(Vector4i)) == 0;
+        }
+        return false;
+      };
+      const bool identical = ProgramType == DxsoProgramType::VertexShader
+        ? same(m_state.vsConsts) : same(m_state.psConsts);
+      static const bool countDuplicates = [] { char v[8]{}; return GetEnvironmentVariableA("BMVR_CONST_DIAG",v,sizeof(v))==1 && v[0]=='1'; }();
+      if (countDuplicates) {
+        static std::atomic<uint64_t> calls{0}, duplicates{0};
+        const auto total=calls.fetch_add(1,std::memory_order_relaxed)+1;
+        if (identical) duplicates.fetch_add(1,std::memory_order_relaxed);
+        if ((total & 32767u)==0) Logger::info(str::format("[BMVR CPU v35] stage=",unsigned(ProgramType),
+          " type=",unsigned(ConstantType)," setters=",total," identicalSkipped=",duplicates.load(std::memory_order_relaxed)));
+      }
+      if (identical) return D3D_OK; // Never clear an existing dirty flag.
+    }
 
     D3D9ConstantSets& constSet = m_consts[ProgramType];
 
@@ -11265,7 +11520,7 @@ namespace dxvk {
   void D3D9DeviceEx::NotifyWindowActivated(HWND window, bool activated) {
     D3D9DeviceLock lock = LockDevice();
 
-    if (g_Game && g_Game->m_VR && g_Game->m_VR->m_IsVREnabled)
+    if (static_cast<IDirect3DDevice9*>(this) == g_BmvrSourceDevice9 && g_Game && g_Game->m_VR && g_Game->m_VR->m_IsVREnabled)
       return;
 
     if (likely(!m_d3d9Options.deviceLossOnFocusLoss || IsExtended()))

@@ -112,7 +112,8 @@ namespace dxvk {
 
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkResult vr = vk->vkCreateComputePipelines(vk->device(),
-          VK_NULL_HANDLE, 1, &info, nullptr, &pipeline);
+          m_device->bmvrPipelineCache(), 1, &info, nullptr, &pipeline);
+    if (vr == VK_SUCCESS) m_device->noteBmvrPipelineCreated();
 
     if (vr != VK_SUCCESS) {
       Logger::err(str::format("DxvkComputePipeline: Failed to compile pipeline: ", vr));

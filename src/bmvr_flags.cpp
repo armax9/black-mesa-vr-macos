@@ -45,12 +45,15 @@ namespace bmvr
     bool g_DisableRecoilAim = true;
     float g_IPDScale = 1.f;
     float g_HeightOffset = 0.f;
+    bool g_SeatedMode = false;
+    float g_SeatedHeightOffsetMeters = 0.f;
     bool g_AutoMatQueueMode = false;
     bool g_MulticoreMode = true;
-    uint32_t g_AntiAliasing = 0;
+    uint32_t g_Msaa = 0;
+    bool g_MsaaAllowed = true;
     bool g_Haptics = true;
     bool g_HideCrosshair = true;
-    bool g_MatchHmdHz = true;
+    bool g_MatchHmdHz = false;
     bool g_DisableViewBob = true;
     bool g_LeftHanded = false;
     bool g_RecenterResetsYaw = true;
@@ -61,8 +64,9 @@ namespace bmvr
     float g_VrHandsModelScale = 0.85f;
     bool g_VrHandsDebugBoxes = false;
     bool g_HandHud = true;
-    bool g_VrCrosshair = false;
+    bool g_VrCrosshair = true;
     float g_VrCrosshairScale = 1.f;
+    int g_VrCrosshairEye = 0;
     bool g_HideHandsWithoutSuit = true;
     bool g_ScopeUsesHmdAim = true;
     float g_ScopeZoomFovScale = 0.28f;
@@ -76,8 +80,7 @@ namespace bmvr
     // wrong way on a given headset.
     // Hands lower in view (controller local +Y = up). Separate from weapon.
     float g_VrHandsPoseOffX = 0.f;
-    // Raised from hanging under the controller. +Y is up. Config and
-    // install.ps1 must match this or they overwrite it on every install.
+    // Raised from hanging under the controller. +Y is up.
     float g_VrHandsPoseOffY = -0.008f;
     float g_VrHandsPoseOffZ = -0.10f;
     // Additive on top of VrHandsPoseOffsetMeters for Quest/Touch.
@@ -99,6 +102,7 @@ namespace bmvr
     float g_VrHandsRightGripRotZ = -180.f;
     bool g_VrHandsUseHevGloves = true;
     bool g_IsBlueShift = false;
+    bool g_IsAzureSheep = false;
     uint32_t g_FullFrameActualWidth = 0;
     uint32_t g_FullFrameActualHeight = 0;
     uint32_t g_GbActualWidth = 0;
@@ -112,7 +116,10 @@ namespace bmvr
     bool g_HiddenAreaMesh = false;
     bool g_MaterialPredraw = false;
     bool g_StereoBlitGpuFlush = true;
-    bool g_OpenXrDeferredPublish = false;
+    // Synchronous publish spins ~12 ms per pair on the material thread
+    // waiting for the GPU, so CPU and GPU never overlap (2026-10-14 bm_c1a0a:
+    // pairs=25-42/s). Deferred + wait-for-previous keeps one frame in flight.
+    bool g_OpenXrDeferredPublish = true;
     float g_OpenXrSlotCoolingMs = 4.f;
     uint32_t g_OpenXrMaxPending = 1;
     // Match L4D2VR weapon tables (designed for VRScale 43.2) to BM 39.37:
@@ -126,10 +133,11 @@ namespace bmvr
     float g_HudDistance = 1.05f;
     float g_HudSize = 0.70f;
     float g_MenuPanelScale = 0.70f;
-    float g_MenuForwardMeters = 0.65f;
-    float g_MenuWidthMeters = 1.05f;
+    float g_MenuForwardMeters = 1.30f;
+    float g_MenuWidthMeters = 2.10f;
     float g_MenuHeightOffsetMeters = -0.02f;
-    float g_MenuCursorSmoothSec = 0.18f;
+    float g_MenuCursorSmoothSec = 0.f;
+    float g_MenuPointerSensitivity = 1.f;
 
     static HMODULE g_Module = nullptr;
     static std::mutex g_LogMutex;
@@ -462,18 +470,21 @@ namespace bmvr
                 if (s >= 0.5f && s <= 2.f)
                     g_IPDScale = s;
             }
+            else if (std::strcmp(n, "SeatedMode") == 0)
+                g_SeatedMode = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "SeatedHeightOffsetMeters") == 0)
+            {
+                const float meters = static_cast<float>(atof(val));
+                if (meters >= -0.5f && meters <= 1.f) g_SeatedHeightOffsetMeters = meters;
+            }
             else if (std::strcmp(n, "HeightOffset") == 0)
                 g_HeightOffset = static_cast<float>(atof(val));
             else if (std::strcmp(n, "AutoMatQueueMode") == 0)
                 g_AutoMatQueueMode = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "MulticoreMode") == 0)
                 g_MulticoreMode = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
-            else if (std::strcmp(n, "AntiAliasing") == 0 || std::strcmp(n, "msaa") == 0)
-            {
-                const int nAa = atoi(val);
-                g_AntiAliasing = (nAa == 2 || nAa == 4 || nAa == 8 || nAa == 16)
-                    ? static_cast<uint32_t>(nAa) : 0u;
-            }
+            else if (std::strcmp(n, "Msaa") == 0 || std::strcmp(n, "msaa") == 0)
+                g_Msaa = NormalizeMsaa(atoi(val));
             else if (std::strcmp(n, "Haptics") == 0)
                 g_Haptics = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "HideCrosshair") == 0)
@@ -506,6 +517,11 @@ namespace bmvr
                 g_HandHud = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "VrCrosshair") == 0)
                 g_VrCrosshair = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrCrosshairEye") == 0)
+            {
+                const int eye = atoi(val);
+                if (eye >= 0 && eye <= 2) g_VrCrosshairEye = eye;
+            }
             else if (std::strcmp(n, "VrCrosshairScale") == 0)
                 g_VrCrosshairScale = static_cast<float>(atof(val));
             else if (std::strcmp(n, "VrHideHandsWithoutSuit") == 0)
@@ -638,10 +654,15 @@ namespace bmvr
                 if (s >= -0.5f && s <= 0.5f)
                     g_MenuHeightOffsetMeters = s;
             }
+            else if (std::strcmp(n, "MenuPointerSensitivity") == 0)
+            {
+                const float gain = static_cast<float>(atof(val));
+                if (gain >= 0.5f && gain <= 4.f) g_MenuPointerSensitivity = gain;
+            }
             else if (std::strcmp(n, "MenuCursorSmoothSec") == 0)
             {
                 const float s = static_cast<float>(atof(val));
-                if (s >= 0.02f && s <= 0.6f)
+                if (s >= 0.f && s <= 0.6f)
                     g_MenuCursorSmoothSec = s;
             }
             else if (std::strcmp(n, "HudMaxFov") == 0)
@@ -669,7 +690,7 @@ namespace bmvr
             path.c_str(), g_RenderScale, g_TurnSpeed, g_SnapTurning ? 1 : 0,
             g_ViewmodelPosOffsetX, g_ViewmodelPosOffsetY, g_ViewmodelPosOffsetZ,
             g_ViewmodelPosOffsetXTouch,
-            g_ControllerPitchTilt, g_IPDScale, g_AutoMatQueueMode ? 1 : 0, g_MulticoreMode ? 1 : 0, g_AntiAliasing,
+            g_ControllerPitchTilt, g_IPDScale, g_AutoMatQueueMode ? 1 : 0, g_MulticoreMode ? 1 : 0, g_Msaa,
             g_WorldEyeSizeOptIn ? 1 : 0,
             sawWorldEyeSize ? (g_WorldEyeSizeOptIn ? "true" : "false") : "missing");
         if (!g_WorldEyeSizeOptIn)
@@ -789,6 +810,11 @@ namespace bmvr
         {
             // Leftover from the reverted native OpenVR stereo experiment.
             return;
+        }
+        else if (name == "msaa")
+        {
+            g_MsaaAllowed = false;
+            g_Msaa = 0;
         }
         else if (name == "ctrl_pose" || name == "ctrl_vm" || name == "vr_gloves"
             || name == "hand_overlay")
@@ -958,6 +984,11 @@ namespace bmvr
 
     void Log(const char* fmt, ...)
     {
+        static const bool quiet = [] {
+            char value[8]{};
+            return GetEnvironmentVariableA("BMVR_QUIET", value, sizeof(value)) == 1 && value[0] == '1';
+        }();
+        if (quiet) return;
         char buf[1024];
         va_list args;
         va_start(args, fmt);
@@ -965,13 +996,22 @@ namespace bmvr
         va_end(args);
 
         std::lock_guard<std::mutex> lock(g_LogMutex);
-        // One OutputDebugString per line, not three: each call raises
-        // DBG_PRINTEXCEPTION_C through the kernel and probes the DBWin mutex
-        // even with no debugger attached (tens of microseconds apiece).
-        char dbg[1040];
-        snprintf(dbg, sizeof(dbg), "[BMVR] %s\n", buf);
-        OutputDebugStringA(dbg);
-        printf("%s", dbg);
+        // Persistent files below are the normal diagnostic output. Console
+        // mirroring adds Wine debug/DBWin and stdout I/O while this thread
+        // owns the logger lock; retain it only as an explicit startup opt-in.
+        // Read the setting once rather than querying the environment per line.
+        static const bool consoleEnabled = [] {
+            char enabled[2]{};
+            return GetEnvironmentVariableA("BMVR_LOG_CONSOLE", enabled, sizeof(enabled)) == 1
+                && enabled[0] == '1';
+        }();
+        if (consoleEnabled)
+        {
+            char dbg[1040];
+            snprintf(dbg, sizeof(dbg), "[BMVR] %s\n", buf);
+            OutputDebugStringA(dbg);
+            printf("%s", dbg);
+        }
 
         // Persistent append handles + batched flush. Opening/flushing every
         // line on the render thread was a stutter source during compositor
@@ -1037,7 +1077,14 @@ namespace bmvr
             || strstr(buf, "Controller tracking") != nullptr
             || strstr(buf, "Skip hand overlay") != nullptr
             || strstr(buf, "Hand overlay") != nullptr
-            || strstr(buf, "Hand markers done") != nullptr;
+            || strstr(buf, "Hand markers done") != nullptr
+            || strstr(buf, "GameUI dismissed") != nullptr
+            || strstr(buf, "HMD-fb pass-through") != nullptr
+            || strstr(buf, "Viewmodel DME") != nullptr
+            || strstr(buf, "offscreen native") != nullptr
+            || strstr(buf, "CopyRTEx clip") != nullptr
+            || strstr(buf, "BMVR-CRASH") != nullptr
+            || strstr(buf, "WM_ACTIVATEAPP") != nullptr;
         if (crashBoundary || s_unflushed >= 16 || (s_unflushed > 0 && nowMs - s_lastFlush >= 500))
         {
             if (s_exe)
@@ -1082,6 +1129,108 @@ namespace bmvr
             return;
         g_WatchdogStarted = true;
         CreateThread(nullptr, 0, WatchdogThread, nullptr, 0, nullptr);
+    }
+
+    static void ReadStackDwords(DWORD esp, DWORD* out, int count)
+    {
+        for (int i = 0; i < count; ++i)
+            out[i] = 0;
+        if (esp < 0x10000)
+            return;
+        const DWORD* stk = reinterpret_cast<const DWORD*>(static_cast<uintptr_t>(esp));
+        for (int i = 0; i < count; ++i)
+        {
+            DWORD v = 0;
+            __try
+            {
+                v = stk[i];
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                break;
+            }
+            out[i] = v;
+        }
+    }
+
+    static LONG CALLBACK CrashVectored(PEXCEPTION_POINTERS info)
+    {
+        if (!info || !info->ExceptionRecord || !info->ContextRecord)
+            return EXCEPTION_CONTINUE_SEARCH;
+        const DWORD code = info->ExceptionRecord->ExceptionCode;
+        // OutputDebugString raises 0x40010005/6 with no debugger. Logging
+        // from this handler while Log() holds g_LogMutex deadlocked startup
+        // at dll_attach (2026-09-09). Only dump NT error-severity faults.
+        if ((code & 0xF0000000) != 0xC0000000)
+            return EXCEPTION_CONTINUE_SEARCH;
+        if (code == EXCEPTION_BREAKPOINT || code == EXCEPTION_SINGLE_STEP
+            || code == EXCEPTION_GUARD_PAGE)
+            return EXCEPTION_CONTINUE_SEARCH;
+        static volatile LONG once = 0;
+        if (InterlockedCompareExchange(&once, 1, 0) != 0)
+            return EXCEPTION_CONTINUE_SEARCH;
+
+        void* addr = info->ExceptionRecord->ExceptionAddress;
+#ifdef _M_IX86
+        const DWORD eip = info->ContextRecord->Eip;
+        const DWORD esp = info->ContextRecord->Esp;
+        const DWORD eax = info->ContextRecord->Eax;
+        const DWORD ecx = info->ContextRecord->Ecx;
+        const DWORD edx = info->ContextRecord->Edx;
+        const DWORD esi = info->ContextRecord->Esi;
+        const DWORD edi = info->ContextRecord->Edi;
+        const DWORD ebp = info->ContextRecord->Ebp;
+#else
+        const DWORD eip = static_cast<DWORD>(info->ContextRecord->Rip);
+        const DWORD esp = 0;
+        const DWORD eax = 0, ecx = 0, edx = 0, esi = 0, edi = 0, ebp = 0;
+#endif
+        char base[64] = "?";
+        DWORD off = 0;
+        HMODULE mod = nullptr;
+        if (addr && GetModuleHandleExA(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                static_cast<LPCSTR>(addr), &mod) && mod)
+        {
+            char path[MAX_PATH]{};
+            GetModuleFileNameA(mod, path, MAX_PATH);
+            const char* slash = strrchr(path, '\\');
+            const char* name = slash ? slash + 1 : path;
+            strncpy_s(base, name, _TRUNCATE);
+            off = static_cast<DWORD>(reinterpret_cast<uintptr_t>(addr) - reinterpret_cast<uintptr_t>(mod));
+        }
+
+        DWORD stk[8]{};
+#ifdef _M_IX86
+        ReadStackDwords(esp, stk, 8);
+#else
+        (void)esp;
+#endif
+        char body[1600];
+        int n = snprintf(body, sizeof(body),
+            "BMVR-CRASH code%08X tid=%08lX fault=%p eip=%s+%08X raw=%08X tick=%lu stage=%s\n"
+            "  eax=%08X ecx=%08X edx=%08X esi=%08X edi=%08X ebp=%08X esp=%08X\n",
+            code, GetCurrentThreadId(), addr, base, off, eip, GetTickCount(), g_Stage,
+            eax, ecx, edx, esi, edi, ebp, esp);
+        for (int i = 0; i < 8 && n > 0 && n < static_cast<int>(sizeof(body)) - 40; ++i)
+        {
+            n += snprintf(body + n, sizeof(body) - static_cast<size_t>(n),
+                "  stk+%08X=%08X\n", i * 4, stk[i]);
+        }
+        WriteUtf8File(ExeDir() + L"\\bmvr_crash.txt", body, false);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    static void InstallCrashHandler()
+    {
+        static bool s_once;
+        if (s_once)
+            return;
+        s_once = true;
+        // Continue handler runs after frame __try/__except. First-chance VEH
+        // dumped caught AVs in SehCopyAndFixViewmodelMatrices and consumed the
+        // once-flag so a later real fault was silent (2026-09-09).
+        AddVectoredContinueHandler(1, CrashVectored);
     }
 
     static void ConsumeIfStuck(const wchar_t* name, bool& enabled, const char* key, const char* label, bool persist = true)
@@ -1141,9 +1290,19 @@ namespace bmvr
         return g_IsBlueShift;
     }
 
-    static bool PathLeafIsBshift(const wchar_t* tok)
+    bool IsAzureSheep()
     {
-        if (!tok || !tok[0])
+        return g_IsAzureSheep;
+    }
+
+    bool UseBlueHud()
+    {
+        return g_IsBlueShift || g_IsAzureSheep;
+    }
+
+    static bool PathLeafEquals(const wchar_t* tok, const wchar_t* name)
+    {
+        if (!tok || !tok[0] || !name || !name[0])
             return false;
         const wchar_t* leaf = tok;
         for (const wchar_t* p = tok; *p; ++p)
@@ -1151,12 +1310,13 @@ namespace bmvr
             if (*p == L'/' || *p == L'\\')
                 leaf = p + 1;
         }
-        return _wcsicmp(leaf, L"bshift") == 0;
+        return _wcsicmp(leaf, name) == 0;
     }
 
-    static void DetectBlueShiftSession()
+    static void DetectCampaignSession()
     {
         g_IsBlueShift = false;
+        g_IsAzureSheep = false;
         const wchar_t* p = GetCommandLineW();
         if (!p)
             return;
@@ -1189,13 +1349,30 @@ namespace bmvr
         {
             if (_wcsicmp(tok, L"-game") != 0)
                 continue;
-            if (nextTok() && PathLeafIsBshift(tok))
+            if (!nextTok())
+                return;
+            if (PathLeafEquals(tok, L"bshift"))
             {
                 g_IsBlueShift = true;
                 Log("Blue Shift session (-game bshift)");
                 return;
             }
+            if (PathLeafEquals(tok, L"asheep"))
+            {
+                g_IsAzureSheep = true;
+                Log("Azure Sheep session (-game asheep)");
+                return;
+            }
         }
+    }
+
+    uint32_t NormalizeMsaa(int samples)
+    {
+        if (samples == 1)
+            return 2;
+        if (samples == 2 || samples == 4 || samples == 8 || samples == 16)
+            return static_cast<uint32_t>(samples);
+        return 0;
     }
 
     void InitFromDisk()
@@ -1203,11 +1380,15 @@ namespace bmvr
         if (g_Inited)
             return;
         g_Inited = true;
+        InstallCrashHandler();
         StartWatchdog();
-        DetectBlueShiftSession();
+        DetectCampaignSession();
         ReadUserConfig(ExeDir() + L"\\VR\\config.txt");
         ReadSkipFile(SkipPath());
         ReadSkipFile(ModuleDir() + L"\\bmvr_skip.txt");
+        ConsumeIfStuck(L"msaa", g_MsaaAllowed, "msaa", "HL2VR scene MSAA");
+        if (!g_MsaaAllowed)
+            g_Msaa = 0;
         ConsumeIfStuck(L"hmd_swap", g_TryHmdSwapchain, "hmd_swap", "HMD-sized swapchain");
         ConsumeIfStuck(L"hmd_native", g_TryHmdNative, "hmd_native", "L4D2VR recommended G-buffer size");
         // Last launch: 8 pass-through 1584 RenderViews (zNear=7) succeeded,
@@ -1276,12 +1457,19 @@ namespace bmvr
             "47777b5 HMD-fit FullFrame LITERAL (window-capped, not grow)");
         ConsumeIfStuck(L"ff_gbfit", g_TryEyeFitWorldRts, "ff_gbfit",
             "LITERAL FullFrame+G-buffer at eye size (HDR unbind still skipped)");
-        ConsumeIfStuck(L"fl_gbmatch", g_TryFlashlightGbMatch, "fl_gbmatch",
-            "2560 GB-match stereo view (HMD fov/aspect, squash-blit eyes)");
+        // Skip-file already ignores fl_gbmatch. ConsumeIfStuck still disabled
+        // it from leftover bmvr_in_fl_gbmatch.flag (BeginRisky held when the
+        // first simulator pair died). Next launch then double-RVed 1280 into
+        // a 2560 G-buffer and died in DRAWHUD (2026-09-09). Same class as
+        // hmd_world leftover — do not disable the HWND lock.
+        for (const auto& dir : FlagDirs())
+            DeleteFileW((dir + L"\\bmvr_in_fl_gbmatch.flag").c_str());
+        Log("Ignoring fl_gbmatch crash-sticky (HWND blit when eyes fit in the window)");
         ConsumeIfStuck(L"gb_leftskip", g_TryGbLeftSkip, "gb_leftskip",
             "skip leftover 16:9 main under gbmatch");
-        ConsumeIfStuck(L"drawhud", g_TryDrawHud, "drawhud",
-            "leftover RenderView with RENDERVIEW_DRAWHUD");
+        for (const auto& dir : FlagDirs())
+            DeleteFileW((dir + L"\\bmvr_in_drawhud.flag").c_str());
+        Log("Ignoring drawhud crash-sticky (third HWND HUD pass after small-eye stereo)");
         ConsumeIfStuck(L"hl2vr_wgp", g_TryHl2vrQueuedWgp, "hl2vr_wgp",
             "HL2VR queued WaitGetPoses on ICallQueue");
         ConsumeIfStuck(L"hl2vr_eye", g_TryHl2vrStereoEye, "hl2vr_eye",
@@ -1358,8 +1546,9 @@ namespace bmvr
         }
         if (!g_WorldEyeSizeOptIn)
             PersistSkip("hmd_world", "LITERAL FullFrame+G-buffer at SteamVR rec still PushRT 2560x1440; HMD warp + bottom garbage");
-        // Do not PersistSkip fl_gbmatch — other builds wrote a policy skip
-        // that silently disabled the flashlight path. Crash-sticky only.
+        // Do not PersistSkip or ConsumeIfStuck fl_gbmatch. Skip-file ignore
+        // was not enough: leftover bmvr_in_fl_gbmatch.flag still disabled
+        // the HWND lock on OpenXR Simulator (2026-09-09).
         // Named HDR wrap + rewriting CSimpleWorldView PushRT(NULL) dies after
         // the third bind even when the named RT is 2560x1440. Do not retry it.
         g_TryNamedStereoWrap = false;
@@ -1403,7 +1592,7 @@ namespace bmvr
             name = name.substr(0, dot);
         for (char& c : name)
             c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
-        if (name == "dedicated" || name.rfind("background", 0) == 0)
+        if (name == "dedicated" || name.find("background") != std::string::npos)
             return false;
         return true;
     }
@@ -1420,7 +1609,7 @@ namespace bmvr
         g_EngineMapIsBackground = !gameplay;
         Log("World RT map=%s gameplay=%d backgroundBlock=%d",
             map, gameplay ? 1 : 0, g_EngineMapIsBackground ? 1 : 0);
-        if (!g_IsBlueShift)
+        if (!g_IsBlueShift && !g_IsAzureSheep)
         {
             const char* slash = strrchr(map, '/');
             const char* bslash = strrchr(map, '\\');
@@ -1433,6 +1622,13 @@ namespace bmvr
             {
                 g_IsBlueShift = true;
                 Log("Blue Shift session (map %s)", map);
+            }
+            else if ((base[0] == 'a' || base[0] == 'A')
+                && (base[1] == 's' || base[1] == 'S')
+                && base[2] == '_')
+            {
+                g_IsAzureSheep = true;
+                Log("Azure Sheep session (map %s)", map);
             }
         }
     }
@@ -1830,7 +2026,31 @@ namespace bmvr
     {
         if (!WorldRtGrowActive())
             return false;
-        return ComputeOffscreenEyeSize(width, height);
+        uint32_t eyeW = 0, eyeH = 0;
+        if (!ComputeOffscreenEyeSize(eyeW, eyeH))
+            return false;
+        uint32_t winW = 0, winH = 0;
+        if (QueryWindowClientSize(winW, winH) && winW >= 640 && winH >= 360
+            && eyeW <= winW && eyeH <= winH)
+        {
+            // Grow-only. Do not shrink FullFrame to a recommended eye that is
+            // smaller than the HWND (simulator 1280 inside 2560). Cover-scaling
+            // those eyes to 2560x2816 created a 5136x8448 MC ring and stopped
+            // the OpenXR Simulator session on the menu (2026-09-09).
+            static uint32_t s_skipW, s_skipH;
+            if (s_skipW != eyeW || s_skipH != eyeH)
+            {
+                s_skipW = eyeW;
+                s_skipH = eyeH;
+                Log("World RT grow skipped: eye %ux%u is not larger than HWND %ux%u "
+                    "(keep window-sized FullFrame/GB; blit into small eyes)",
+                    eyeW, eyeH, winW, winH);
+            }
+            return false;
+        }
+        width = eyeW;
+        height = eyeH;
+        return true;
     }
 
     bool ComputeWorldRtOverrideSize(uint32_t& width, uint32_t& height)

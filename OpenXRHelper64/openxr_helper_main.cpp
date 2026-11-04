@@ -16,6 +16,8 @@
 #include "../third_party/openxr/include/openxr/openxr.h"
 #include "../third_party/openxr/include/openxr/openxr_platform.h"
 #include "../src/openxr_bridge_protocol.h"
+#include "../src/openxr_cpu_bridge.h"
+#include "../src/openxr_cpu_gpu_bridge.h"
 
 #include <algorithm>
 #include <array>
@@ -33,6 +35,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "../experiments/openxr-fsr/fsr_vulkan.h"
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
@@ -46,7 +49,7 @@ namespace
     constexpr uint32_t kDefaultWaitReadySeconds = 45;
     constexpr uint32_t kBlitDescriptorSetCount = L4D2VR_OPENXR_EYE_COUNT + L4D2VR_OPENXR_OVERLAY_COUNT;
     constexpr uint32_t kMaxOpenXrHudCurveSegments = 12;
-    constexpr uint32_t kMaxOpenXrOverlayLayers = L4D2VR_OPENXR_OVERLAY_COUNT + kMaxOpenXrHudCurveSegments - 1;
+    constexpr uint32_t kMaxOpenXrOverlayLayers = L4D2VR_OPENXR_OVERLAY_COUNT + kMaxOpenXrHudCurveSegments - 1 + 3;
     constexpr float kPi = 3.141592654f;
 
     HANDLE OpenParentProcessHandle(DWORD parentPid)
@@ -129,6 +132,7 @@ namespace
     public:
         bool Open(const std::wstring& path)
         {
+            if (m_Quiet) return true;
             if (path.empty())
                 return true;
 
@@ -144,6 +148,7 @@ namespace
 
         void Print(const char* fmt, ...)
         {
+            if (m_Quiet) return;
             SYSTEMTIME st{};
             GetLocalTime(&st);
 
@@ -178,6 +183,7 @@ namespace
         }
 
     private:
+        bool m_Quiet = [] {char v[8]{};return GetEnvironmentVariableA("BMVR_QUIET",v,sizeof(v))==1 && v[0]=='1';}();
         FILE* m_File = nullptr;
     };
 
@@ -1297,7 +1303,7 @@ namespace
         "AwIjBwAAAQALAAgAMwAAAAAAAAARAAIAAQAAAAsABgABAAAAR0xTTC5zdGQuNDUwAAAAAA4AAwAAAAAAAQAAAA8ACAAAAAAABAAAAG1haW4AAAAAHwAAACMAAAAvAAAAAwADAAIAAADCAQAABQAEAAQAAABtYWluAAAAAAUAAwAMAAAAcG9zAAUAAwATAAAAdXYAAAUABgAdAAAAZ2xfUGVyVmVydGV4AAAAAAYABgAdAAAAAAAAAGdsX1Bvc2l0aW9uAAYABwAdAAAAAQAAAGdsX1BvaW50U2l6ZQAAAAAGAAcAHQAAAAIAAABnbF9DbGlwRGlzdGFuY2UABgAHAB0AAAADAAAAZ2xfQ3VsbERpc3RhbmNlAAUAAwAfAAAAAAAAAAUABgAjAAAAZ2xfVmVydGV4SW5kZXgAAAUAAwAvAAAAdlV2AEcAAwAdAAAAAgAAAEgABQAdAAAAAAAAAAsAAAAAAAAASAAFAB0AAAABAAAACwAAAAEAAABIAAUAHQAAAAIAAAALAAAAAwAAAEgABQAdAAAAAwAAAAsAAAAEAAAARwAEACMAAAALAAAAKgAAAEcABAAvAAAAHgAAAAAAAAATAAIAAgAAACEAAwADAAAAAgAAABYAAwAGAAAAIAAAABcABAAHAAAABgAAAAIAAAAVAAQACAAAACAAAAAAAAAAKwAEAAgAAAAJAAAAAwAAABwABAAKAAAABwAAAAkAAAAgAAQACwAAAAcAAAAKAAAAKwAEAAYAAAANAAAAAACAvywABQAHAAAADgAAAA0AAAANAAAAKwAEAAYAAAAPAAAAAABAQCwABQAHAAAAEAAAAA8AAAANAAAALAAFAAcAAAARAAAADQAAAA8AAAAsAAYACgAAABIAAAAOAAAAEAAAABEAAAArAAQABgAAABQAAAAAAAAALAAFAAcAAAAVAAAAFAAAABQAAAArAAQABgAAABYAAAAAAABALAAFAAcAAAAXAAAAFgAAABQAAAAsAAUABwAAABgAAAAUAAAAFgAAACwABgAKAAAAGQAAABUAAAAXAAAAGAAAABcABAAaAAAABgAAAAQAAAArAAQACAAAABsAAAABAAAAHAAEABwAAAAGAAAAGwAAAB4ABgAdAAAAGgAAAAYAAAAcAAAAHAAAACAABAAeAAAAAwAAAB0AAAA7AAQAHgAAAB8AAAADAAAAFQAEACAAAAAgAAAAAQAAACsABAAgAAAAIQAAAAAAAAAgAAQAIgAAAAEAAAAgAAAAOwAEACIAAAAjAAAAAQAAACAABAAlAAAABwAAAAcAAAArAAQABgAAACgAAAAAAIA/IAAEACwAAAADAAAAGgAAACAABAAuAAAAAwAAAAcAAAA7AAQALgAAAC8AAAADAAAANgAFAAIAAAAEAAAAAAAAAAMAAAD4AAIABQAAADsABAALAAAADAAAAAcAAAA7AAQACwAAABMAAAAHAAAAPgADAAwAAAASAAAAPgADABMAAAAZAAAAPQAEACAAAAAkAAAAIwAAAEEABQAlAAAAJgAAAAwAAAAkAAAAPQAEAAcAAAAnAAAAJgAAAFEABQAGAAAAKQAAACcAAAAAAAAAUQAFAAYAAAAqAAAAJwAAAAEAAABQAAcAGgAAACsAAAApAAAAKgAAABQAAAAoAAAAQQAFACwAAAAtAAAAHwAAACEAAAA+AAMALQAAACsAAAA9AAQAIAAAADAAAAAjAAAAQQAFACUAAAAxAAAAEwAAADAAAAA9AAQABwAAADIAAAAxAAAAPgADAC8AAAAyAAAA/QABADgAAQA=";
 
     constexpr char kOpenXrBlitFragSpvBase64[] =
-        "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";
+        "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";
 
     struct VulkanDispatch
     {
@@ -1343,6 +1349,7 @@ namespace
         PFN_vkCmdPipelineBarrier vkCmdPipelineBarrier = nullptr;
         PFN_vkCmdBlitImage vkCmdBlitImage = nullptr;
         PFN_vkCmdCopyImageToBuffer vkCmdCopyImageToBuffer = nullptr;
+        PFN_vkCmdCopyBufferToImage vkCmdCopyBufferToImage = nullptr;
         PFN_vkCmdClearColorImage vkCmdClearColorImage = nullptr;
         PFN_vkCreateImageView vkCreateImageView = nullptr;
         PFN_vkDestroyImageView vkDestroyImageView = nullptr;
@@ -1407,9 +1414,195 @@ namespace
         bool ownsImport = true;
     };
 
+    // BEGIN BMVR_SHARED_GPU_CPU_READER: CPU-only, extracted by the local tests.
+    struct SharedGpuCpuSnapshot
+    {
+        uint32_t width = 0, height = 0, frame = 0;
+        L4D2VROpenXrPoseDesc pose{};
+        int64_t captureQpc = 0;
+        float fovX = 90.f, aspect = 1.f;
+        int64_t cpuSnapshotStartQpc = 0, cpuSnapshotEndQpc = 0;
+    };
+
+    enum class SharedGpuCpuReadResult { NoReady, Copied, Invalid };
+
+    class SharedGpuCpuReader
+    {
+    public:
+        ~SharedGpuCpuReader() { Close(); }
+        SharedGpuCpuReader() = default;
+        SharedGpuCpuReader(const SharedGpuCpuReader&) = delete;
+        SharedGpuCpuReader& operator=(const SharedGpuCpuReader&) = delete;
+
+        bool Matches(uint32_t pid, uint64_t nonce, uint32_t width, uint32_t height) const
+        {
+            return m_Control && m_ProducerPid == pid && m_Nonce == nonce
+                && m_Width == width && m_Height == height;
+        }
+
+        bool IsOpen() const { return m_Control != nullptr; }
+
+        bool Open(uint32_t pid, uint64_t nonce, uint32_t width, uint32_t height, bool& changed)
+        {
+            changed = !Matches(pid, nonce, width, height);
+            if (!changed)
+                return HeaderValid();
+            Close();
+            uint64_t eyeBytes = 0, logicalBytes = 0;
+            if (!pid || !nonce || !bmvr_shared_gpu::Layout(width, height, eyeBytes, logicalBytes))
+                return false;
+            wchar_t name[128]{};
+            bmvr_shared_gpu::ControlName(name, pid, nonce);
+            if (!m_ControlMapping.Open(name, sizeof(bmvr_shared_gpu::Control), false))
+                return false;
+            auto* control = static_cast<bmvr_shared_gpu::Control*>(m_ControlMapping.data);
+            if (!bmvr_shared_gpu::Validate(*control, pid, nonce, width, height))
+            {
+                Close();
+                return false;
+            }
+            const uint32_t helperPid = GetCurrentProcessId();
+            const uint32_t owner = bmvr_shared_gpu::Load(control->helperPid);
+            if ((owner != 0 && owner != helperPid)
+                || (owner == 0 && !bmvr_shared_gpu::Claim(control->helperPid, 0, helperPid)))
+            {
+                Close();
+                return false;
+            }
+            // Set identity before opening pixels so partial-failure Close also
+            // releases our helper ownership. Producer never recycles this nonce.
+            m_Control = control;
+            m_ProducerPid = pid;
+            m_Nonce = nonce;
+            m_Width = width;
+            m_Height = height;
+            m_EyeBytes = eyeBytes;
+            m_AllocationBytes = control->allocationBytes;
+            for (uint32_t i = 0; i < bmvr_shared_gpu::SlotCount; ++i)
+            {
+                bmvr_shared_gpu::PixelName(name, pid, nonce, i);
+                if (!m_Pixels[i].Open(name, m_AllocationBytes, false, true))
+                {
+                    Close();
+                    return false;
+                }
+            }
+            if (!HeaderValid())
+            {
+                Close();
+                return false;
+            }
+            return true;
+        }
+
+        void Close()
+        {
+            // Read() releases its CPU pin before returning. Only CPU views are
+            // owned here; the producer owns all imported Vulkan allocations.
+            if (m_Control)
+                bmvr_shared_gpu::Claim(m_Control->helperPid, GetCurrentProcessId(), 0);
+            m_Control = nullptr;
+            for (auto& pixels : m_Pixels)
+                pixels.Close();
+            m_ControlMapping.Close();
+            std::vector<uint8_t>().swap(m_Scratch);
+            m_ProducerPid = m_Width = m_Height = 0;
+            m_Nonce = m_EyeBytes = m_AllocationBytes = 0;
+        }
+
+        SharedGpuCpuReadResult Read(std::vector<uint8_t>& pixels, uint32_t lastFrame,
+            SharedGpuCpuSnapshot& snapshot, bool measureSnapshot = false)
+        {
+            if (!HeaderValid())
+                return SharedGpuCpuReadResult::Invalid;
+            // All checked sizes are cached from the immutable allocation header.
+            // Resize before pinning: allocation failure cannot strand CpuReading.
+            m_Scratch.resize(static_cast<size_t>(2 * m_EyeBytes));
+            for (uint32_t attempt = 0; attempt < bmvr_shared_gpu::SlotCount; ++attempt)
+            {
+                int selected = -1;
+                uint32_t newest = 0;
+                for (uint32_t i = 0; i < bmvr_shared_gpu::SlotCount; ++i)
+                {
+                    const auto& candidate = m_Control->slots[i];
+                    if (bmvr_shared_gpu::Load(candidate.state) != bmvr_shared_gpu::Ready)
+                        continue;
+                    const uint32_t frame = bmvr_shared_gpu::Load(candidate.frame);
+                    if (frame && (selected < 0 || static_cast<int32_t>(frame - newest) > 0))
+                    {
+                        selected = static_cast<int>(i);
+                        newest = frame;
+                    }
+                }
+                if (selected < 0)
+                    return SharedGpuCpuReadResult::NoReady;
+                auto& slot = m_Control->slots[static_cast<size_t>(selected)];
+                if (!bmvr_shared_gpu::Claim(slot.state, bmvr_shared_gpu::Ready, bmvr_shared_gpu::CpuReading))
+                    continue;
+                struct Pin
+                {
+                    bmvr_shared_gpu::Slot& slot;
+                    ~Pin() { bmvr_shared_gpu::Store(slot.state, bmvr_shared_gpu::Free); }
+                } pin{ slot };
+                // The scan was only a hint: after CAS the slot may be a newer
+                // reuse. Metadata is read only now, under our exclusive CPU pin.
+                SharedGpuCpuSnapshot next{};
+                next.frame = bmvr_shared_gpu::Load(slot.frame);
+                if (!next.frame || !HeaderValid())
+                    return SharedGpuCpuReadResult::Invalid;
+                if (lastFrame && static_cast<int32_t>(next.frame - lastFrame) <= 0)
+                    continue; // Retire stale Ready slots without regressing.
+                next.width = m_Width;
+                next.height = m_Height;
+                next.pose = slot.pose;
+                next.captureQpc = slot.captureQpc;
+                next.fovX = slot.fovX;
+                next.aspect = slot.aspect;
+                const auto* source = static_cast<const uint8_t*>(m_Pixels[static_cast<size_t>(selected)].data)
+                    + static_cast<size_t>(bmvr_shared_gpu::PrefixBytes);
+                const size_t eyeBytes = static_cast<size_t>(m_EyeBytes);
+                LARGE_INTEGER copyStart{}, copyEnd{};
+                if (measureSnapshot)
+                    QueryPerformanceCounter(&copyStart);
+                std::memcpy(m_Scratch.data(), source, eyeBytes);
+                std::memcpy(m_Scratch.data() + eyeBytes, source + eyeBytes, eyeBytes);
+                if (measureSnapshot)
+                {
+                    QueryPerformanceCounter(&copyEnd);
+                    next.cpuSnapshotStartQpc = copyStart.QuadPart;
+                    next.cpuSnapshotEndQpc = copyEnd.QuadPart;
+                }
+                if (!HeaderValid())
+                    return SharedGpuCpuReadResult::Invalid;
+                pixels.swap(m_Scratch); // Old coherent snapshot survives until here.
+                snapshot = next; // Publish metadata only after BOTH eyes copied.
+                return SharedGpuCpuReadResult::Copied;
+            }
+            return SharedGpuCpuReadResult::NoReady;
+        }
+
+    private:
+        bool HeaderValid() const
+        {
+            return m_Control && bmvr_shared_gpu::Validate(*m_Control, m_ProducerPid, m_Nonce, m_Width, m_Height)
+                && m_Control->eyeBytes == m_EyeBytes && m_Control->allocationBytes == m_AllocationBytes
+                && bmvr_shared_gpu::Load(m_Control->helperPid) == GetCurrentProcessId();
+        }
+        bmvr_shared_gpu::Mapping m_ControlMapping;
+        std::array<bmvr_shared_gpu::Mapping, bmvr_shared_gpu::SlotCount> m_Pixels;
+        bmvr_shared_gpu::Control* m_Control = nullptr;
+        uint32_t m_ProducerPid = 0, m_Width = 0, m_Height = 0;
+        uint64_t m_Nonce = 0, m_EyeBytes = 0, m_AllocationBytes = 0;
+        std::vector<uint8_t> m_Scratch;
+    };
+    // END BMVR_SHARED_GPU_CPU_READER
+
     class BridgeWriter
     {
     public:
+        void NotifyReferenceSpaceChange() {
+            if(m_State) InterlockedIncrement(reinterpret_cast<volatile LONG*>(&m_State->referenceSpaceEpoch));
+        }
         bool Open(const std::wstring& mappingName, Logger& log)
         {
             if (mappingName.empty())
@@ -1449,6 +1642,9 @@ namespace
         {
             if (m_State)
             {
+                if (m_AdvertisedSharedGpu && m_State->helperPid == GetCurrentProcessId())
+                    InterlockedAnd(reinterpret_cast<volatile LONG*>(&m_State->reservedTail0),
+                        ~static_cast<LONG>(bmvr_shared_gpu::HelperCapability));
                 UnmapViewOfFile(m_State);
                 m_State = nullptr;
             }
@@ -1464,9 +1660,9 @@ namespace
             if (!m_State)
                 return;
 
-            m_State->status = static_cast<uint32_t>(status);
+            L4D2VR_OpenXrAtomicStore(m_State->status, static_cast<uint32_t>(status));
             m_State->exitCode = exitCode;
-            m_State->submittedFrames = submittedFrames;
+            L4D2VR_OpenXrAtomicStore(m_State->submittedFrames, submittedFrames);
             m_State->heartbeatTickMs = GetTickCount64();
             if (detail)
             {
@@ -1479,22 +1675,35 @@ namespace
             return m_State != nullptr;
         }
 
+        void AdvertiseSharedGpuCpuReader(uint32_t expectedGamePid)
+        {
+            if (!m_State || !expectedGamePid || m_State->gamePid != expectedGamePid
+                || m_State->helperPid != GetCurrentProcessId())
+                return;
+            InterlockedOr(reinterpret_cast<volatile LONG*>(&m_State->reservedTail0),
+                static_cast<LONG>(bmvr_shared_gpu::HelperCapability));
+            m_AdvertisedSharedGpu = true;
+        }
+
         bool SharedTexturesReady() const
         {
             return m_State &&
-                (m_State->sharedTexturesReadyMask & L4D2VR_OPENXR_EYES_READY_MASK) == L4D2VR_OPENXR_EYES_READY_MASK;
+                (L4D2VR_OpenXrAtomicLoad(m_State->sharedTexturesReadyMask) & L4D2VR_OPENXR_EYES_READY_MASK) == L4D2VR_OPENXR_EYES_READY_MASK;
         }
 
         uint32_t SharedTextureGeneration() const
         {
-            return m_State ? m_State->sharedTextureGeneration : 0;
+            return m_State ? L4D2VR_OpenXrAtomicLoad(m_State->sharedTextureGeneration) : 0;
         }
 
         L4D2VROpenXrSharedTextureDesc SharedTexture(uint32_t eyeIndex) const
         {
             if (!m_State || eyeIndex >= L4D2VR_OPENXR_EYE_COUNT)
                 return {};
-            return m_State->eyeTextures[eyeIndex];
+            L4D2VROpenXrSharedTextureDesc out{};
+            L4D2VR_OpenXrReadSnapshot(m_State->sharedTextureGeneration,
+                m_State->eyeTextures[eyeIndex], out);
+            return out;
         }
 
         // Seqlock read of both eyes. The game rotates publish textures now, so a
@@ -1506,110 +1715,52 @@ namespace
         {
             if (!m_State)
                 return false;
-
-            for (int attempt = 0; attempt < 8; ++attempt)
-            {
-                const uint32_t before = m_State->sharedTextureGeneration;
-                if (before == 0 || (before & 1u) != 0)
-                    continue;
-                std::atomic_thread_fence(std::memory_order_acquire);
-                left = m_State->eyeTextures[L4D2VR_OPENXR_EYE_LEFT];
-                right = m_State->eyeTextures[L4D2VR_OPENXR_EYE_RIGHT];
-                std::atomic_thread_fence(std::memory_order_acquire);
-                if (m_State->sharedTextureGeneration == before)
-                {
-                    generation = before;
-                    return true;
-                }
-            }
-            return false;
+            L4D2VROpenXrSharedTextureDesc pair[L4D2VR_OPENXR_EYE_COUNT]{};
+            if (!L4D2VR_OpenXrReadSnapshot(m_State->sharedTextureGeneration,
+                m_State->eyeTextures, pair, &generation, 8))
+                return false;
+            left = pair[L4D2VR_OPENXR_EYE_LEFT];
+            right = pair[L4D2VR_OPENXR_EYE_RIGHT];
+            return true;
         }
 
         uint32_t OverlayGeneration() const
         {
-            return m_State ? m_State->overlayGeneration : 0;
+            return m_State ? L4D2VR_OpenXrAtomicLoad(m_State->overlayGeneration) : 0;
         }
 
         L4D2VROpenXrOverlayDesc Overlay(uint32_t overlayIndex) const
         {
             if (!m_State || overlayIndex >= L4D2VR_OPENXR_OVERLAY_COUNT)
                 return {};
-            return m_State->overlays[overlayIndex];
+            L4D2VROpenXrOverlayDesc out{};
+            L4D2VR_OpenXrReadSnapshot(m_State->overlayGeneration,
+                m_State->overlays[overlayIndex], out);
+            return out;
         }
 
         bool ReadOverlayFrame(uint32_t& frameId, uint32_t* generation = nullptr) const
         {
             if (!m_State)
                 return false;
-
-            for (int attempt = 0; attempt < 3; ++attempt)
-            {
-                const uint32_t gen0 = m_State->overlayFrameGeneration;
-                if (gen0 == 0 || (gen0 & 1u))
-                    continue;
-
-                const uint32_t snapshotFrameId = m_State->overlayFrameId;
-                const uint32_t gen1 = m_State->overlayFrameGeneration;
-                if (gen0 == gen1 && !(gen1 & 1u) && snapshotFrameId != 0)
-                {
-                    frameId = snapshotFrameId;
-                    if (generation)
-                        *generation = gen1;
-                    return true;
-                }
-            }
-
-            return false;
+            return L4D2VR_OpenXrReadSnapshot(m_State->overlayFrameGeneration,
+                m_State->overlayFrameId, frameId, generation) && frameId != 0;
         }
 
         bool ReadSharedTextureFrame(uint32_t& frameId, uint32_t* generation = nullptr) const
         {
             if (!m_State)
                 return false;
-
-            for (int attempt = 0; attempt < 3; ++attempt)
-            {
-                const uint32_t gen0 = m_State->sharedTextureFrameGeneration;
-                if (gen0 == 0 || (gen0 & 1u))
-                    continue;
-
-                const uint32_t snapshotFrameId = m_State->sharedTextureFrameId;
-                const uint32_t gen1 = m_State->sharedTextureFrameGeneration;
-                if (gen0 == gen1 && !(gen1 & 1u) && snapshotFrameId != 0)
-                {
-                    frameId = snapshotFrameId;
-                    if (generation)
-                        *generation = gen1;
-                    return true;
-                }
-            }
-
-            return false;
+            return L4D2VR_OpenXrReadSnapshot(m_State->sharedTextureFrameGeneration,
+                m_State->sharedTextureFrameId, frameId, generation) && frameId != 0;
         }
 
         bool ReadGameRenderPose(L4D2VROpenXrPoseDesc& pose, uint32_t* generation = nullptr) const
         {
             if (!m_State)
                 return false;
-
-            for (int attempt = 0; attempt < 3; ++attempt)
-            {
-                const uint32_t gen0 = m_State->gameRenderPoseGeneration;
-                if (gen0 == 0 || (gen0 & 1u))
-                    continue;
-
-                L4D2VROpenXrPoseDesc snapshot = m_State->gameRenderPose;
-                const uint32_t gen1 = m_State->gameRenderPoseGeneration;
-                if (gen0 == gen1 && !(gen1 & 1u) && snapshot.valid)
-                {
-                    pose = snapshot;
-                    if (generation)
-                        *generation = gen1;
-                    return true;
-                }
-            }
-
-            return false;
+            return L4D2VR_OpenXrReadSnapshot(m_State->gameRenderPoseGeneration,
+                m_State->gameRenderPose, pose, generation) && pose.valid != 0;
         }
 
         void PublishHmdPose(const L4D2VROpenXrPoseDesc& pose)
@@ -1617,9 +1768,9 @@ namespace
             if (!m_State || !pose.valid)
                 return;
 
-            ++m_State->trackingPoseGeneration;
+            const uint32_t publishSequence = L4D2VR_OpenXrBeginPublish(m_State->trackingPoseGeneration);
             m_State->hmdPose = pose;
-            ++m_State->trackingPoseGeneration;
+            L4D2VR_OpenXrEndPublish(m_State->trackingPoseGeneration, publishSequence);
             m_State->heartbeatTickMs = GetTickCount64();
         }
 
@@ -1628,9 +1779,9 @@ namespace
             if (!m_State || !config.valid)
                 return;
 
-            ++m_State->runtimeViewConfigGeneration;
+            const uint32_t publishSequence = L4D2VR_OpenXrBeginPublish(m_State->runtimeViewConfigGeneration);
             m_State->runtimeViewConfig = config;
-            ++m_State->runtimeViewConfigGeneration;
+            L4D2VR_OpenXrEndPublish(m_State->runtimeViewConfigGeneration, publishSequence);
             m_State->heartbeatTickMs = GetTickCount64();
         }
 
@@ -1639,10 +1790,23 @@ namespace
             if (!m_State)
                 return;
 
-            ++m_State->visibilityMaskGeneration;
+            const uint32_t publishSequence = L4D2VR_OpenXrBeginPublish(m_State->visibilityMaskGeneration);
             m_State->visibilityMask = mask;
-            ++m_State->visibilityMaskGeneration;
+            L4D2VR_OpenXrEndPublish(m_State->visibilityMaskGeneration, publishSequence);
             m_State->heartbeatTickMs = GetTickCount64();
+        }
+
+        bool Loading() const
+        {
+            return m_State && InterlockedCompareExchange(
+                reinterpret_cast<volatile LONG*>(&m_State->reservedTail0),0,0) != 0;
+        }
+
+        bool ReadMenuVisualState(L4D2VROpenXrMenuPointerDesc& pointer, L4D2VROpenXrInputStateDesc& input) const
+        {
+            return m_State
+                && L4D2VR_OpenXrReadSnapshot(m_State->menuPointerGeneration, m_State->menuPointer, pointer)
+                && L4D2VR_OpenXrReadSnapshot(m_State->inputStateGeneration, m_State->inputState, input);
         }
 
         void PublishInputState(const L4D2VROpenXrInputStateDesc& inputState)
@@ -1650,9 +1814,9 @@ namespace
             if (!m_State || !inputState.valid)
                 return;
 
-            ++m_State->inputStateGeneration;
+            const uint32_t publishSequence = L4D2VR_OpenXrBeginPublish(m_State->inputStateGeneration);
             m_State->inputState = inputState;
-            ++m_State->inputStateGeneration;
+            L4D2VR_OpenXrEndPublish(m_State->inputStateGeneration, publishSequence);
             m_State->heartbeatTickMs = GetTickCount64();
         }
 
@@ -1664,7 +1828,7 @@ namespace
         {
             if (!m_State)
                 return;
-            m_State->helperConsumingFrameId = frameId;
+            L4D2VR_OpenXrAtomicStore(m_State->helperConsumingFrameId, frameId);
             std::atomic_thread_fence(std::memory_order_release);
         }
 
@@ -1675,8 +1839,9 @@ namespace
             // Written after both eye blits have vkQueueWaitIdle'd: the
             // swapchain has the pixels and the shared images can be rewritten.
             std::atomic_thread_fence(std::memory_order_release);
-            m_State->helperConsumedFrameId = frameId;
-            ++m_State->helperConsumedCount;
+            L4D2VR_OpenXrAtomicStore(m_State->helperConsumedFrameId, frameId);
+            L4D2VR_OpenXrAtomicStore(m_State->helperConsumedCount,
+                L4D2VR_OpenXrAtomicLoad(m_State->helperConsumedCount) + 1u);
             std::atomic_thread_fence(std::memory_order_release);
         }
 
@@ -1684,28 +1849,14 @@ namespace
         {
             if (!m_State || handIndex >= L4D2VR_OPENXR_HAND_COUNT)
                 return false;
-
-            const L4D2VROpenXrHapticRequestDesc& sharedRequest = m_State->hapticRequests[handIndex];
-            for (int attempt = 0; attempt < 3; ++attempt)
-            {
-                const uint32_t seq0 = sharedRequest.sequence;
-                if (seq0 == 0 || (seq0 & 1u))
-                    continue;
-
-                L4D2VROpenXrHapticRequestDesc snapshot = sharedRequest;
-                const uint32_t seq1 = sharedRequest.sequence;
-                if (seq0 == seq1 && !(seq1 & 1u) && snapshot.valid)
-                {
-                    request = snapshot;
-                    return true;
-                }
-            }
-
-            return false;
+            const auto& shared = m_State->hapticRequests[handIndex];
+            return L4D2VR_OpenXrReadSnapshot(shared.sequence, shared, request)
+                && request.valid != 0;
         }
 
     private:
         HANDLE m_Mapping = nullptr;
+        bool m_AdvertisedSharedGpu = false;
         L4D2VROpenXrBridgeState* m_State = nullptr;
     };
 
@@ -1721,7 +1872,7 @@ namespace
 
         const bool orientationValid = (viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0;
         const bool positionValid = (viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
-        if (!orientationValid)
+        if (!orientationValid || !positionValid)
             return pose;
 
         const uint32_t count = std::min<uint32_t>(locatedCount, static_cast<uint32_t>(views.size()));
@@ -2215,9 +2366,9 @@ namespace
             return static_cast<size_t>(id);
         }
 
-        static const std::array<BooleanActionDef, 31>& BooleanDefs();
+        static const std::array<BooleanActionDef, 30>& BooleanDefs();
         static const std::array<BooleanActionDef, 4>& ExtraBooleanDefs();
-        static const std::array<FloatDigitalActionDef, 4>& FloatDigitalDefs();
+        static const std::array<FloatDigitalActionDef, 5>& FloatDigitalDefs();
         static const std::array<AnalogActionDef, 2>& AnalogDefs();
 
         bool Path(const char* text, XrPath& out, Logger& log);
@@ -4113,6 +4264,12 @@ namespace
                                 const uint32_t projectionViewEye = SelectProjectionViewEye(options, eye);
                                 projectionViews[eye].pose = BuildProjectionPose(locatedViews, locatedCount, projectionViewEye);
                                 projectionViews[eye].fov = locatedViews[projectionViewEye].fov;
+                                if(m_CpuWarpReady && !poseMono2d) {
+                                    // Pixels were rotated from the image pose into this orientation.
+                                    // Keep render position: this warp is rotational, not positional.
+                                    projectionViews[eye].pose.orientation=locatedViews[projectionViewEye].pose.orientation;
+                                    projectionViews[eye].fov=locatedViews[projectionViewEye].fov;
+                                }
                                 if (options.mirrorProjectionHorizontal)
                                     projectionViews[eye].fov = MirrorProjectionFovHorizontal(projectionViews[eye].fov);
                                 projectionViews[eye].subImage.swapchain = m_Eyes[imageEye].handle;
@@ -4564,9 +4721,9 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     };
 
 #endif
-    const std::array<OpenXrInputBridge::BooleanActionDef, 31>& OpenXrInputBridge::BooleanDefs()
+    const std::array<OpenXrInputBridge::BooleanActionDef, 30>& OpenXrInputBridge::BooleanDefs()
     {
-        static const std::array<BooleanActionDef, 31> defs =
+        static const std::array<BooleanActionDef, 30> defs =
         {{
             { L4D2VROpenXrActionId::ActivateVR, "activate_vr", "Activate VR" },
             { L4D2VROpenXrActionId::Jump, "jump", "Jump" },
@@ -4576,7 +4733,6 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             { L4D2VROpenXrActionId::PrevItem, "prev_item", "Previous Item" },
             { L4D2VROpenXrActionId::ResetPosition, "reset_position", "Reset Position" },
             { L4D2VROpenXrActionId::Flashlight, "flashlight", "Flashlight" },
-            { L4D2VROpenXrActionId::InventoryGripLeft, "inventory_grip_left", "Inventory Grip Left" },
             { L4D2VROpenXrActionId::InventoryGripRight, "inventory_grip_right", "Inventory Grip Right" },
             { L4D2VROpenXrActionId::InventoryQuickSwitch, "inventory_quick_switch", "Inventory Quick Switch" },
             { L4D2VROpenXrActionId::SpecialInfectedAutoAimToggle, "special_infected_auto_aim", "Special Infected Auto Aim" },
@@ -4616,14 +4772,15 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         return defs;
     }
 
-    const std::array<OpenXrInputBridge::FloatDigitalActionDef, 4>& OpenXrInputBridge::FloatDigitalDefs()
+    const std::array<OpenXrInputBridge::FloatDigitalActionDef, 5>& OpenXrInputBridge::FloatDigitalDefs()
     {
-        static const std::array<FloatDigitalActionDef, 4> defs =
+        static const std::array<FloatDigitalActionDef, 5> defs =
         {{
             { L4D2VROpenXrActionId::PrimaryAttack, "primary_attack", "Primary Attack", 0.45f },
             { L4D2VROpenXrActionId::Use, "use", "Use", 0.45f },
             { L4D2VROpenXrActionId::Reload, "reload", "Reload", 0.45f },
             { L4D2VROpenXrActionId::Flashlight, "flashlight_value", "Flashlight Grip", 0.55f },
+            { L4D2VROpenXrActionId::InventoryGripLeft, "inventory_grip_left_value", "Left Support Grip", 0.35f },
         }};
         return defs;
     }
@@ -4932,6 +5089,8 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         std::vector<XrActionSuggestedBinding>& b,
         const char* gripValueName)
     {
+        const std::string leftGripValue = std::string("/user/hand/left/input/") + gripValueName;
+        AddBinding(b, m_FloatDigitalActions[Index(L4D2VROpenXrActionId::InventoryGripLeft)], leftGripValue.c_str());
         const std::string rightGripValue = std::string("/user/hand/right/input/") + gripValueName;
         AddBinding(b, m_FloatDigitalActions[Index(L4D2VROpenXrActionId::Flashlight)], rightGripValue.c_str());
     }
@@ -5420,7 +5579,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         synthesizeHand(
             L4D2VR_OPENXR_HAND_LEFT,
             L4D2VROpenXrActionId::Use,
-            L4D2VROpenXrActionId::Reload);
+            L4D2VROpenXrActionId::InventoryGripLeft);
         synthesizeHand(
             L4D2VR_OPENXR_HAND_RIGHT,
             L4D2VROpenXrActionId::PrimaryAttack,
@@ -5465,7 +5624,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
                 const bool orientationValid = (location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0;
                 const bool positionValid = (location.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0;
-                if (!orientationValid && !positionValid)
+                if (!orientationValid || !positionValid)
                     return;
 
                 out.valid = 1;
@@ -5678,6 +5837,9 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             m_Bridge.Open(options.mappingName, m_Log);
             m_ParentProcess = OpenParentProcess(options.parentPid);
 
+            m_CpuTransport = BMVR_UseCpuBridge() && m_Bridge.HasState();
+            m_CpuParentPid = options.parentPid;
+            if (m_CpuTransport) m_Log.Print("[BMVR CPU] shared-pixel transport enabled parent=%lu", m_CpuParentPid);
             if (!LoadOpenXrLoader())
                 return Fail(10, "OpenXR loader load failed");
             if (!LoadOpenXrGlobalFunctions())
@@ -5699,8 +5861,14 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             if (!CreateSwapchains())
                 return Fail(19, "OpenXR Vulkan swapchain creation failed");
 
+            // Old helpers leave this capability bit clear, so the producer
+            // cannot publish a new handle type to a legacy CPU reader.
+            if (m_CpuTransport)
+                m_Bridge.AdvertiseSharedGpuCpuReader(m_CpuParentPid);
+
             Options runtimeOptions = options;
             runtimeOptions.swapProjectionEyes = m_SwapProjectionEyes ? 1 : 0;
+            // CPU HUD pixels now have their own transport channel.
             runtimeOptions.flipSubmitY = m_FlipSubmitY ? 1 : 0;
             const int exitCode = FrameLoop(runtimeOptions);
             if (exitCode != 0)
@@ -5936,7 +6104,8 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                     m_RuntimeName, L4D2VR_OPENXR_CONTROLLER_FAMILY_UNKNOWN, reason);
             }
 
-            m_UseRuntimeProjectionFov = RuntimeNameLooksLikeOculus(m_RuntimeName);
+            m_UseRuntimeProjectionFov = RuntimeNameLooksLikeOculus(m_RuntimeName) ||
+                (m_CpuTransport && L4D2VR_TextContainsI(m_RuntimeName, "MoltenVR"));
 
             std::string activeRuntime;
             if (ReadWindowsOpenXrActiveRuntime(activeRuntime))
@@ -6358,7 +6527,11 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 }
             }
 
-            if (!AddRequiredDeviceExtension(availableDeviceExtensions, enabledDeviceExtensions, VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME))
+            // Standalone test frames use only OpenXR-owned swapchain images.
+            // They do not import game textures and need no Win32 handles.
+            // Keep the extension mandatory when the game bridge is attached.
+            if (m_Bridge.HasState() && !m_CpuTransport &&
+                !AddRequiredDeviceExtension(availableDeviceExtensions, enabledDeviceExtensions, VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME))
                 return false;
             if (HasName(availableDeviceExtensions, VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME))
                 AddUniqueName(enabledDeviceExtensions, VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME);
@@ -6448,10 +6621,11 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 !LoadVkDevice("vkBindBufferMemory", m_Vk.vkBindBufferMemory) ||
                 !LoadVkDevice("vkMapMemory", m_Vk.vkMapMemory) ||
                 !LoadVkDevice("vkUnmapMemory", m_Vk.vkUnmapMemory) ||
-                !LoadVkDevice("vkGetMemoryWin32HandlePropertiesKHR", m_Vk.vkGetMemoryWin32HandlePropertiesKHR) ||
+                (m_Bridge.HasState() && !m_CpuTransport && !LoadVkDevice("vkGetMemoryWin32HandlePropertiesKHR", m_Vk.vkGetMemoryWin32HandlePropertiesKHR)) ||
                 !LoadVkDevice("vkCmdPipelineBarrier", m_Vk.vkCmdPipelineBarrier) ||
                 !LoadVkDevice("vkCmdBlitImage", m_Vk.vkCmdBlitImage) ||
                 !LoadVkDevice("vkCmdCopyImageToBuffer", m_Vk.vkCmdCopyImageToBuffer) ||
+                !LoadVkDevice("vkCmdCopyBufferToImage", m_Vk.vkCmdCopyBufferToImage) ||
                 !LoadVkDevice("vkCmdClearColorImage", m_Vk.vkCmdClearColorImage) ||
                 !LoadVkDevice("vkCreateImageView", m_Vk.vkCreateImageView) ||
                 !LoadVkDevice("vkDestroyImageView", m_Vk.vkDestroyImageView) ||
@@ -6690,7 +6864,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
             VkPushConstantRange pushRange{};
             pushRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-            pushRange.size = sizeof(float) * 4;
+            pushRange.size = sizeof(float) * 32;
 
             VkPipelineLayoutCreateInfo pipelineLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
             pipelineLayoutInfo.setLayoutCount = 1;
@@ -6912,7 +7086,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
             m_Log.Print("Selected swapchain VkFormat=%u", static_cast<unsigned int>(selectedFormat));
             m_SelectedSwapchainFormat = selectedFormat;
-            m_UseShaderBlit = IsSrgbVkFormat(selectedFormat);
+            m_UseShaderBlit = IsSrgbVkFormat(selectedFormat) || m_CpuTransport;
             if (m_UseShaderBlit && !CreateShaderBlitPipeline(selectedFormat))
                 return false;
 
@@ -7055,6 +7229,14 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                     {
                         shouldExit = true;
                     }
+                    break;
+                }
+
+                case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING:
+                {
+                    const auto& changed=*reinterpret_cast<const XrEventDataReferenceSpaceChangePending*>(&event);
+                    if(changed.referenceSpaceType==XR_REFERENCE_SPACE_TYPE_LOCAL)
+                        m_MenuSpaceChangeTime=changed.changeTime;
                     break;
                 }
 
@@ -7891,11 +8073,33 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
         bool ImportSharedGameTexturesIfNeeded()
         {
+            m_SharedGpuAwaitingFirstPair = false;
             L4D2VROpenXrSharedTextureDesc eyes[L4D2VR_OPENXR_EYE_COUNT]{};
             uint32_t generation = 0;
             if (!m_Bridge.ReadSharedTexturePair(
                     eyes[L4D2VR_OPENXR_EYE_LEFT], eyes[L4D2VR_OPENXR_EYE_RIGHT], generation))
                 return false;
+            if (m_CpuTransport) {
+                if (eyes[0].handleType == bmvr_shared_gpu::HandleType
+                    || eyes[1].handleType == bmvr_shared_gpu::HandleType)
+                    return ReadSharedGpuCpuPair(eyes, generation);
+                if (m_SharedGpuReader.IsOpen())
+                {
+                    m_SharedGpuReader.Close();
+                    m_CpuSnapshotFrame = 0;
+                    m_CpuUploads[0].frame = m_CpuUploads[1].frame = 0;
+                    m_Fsr.InvalidateFrameCache();
+                }
+                m_SharedGpuSnapshotValid = false;
+                m_SharedGpuSnapshotNonce = 0;
+                for (uint32_t eye = 0; eye < 2; ++eye) {
+                    if (eyes[eye].handleType != BMVR_CPU_HANDLE_TYPE || eyes[eye].kmtHandle != m_CpuParentPid) return false;
+                    m_GameEyes[eye].width = eyes[eye].width;
+                    m_GameEyes[eye].height = eyes[eye].height;
+                    ApplyGameEyeSourceBounds(m_GameEyes[eye], eyes[eye], generation);
+                }
+                return ReadCpuPair();
+            }
             for (uint32_t eyeIndex = 0; eyeIndex < L4D2VR_OPENXR_EYE_COUNT; ++eyeIndex)
             {
                 if (!ImportGameEyeTexture(eyeIndex, eyes[eyeIndex], generation))
@@ -7911,6 +8115,25 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
             const L4D2VROpenXrSharedTextureDesc& desc = overlay.texture;
             VulkanGameEyeTexture& texture = m_OverlayTextures[overlayIndex];
+            if(m_CpuTransport) {
+                if(desc.handleType!=BMVR_CPU_HANDLE_TYPE || desc.kmtHandle!=m_CpuParentPid) return false;
+                auto& map=m_CpuOverlayMappings[overlayIndex];
+                auto& pixels=m_CpuOverlayPixels[overlayIndex];
+                if(map.Open(m_CpuParentPid,false,1+overlayIndex) && map.Lock(0)) {
+                    const auto* p=map.data;
+                    const bool valid=p->magic==BMVR_CPU_MAGIC && p->version==BMVR_CPU_VERSION &&
+                        p->width==desc.width && p->height==desc.height &&
+                        p->width && p->height && p->width<=BMVR_CPU_MAX_DIM && p->height<=BMVR_CPU_MAX_DIM;
+                    if(valid) {
+                        pixels.resize(size_t(p->width)*p->height*4);
+                        std::memcpy(pixels.data(),p->pixels,pixels.size());
+                        texture.width=p->width;texture.height=p->height;texture.format=static_cast<VkFormat>(desc.format);
+                        texture.uMin=texture.vMin=0.f;texture.uMax=texture.vMax=1.f;texture.generation=generation;
+                    }
+                    map.Unlock();
+                }
+                return !pixels.empty() && texture.width==desc.width && texture.height==desc.height;
+            }
             if (texture.image != VK_NULL_HANDLE &&
                 texture.kmtHandle == desc.kmtHandle &&
                 texture.width == desc.width &&
@@ -8101,6 +8324,8 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             swapchain = VulkanEyeSwapchain{};
         }
 
+#include "menu_visuals.inc"
+
         bool EnsureOverlaySwapchain(uint32_t overlayIndex, const L4D2VROpenXrOverlayDesc& overlay)
         {
             if (overlayIndex >= L4D2VR_OPENXR_OVERLAY_COUNT)
@@ -8176,7 +8401,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
             VulkanEyeSwapchain& swapchain = m_OverlaySwapchains[overlayIndex];
             VulkanGameEyeTexture& source = m_OverlayTextures[overlayIndex];
-            if (m_UseShaderBlit && !UpdateOverlayBlitDescriptorSet(overlayIndex))
+            if (!m_CpuTransport && m_UseShaderBlit && !UpdateOverlayBlitDescriptorSet(overlayIndex))
                 return false;
 
             m_CommandBuffer = m_CommandBuffers[2];
@@ -8204,7 +8429,11 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             if (vkResult != VK_SUCCESS)
                 return false;
 
-            if (m_UseShaderBlit)
+            if(m_CpuTransport) {
+                if(!CmdUploadCpuEye(2+overlayIndex,swapchain,imageIndex,dstImage,
+                    source.width,source.height,&m_CpuOverlayPixels[overlayIndex])) return false;
+            }
+            else if (m_UseShaderBlit)
             {
                 CmdTransitionImage(dstImage, swapchain.layouts[imageIndex], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                     0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
@@ -8365,6 +8594,15 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             uint32_t locatedCount,
             const XrPosef* gameRenderCenterPose = nullptr)
         {
+            // Pause panel and ray intersection share the explicit game anchor.
+            // A cached world-render pose may predate a Quest recenter.
+            L4D2VROpenXrMenuPointerDesc pointer{};L4D2VROpenXrInputStateDesc input{};
+            if(overlayIndex==L4D2VR_OPENXR_OVERLAY_HUD && m_Bridge.ReadMenuVisualState(pointer,input)
+                && pointer.active && pointer.panelValid) {
+                XrPosef anchor{NormalizeOpenXrQuaternion(pointer.panelAnchor.orientation),
+                    {pointer.panelAnchor.position[0],pointer.panelAnchor.position[1],pointer.panelAnchor.position[2]}};
+                return BuildOverlayPose(overlay,locatedViews,locatedCount,&anchor);
+            }
             const XrPosef pose = BuildOverlayPose(overlay, locatedViews, locatedCount, gameRenderCenterPose);
             if (overlayIndex >= m_OverlaySpatialLocks.size() || !OverlayUsesSpatialLock(overlayIndex))
                 return pose;
@@ -8429,7 +8667,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             m_Vk.vkCmdPipelineBarrier(m_CommandBuffer, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
         }
 
-        bool CmdRenderShaderBlitWithDescriptor(VulkanEyeSwapchain& target, uint32_t imageIndex, const VulkanGameEyeTexture& source, VkDescriptorSet descriptorSet, bool containFit, bool flipY)
+        bool CmdRenderShaderBlitWithDescriptor(VulkanEyeSwapchain& target, uint32_t imageIndex, const VulkanGameEyeTexture& source, VkDescriptorSet descriptorSet, bool containFit, bool flipY, const XrView* warpView = nullptr)
         {
             if (!m_UseShaderBlit ||
                 imageIndex >= target.framebuffers.size() ||
@@ -8492,14 +8730,31 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             // mix(1,0,t) did not change the Quest SteamVR image (2026-09-01).
             // Do not use a negative viewport: G2/SteamVR got yellow/white bands.
             // SteamVR+Touch binds a VS that negates NDC Y. Overlays pass flipY=false.
-            const float bounds[4] = { source.uMin, source.vMin, source.uMax, source.vMax };
-            m_Vk.vkCmdPushConstants(
-                m_CommandBuffer,
-                m_BlitPipelineLayout,
-                VK_SHADER_STAGE_FRAGMENT_BIT,
-                0,
-                sizeof(bounds),
-                bounds);
+            float params[32]{};
+            params[0]=source.uMin;params[1]=source.vMin;params[2]=source.uMax;params[3]=source.vMax;
+            if(warpView && m_CpuSnapshotPose.valid) {
+                const auto oldQ=NormalizeOpenXrQuaternion(m_CpuSnapshotPose.orientation);
+                const auto newQ=warpView->pose.orientation;
+                const XrVector3f basis[3]={{1,0,0},{0,1,0},{0,0,1}};
+                for(int col=0;col<3;++col) {
+                    const auto current=RotateOpenXrVector(newQ,basis[col]);
+                    for(int row=0;row<3;++row) {
+                        const auto old=RotateOpenXrVector(oldQ,basis[row]);
+                        params[4+col*4+row]=old.x*current.x+old.y*current.y+old.z*current.z;
+                    }
+                }
+                params[19]=1;
+                const float tx=std::tan(source.renderFovXDeg*3.14159265358979323846f/360.f);
+                const float ty=tx/source.renderAspect;
+                if(tx>0.001f && ty>0.001f) {
+                    params[20]=-tx;params[21]=tx;params[22]=-ty;params[23]=ty;
+                    params[24]=std::tan(warpView->fov.angleLeft);params[25]=std::tan(warpView->fov.angleRight);
+                    params[26]=std::tan(warpView->fov.angleDown);params[27]=std::tan(warpView->fov.angleUp);
+                    params[28]=1;
+                }
+            }
+            m_Vk.vkCmdPushConstants(m_CommandBuffer,m_BlitPipelineLayout,
+                VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof(params),params);
 
             m_Vk.vkCmdDraw(m_CommandBuffer, 3, 1, 0, 0);
             m_Vk.vkCmdEndRenderPass(m_CommandBuffer);
@@ -8538,8 +8793,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 m_Log.Print("vkWaitForFences failed: %s (%d)", VkResultName(vkResult), static_cast<int>(vkResult));
                 return false;
             }
-            if (m_Vk.vkResetFences)
-                m_Vk.vkResetFences(m_VkDevice, 1, &m_BlitFence);
+            if (m_Vk.vkResetFences && m_Vk.vkResetFences(m_VkDevice, 1, &m_BlitFence)!=VK_SUCCESS) return false;
             m_BlitFenceOutstanding = false;
             if (m_BlitFenceFrameId != 0)
             {
@@ -8568,6 +8822,365 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             }
             m_BlitFenceOutstanding = true;
             m_BlitFenceFrameId = consumedFrameId;
+            return true;
+        }
+
+        bool SharedGpuDiagnosticsEnabled() const
+        {
+            static const bool enabled = [] {
+                char value[8]{};
+                return GetEnvironmentVariableA("BMVR_SHARED_GPU_DIAG", value, sizeof(value)) == 1 && value[0] == '1';
+            }();
+            return enabled;
+        }
+
+        void ReportSharedGpuCpuSnapshot(const SharedGpuCpuSnapshot& snapshot)
+        {
+            // Called only for a fresh copied pair with dedicated diagnostics on.
+            // Its two QPC samples are already captured around the CPU memcpy pair.
+            static const int64_t frequency = [] {
+                LARGE_INTEGER value{};
+                return QueryPerformanceFrequency(&value) ? value.QuadPart : int64_t(0);
+            }();
+            if (frequency <= 0 || snapshot.cpuSnapshotEndQpc <= 0)
+                return;
+            static int64_t lastReportQpc = 0;
+            static uint32_t snapshots = 0, ageSamples = 0;
+            static uint64_t bytes = 0;
+            static double sumCopyMs = 0, maxCopyMs = 0, sumAgeMs = 0, maxAgeMs = 0;
+            if (!lastReportQpc)
+                lastReportQpc = snapshot.cpuSnapshotEndQpc;
+            const double copyMs = 1000.0 * double(snapshot.cpuSnapshotEndQpc - snapshot.cpuSnapshotStartQpc) / double(frequency);
+            ++snapshots;
+            bytes += static_cast<uint64_t>(m_CpuPixels.size());
+            sumCopyMs += copyMs;
+            maxCopyMs = std::max(maxCopyMs, copyMs);
+            if (snapshot.captureQpc > 0 && snapshot.cpuSnapshotEndQpc >= snapshot.captureQpc)
+            {
+                const double ageMs = 1000.0 * double(snapshot.cpuSnapshotEndQpc - snapshot.captureQpc) / double(frequency);
+                ++ageSamples;
+                sumAgeMs += ageMs;
+                maxAgeMs = std::max(maxAgeMs, ageMs);
+            }
+            if (double(snapshot.cpuSnapshotEndQpc - lastReportQpc) / double(frequency) >= 5.0)
+            {
+                m_Log.Print("[BMVR sharedGPU v50] snapshots=%u frame=%u bytes=%llu snapshotCpu avg=%.3fms max=%.3fms captureAge avg=%.3fms max=%.3fms ageSamples=%u",
+                    snapshots, snapshot.frame, static_cast<unsigned long long>(bytes),
+                    sumCopyMs / snapshots, maxCopyMs, ageSamples ? sumAgeMs / ageSamples : 0.0, maxAgeMs, ageSamples);
+                lastReportQpc = snapshot.cpuSnapshotEndQpc;
+                snapshots = ageSamples = 0;
+                bytes = 0;
+                sumCopyMs = maxCopyMs = sumAgeMs = maxAgeMs = 0;
+            }
+        }
+
+        bool ImportSharedGameTexturesForFrame(bool& sharedTexturesReady)
+        {
+            if (ImportSharedGameTexturesIfNeeded())
+                return true;
+            if (!m_SharedGpuAwaitingFirstPair)
+                return false; // Invalid/new or legacy imports retain fatal policy.
+            // A valid new mapping can temporarily have only GpuWriting slots.
+            // Complete this XR frame normally, without a projection layer.
+            sharedTexturesReady = false;
+            return true;
+        }
+
+        bool ReadSharedGpuCpuPair(const L4D2VROpenXrSharedTextureDesc (&eyes)[2], uint32_t generation)
+        {
+            m_SharedGpuAwaitingFirstPair = false;
+            const auto haveStableSnapshot = [&]() {
+                return m_CpuWidth && m_CpuHeight && !m_CpuPixels.empty();
+            };
+            const auto& left = eyes[L4D2VR_OPENXR_EYE_LEFT];
+            const auto& right = eyes[L4D2VR_OPENXR_EYE_RIGHT];
+            if (!generation || (generation & 1u) || !m_CpuParentPid || !left.valid || !right.valid
+                || left.handleType != bmvr_shared_gpu::HandleType || right.handleType != bmvr_shared_gpu::HandleType
+                || left.kmtHandle != m_CpuParentPid || right.kmtHandle != m_CpuParentPid
+                || !left.image || left.image != right.image || left.width != right.width || left.height != right.height
+                || left.format != right.format)
+                return haveStableSnapshot();
+            bool changed = false;
+            if (!m_SharedGpuReader.Open(m_CpuParentPid, left.image, left.width, left.height, changed))
+                return haveStableSnapshot();
+            const bool sameSnapshotIdentity = m_SharedGpuSnapshotValid
+                && m_SharedGpuSnapshotNonce == left.image
+                && m_CpuWidth == left.width && m_CpuHeight == left.height;
+            SharedGpuCpuSnapshot snapshot{};
+            const bool diagnostics = SharedGpuDiagnosticsEnabled();
+            const auto result = m_SharedGpuReader.Read(m_CpuPixels,
+                sameSnapshotIdentity ? m_CpuSnapshotFrame : 0, snapshot, diagnostics);
+            if (result == SharedGpuCpuReadResult::Invalid)
+                return haveStableSnapshot();
+            if (result == SharedGpuCpuReadResult::Copied)
+            {
+                // Keep the previous coherent snapshot through allocation/mode
+                // changes. Only a complete new pair can replace it or reset the
+                // upload frame tags (new nonces can restart frame numbering).
+                if (!sameSnapshotIdentity)
+                    m_CpuUploads[0].frame = m_CpuUploads[1].frame = 0;
+                    m_Fsr.InvalidateFrameCache();
+                m_CpuWidth = snapshot.width;
+                m_CpuHeight = snapshot.height;
+                m_CpuSnapshotFrame = snapshot.frame;
+                m_CpuSnapshotPose = snapshot.pose;
+                m_CpuCaptureQpc = snapshot.captureQpc;
+                m_SharedGpuFovX = snapshot.fovX;
+                m_SharedGpuAspect = snapshot.aspect;
+                m_SharedGpuSnapshotValid = true;
+                m_SharedGpuSnapshotNonce = left.image;
+                if (diagnostics)
+                    ReportSharedGpuCpuSnapshot(snapshot);
+            }
+            else
+            {
+                m_SharedGpuAwaitingFirstPair = !haveStableSnapshot();
+                return haveStableSnapshot();
+            }
+            for (uint32_t eye = 0; eye < 2; ++eye)
+            {
+                auto desc = eyes[eye];
+                // Pose and render FOV belong to the pinned pixel pair, not a
+                // newer descriptor. Normalization and warp math remain shared.
+                desc.renderFovXDeg = m_SharedGpuFovX;
+                desc.renderAspect = m_SharedGpuAspect;
+                m_GameEyes[eye].width = m_CpuWidth;
+                m_GameEyes[eye].height = m_CpuHeight;
+                ApplyGameEyeSourceBounds(m_GameEyes[eye], desc, generation);
+            }
+            return true;
+        }
+
+        bool ReadCpuPair()
+        {
+            LARGE_INTEGER copyStart{}; QueryPerformanceCounter(&copyStart);
+            if (!m_CpuMapping.Open(m_CpuParentPid, false)) return false;
+            if (!m_CpuMapping.Lock(0)) return !m_CpuPixels.empty();
+            const auto* p = m_CpuMapping.data;
+            const bool valid = p->magic == BMVR_CPU_MAGIC && p->version == BMVR_CPU_VERSION &&
+                p->width && p->height && p->width <= BMVR_CPU_MAX_DIM && p->height <= BMVR_CPU_MAX_DIM;
+            if (valid && p->frame == m_CpuSnapshotFrame && p->width == m_CpuWidth && p->height == m_CpuHeight
+                && !m_CpuPixels.empty()) {
+                m_CpuMapping.Unlock();
+                return true; // Do not copy unchanged pixels at compositor frequency.
+            }
+            if (valid) {
+                m_CpuSnapshotFrame = p->frame;
+                m_CpuSnapshotPose = p->pose;
+                m_CpuCaptureQpc = p->captureQpc;
+                LARGE_INTEGER now{},frequency{};QueryPerformanceCounter(&now);QueryPerformanceFrequency(&frequency);
+                static double sumAge=0,maxAge=0;static unsigned samples=0;static ULONGLONG report=0;
+                if(frequency.QuadPart>0 && m_CpuCaptureQpc>0) {
+                    const double age=1000.0*double(now.QuadPart-m_CpuCaptureQpc)/double(frequency.QuadPart);
+                    sumAge+=age;maxAge=std::max(maxAge,age);++samples;
+                }
+                if(samples && GetTickCount64()-report>=5000) {
+                    m_Log.Print("[BMVR CPU v3] readback-to-helper age avg=%.2fms max=%.2fms n=%u frame=%u",
+                        sumAge/samples,maxAge,samples,p->frame);
+                    sumAge=maxAge=0;samples=0;report=GetTickCount64();
+                }
+                m_CpuWidth = p->width; m_CpuHeight = p->height;
+                const size_t bytes = size_t(m_CpuWidth) * m_CpuHeight * 4;
+                m_CpuPixels.resize(bytes * 2);
+                std::memcpy(m_CpuPixels.data(), p->pixels, bytes);
+                std::memcpy(m_CpuPixels.data() + bytes, p->pixels + BMVR_CPU_EYE_BYTES, bytes);
+            }
+            m_CpuMapping.Unlock();
+            if (valid) {
+                LARGE_INTEGER end{},frequency{};QueryPerformanceCounter(&end);QueryPerformanceFrequency(&frequency);
+                static double sum=0,maximum=0;static unsigned count=0;static ULONGLONG report=0;
+                if (frequency.QuadPart>0) {
+                    const double ms=1000.0*double(end.QuadPart-copyStart.QuadPart)/frequency.QuadPart;
+                    sum+=ms;maximum=std::max(maximum,ms);++count;
+                    if (GetTickCount64()-report>=5000) {
+                        m_Log.Print("[BMVR perf v33] shared-pair snapshot avg=%.3fms max=%.3fms n=%u bytes=%zu",sum/count,maximum,count,m_CpuPixels.size());
+                        sum=maximum=0;count=0;report=GetTickCount64();
+                    }
+                }
+            }
+            return valid;
+        }
+
+        void DestroyCpuUploads()
+        {
+            if (!m_VkDevice) return;
+            for (auto& upload : m_CpuUploads) {
+                if (upload.buffer) m_Vk.vkDestroyBuffer(m_VkDevice, upload.buffer, nullptr);
+                if (upload.mapped && upload.memory) m_Vk.vkUnmapMemory(m_VkDevice, upload.memory);
+            if (upload.memory) m_Vk.vkFreeMemory(m_VkDevice, upload.memory, nullptr);
+                if (upload.fsrView) m_Vk.vkDestroyImageView(m_VkDevice, upload.fsrView, nullptr);
+                if (upload.view) m_Vk.vkDestroyImageView(m_VkDevice, upload.view, nullptr);
+                if (upload.image) m_Vk.vkDestroyImage(m_VkDevice, upload.image, nullptr);
+                if (upload.imageMemory) m_Vk.vkFreeMemory(m_VkDevice, upload.imageMemory, nullptr);
+                upload = {};
+            }
+        }
+
+        bool CmdUploadCpuEye(uint32_t eyeIndex, VulkanEyeSwapchain& eye, uint32_t imageIndex, VkImage dst,
+            uint32_t width=0, uint32_t height=0, const std::vector<uint8_t>* pixels=nullptr)
+        {
+            const bool projection=pixels==nullptr;
+            if(projection) { width=m_CpuWidth;height=m_CpuHeight;pixels=&m_CpuPixels; }
+            auto& upload = m_CpuUploads[eyeIndex];
+            const VkDeviceSize bytes = VkDeviceSize(width) * height * 4;
+            if (!width || !height || pixels->empty()) return false;
+            const bool bgra = eye.format == VK_FORMAT_B8G8R8A8_UNORM || eye.format == VK_FORMAT_B8G8R8A8_SRGB;
+            const bool rgba = eye.format == VK_FORMAT_R8G8B8A8_UNORM || eye.format == VK_FORMAT_R8G8B8A8_SRGB;
+            if (!bgra && !rgba) { m_Log.Print("[BMVR CPU] unsupported swapchain format=%u", eye.format); return false; }
+            const VkFormat sourceFormat = (eye.format == VK_FORMAT_B8G8R8A8_SRGB || eye.format == VK_FORMAT_R8G8B8A8_SRGB)
+                ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM;
+            if (upload.size != bytes || upload.width != width || upload.height != height || upload.format != sourceFormat) {
+                if (upload.buffer) m_Vk.vkDestroyBuffer(m_VkDevice, upload.buffer, nullptr);
+                if (upload.mapped && upload.memory) m_Vk.vkUnmapMemory(m_VkDevice, upload.memory);
+            if (upload.memory) m_Vk.vkFreeMemory(m_VkDevice, upload.memory, nullptr);
+                if (upload.fsrView) m_Vk.vkDestroyImageView(m_VkDevice, upload.fsrView, nullptr);
+                if (upload.view) m_Vk.vkDestroyImageView(m_VkDevice, upload.view, nullptr);
+                if (upload.image) m_Vk.vkDestroyImage(m_VkDevice, upload.image, nullptr);
+                if (upload.imageMemory) m_Vk.vkFreeMemory(m_VkDevice, upload.imageMemory, nullptr);
+                upload = {};
+                VkBufferCreateInfo info{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+                info.size = bytes; info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+                info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+                if (m_Vk.vkCreateBuffer(m_VkDevice, &info, nullptr, &upload.buffer) != VK_SUCCESS) return false;
+                VkMemoryRequirements req{};
+                m_Vk.vkGetBufferMemoryRequirements(m_VkDevice, upload.buffer, &req);
+                uint32_t type = UINT32_MAX;
+                const VkMemoryPropertyFlags flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+                for (uint32_t i = 0; i < m_MemoryProperties.memoryTypeCount; ++i)
+                    if ((req.memoryTypeBits & (1u << i)) &&
+                        (m_MemoryProperties.memoryTypes[i].propertyFlags & flags) == flags) { type = i; break; }
+                if (type == UINT32_MAX) return false;
+                VkMemoryAllocateInfo alloc{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+                alloc.allocationSize = req.size; alloc.memoryTypeIndex = type;
+                if (m_Vk.vkAllocateMemory(m_VkDevice, &alloc, nullptr, &upload.memory) != VK_SUCCESS ||
+                    m_Vk.vkBindBufferMemory(m_VkDevice, upload.buffer, upload.memory, 0) != VK_SUCCESS) return false;
+                VkImageCreateInfo imageInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+                // FSR reads encoded values through a compatible UNORM view; the
+                // existing warp still uses its original sRGB view when applicable.
+                imageInfo.flags = m_FsrEnabled && projection ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+                imageInfo.imageType = VK_IMAGE_TYPE_2D; imageInfo.format = sourceFormat;
+                imageInfo.extent = { width, height, 1 };
+                imageInfo.mipLevels = 1; imageInfo.arrayLayers = 1; imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+                imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+                imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+                if (m_Vk.vkCreateImage(m_VkDevice, &imageInfo, nullptr, &upload.image) != VK_SUCCESS) return false;
+                m_Vk.vkGetImageMemoryRequirements(m_VkDevice, upload.image, &req);
+                if (!FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, type)) return false;
+                alloc.allocationSize = req.size; alloc.memoryTypeIndex = type;
+                if (m_Vk.vkAllocateMemory(m_VkDevice, &alloc, nullptr, &upload.imageMemory) != VK_SUCCESS ||
+                    m_Vk.vkBindImageMemory(m_VkDevice, upload.image, upload.imageMemory, 0) != VK_SUCCESS) return false;
+                upload.size = bytes; upload.width = width; upload.height = height; upload.format = sourceFormat;
+            }
+            if(!projection || upload.frame!=m_CpuSnapshotFrame || upload.layout==VK_IMAGE_LAYOUT_UNDEFINED) {
+            // HOST_COHERENT memory is mapped once, reused only after pair completion.
+            if (!upload.mapped && m_Vk.vkMapMemory(m_VkDevice, upload.memory, 0, VK_WHOLE_SIZE, 0, &upload.mapped) != VK_SUCCESS) return false;
+            auto* out = static_cast<uint8_t*>(upload.mapped);
+            const uint8_t* src = pixels->data() + (projection ? size_t(eyeIndex)*width*height*4 : 0);
+            std::memcpy(out, src, size_t(bytes)); // GPU handles scaling and any channel conversion.
+            VkBufferMemoryBarrier host{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+            host.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT; host.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            host.srcQueueFamilyIndex = host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            host.buffer = upload.buffer; host.size = bytes;
+            m_Vk.vkCmdPipelineBarrier(m_CommandBuffer, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 0, nullptr, 1, &host, 0, nullptr);
+            CmdTransitionImage(upload.image, upload.layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                upload.layout == VK_IMAGE_LAYOUT_UNDEFINED ? 0 : (VK_ACCESS_TRANSFER_READ_BIT|VK_ACCESS_SHADER_READ_BIT),
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            VkBufferImageCopy copy{};
+            copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            copy.imageSubresource.layerCount = 1;
+            copy.imageExtent = { width, height, 1 };
+            m_Vk.vkCmdCopyBufferToImage(m_CommandBuffer, upload.buffer, upload.image,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+            CmdTransitionImage(upload.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            upload.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                upload.frame=m_CpuSnapshotFrame;
+            }
+            if(m_FsrEnabled && projection && !(m_CpuSnapshotPose.reserved1 & L4D2VR_OPENXR_POSE_FLAG_MONO) && !m_CpuWarpReady) {
+                m_Log.Print("[BMVR FSR experimental] CPU projection warp unavailable; refusing partial FSR path");
+                return false;
+            }
+            if(projection && m_CpuWarpReady && !(m_CpuSnapshotPose.reserved1 & L4D2VR_OPENXR_POSE_FLAG_MONO)) {
+                if(!upload.view) {
+                    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+                    vi.image=upload.image;vi.viewType=VK_IMAGE_VIEW_TYPE_2D;vi.format=upload.format;
+                    vi.subresourceRange.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;vi.subresourceRange.levelCount=vi.subresourceRange.layerCount=1;
+                    if(m_Vk.vkCreateImageView(m_VkDevice,&vi,nullptr,&upload.view)!=VK_SUCCESS) return false;
+                }
+                CmdTransitionImage(upload.image,upload.layout,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_ACCESS_TRANSFER_READ_BIT|VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT|(m_FsrEnabled?VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT:0));
+                upload.layout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                auto source=m_GameEyes[eyeIndex];source.image=upload.image;source.view=upload.view;source.layout=upload.layout;
+                source.uMin=source.vMin=0;source.uMax=source.vMax=1;
+                if(m_FsrEnabled) {
+                    const uint32_t outW=(std::max)(m_Eyes[0].width,m_Eyes[1].width);
+                    const uint32_t outH=(std::max)(m_Eyes[0].height,m_Eyes[1].height);
+                    const bool srgb=sourceFormat==VK_FORMAT_B8G8R8A8_SRGB;
+                    if(!m_Fsr.Prepare(m_Vk,m_VkDevice,m_PhysicalDevice,m_VkInstance,m_GraphicsQueueFamily,
+                        m_MemoryProperties,width,height,outW,outH,srgb)) {
+                        m_Log.Print("[BMVR FSR experimental] unsupported capability or resize (%ux%u -> %ux%u); restart required",width,height,outW,outH);
+                        return false;
+                    }
+                    if (!upload.fsrView) {
+                        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+                        vi.image=upload.image;vi.viewType=VK_IMAGE_VIEW_TYPE_2D;vi.format=VK_FORMAT_B8G8R8A8_UNORM;
+                        vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+                        if (m_Vk.vkCreateImageView(m_VkDevice,&vi,nullptr,&upload.fsrView)!=VK_SUCCESS) return false;
+                    }
+                    source.view=m_Fsr.Record(m_CommandBuffer,eyeIndex,upload.fsrView,m_CpuSnapshotFrame);
+                    if(!source.view)return false;
+                    source.image=m_Fsr.OutputImage(eyeIndex);source.width=outW;source.height=outH;
+                    source.format=srgb?VK_FORMAT_R8G8B8A8_SRGB:VK_FORMAT_R8G8B8A8_UNORM;
+                    static unsigned fsrLogBudget=2;
+                    if(fsrLogBudget){--fsrLogBudget;m_Log.Print("[BMVR FSR experimental] eye=%u EASU+RCAS %ux%u -> %ux%u srgb=%u",eyeIndex,width,height,outW,outH,srgb?1u:0u);}
+                }
+                if(!UpdateBlitDescriptorSet(m_BlitDescriptorSets[eyeIndex],source)) return false;
+                CmdTransitionImage(dst,eye.layouts[imageIndex],VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    0,VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+                if(!CmdRenderShaderBlitWithDescriptor(eye,imageIndex,source,m_BlitDescriptorSets[eyeIndex],false,false,&m_CpuCurrentViews[eyeIndex])) return false;
+                eye.layouts[imageIndex]=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                return true;
+            }
+            float u0 = 0.f, v0 = 0.f, u1 = 1.f, v1 = 1.f;
+            L4D2VROpenXrPoseDesc pose{};
+            const bool mono = m_CpuTransport
+                ? (m_CpuSnapshotPose.reserved1 & L4D2VR_OPENXR_POSE_FLAG_MONO)!=0
+                : m_Bridge.ReadGameRenderPose(pose) && (pose.reserved1 & L4D2VR_OPENXR_POSE_FLAG_MONO);
+            if (projection && !mono && m_UseRuntimeProjectionFov && m_HaveLocatedFov) {
+                const auto& fov = m_LocatedFov[eyeIndex];
+                const auto& source = m_GameEyes[eyeIndex];
+                const float tx = std::tan(source.renderFovXDeg * 3.14159265358979323846f / 360.f);
+                const float ty = tx / source.renderAspect;
+                if (!(tx > 0.001f && ty > 0.001f)) return false;
+                u0 = std::clamp(0.5f + 0.5f * std::tan(fov.angleLeft) / tx, 0.f, 1.f);
+                u1 = std::clamp(0.5f + 0.5f * std::tan(fov.angleRight) / tx, 0.f, 1.f);
+                v0 = std::clamp(0.5f - 0.5f * std::tan(fov.angleUp) / ty, 0.f, 1.f);
+                v1 = std::clamp(0.5f - 0.5f * std::tan(fov.angleDown) / ty, 0.f, 1.f);
+                if (!(u1 > u0 && v1 > v0)) return false;
+                static unsigned cropBudget = 2;
+                if (cropBudget) { --cropBudget; m_Log.Print("[BMVR CPU] asymmetric crop eye=%u uv=(%.4f %.4f %.4f %.4f) sourceFov=%.2f aspect=%.4f",
+                    eyeIndex, u0, v0, u1, v1, source.renderFovXDeg, source.renderAspect); }
+            }
+            CmdTransitionImage(dst, eye.layouts[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            VkImageBlit blit{};
+            blit.srcSubresource.aspectMask = blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            blit.srcSubresource.layerCount = blit.dstSubresource.layerCount = 1;
+            blit.srcOffsets[0] = { int32_t(u0 * width), int32_t(v0 * height), 0 };
+            blit.srcOffsets[1] = { int32_t(u1 * width), int32_t(v1 * height), 1 };
+            blit.dstOffsets[1] = { int32_t(eye.width), int32_t(eye.height), 1 };
+            m_Vk.vkCmdBlitImage(m_CommandBuffer, upload.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+            CmdTransitionImage(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+            eye.layouts[imageIndex] = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            static uint32_t budget = 2;
+            if (budget) { --budget; m_Log.Print("[BMVR CPU] uploaded eye=%u BGRA8 %ux%u -> %ux%u format=%u",
+                eyeIndex, width, height, eye.width, eye.height, eye.format); }
             return true;
         }
 
@@ -8600,7 +9213,10 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
             VulkanImageDumpTarget sourceDump;
             VulkanImageDumpTarget swapchainDump;
-            if (m_Bridge.HasState())
+            if (m_CpuTransport && m_Bridge.HasState()) {
+                if (!CmdUploadCpuEye(eyeIndex, eye, imageIndex, dstImage)) return false;
+            }
+            else if (m_Bridge.HasState())
             {
                 const VulkanGameEyeTexture& source = m_GameEyes[eyeIndex];
                 if (source.image == VK_NULL_HANDLE)
@@ -8824,7 +9440,9 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
             submitInfo.commandBufferCount = 1;
             submitInfo.pCommandBuffers = &m_CommandBuffer;
-            vkResult = m_Vk.vkQueueSubmit(m_GraphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+            const VkFence pairFence = m_CpuTransport && eyeIndex == 1 ? m_BlitFence : VK_NULL_HANDLE;
+            vkResult = m_Vk.vkQueueSubmit(m_GraphicsQueue, 1, &submitInfo, pairFence);
+            if (vkResult == VK_SUCCESS && pairFence != VK_NULL_HANDLE) m_BlitFenceOutstanding = true;
             if (vkResult != VK_SUCCESS)
             {
                 DestroyImageDumpTarget(sourceDump);
@@ -8989,7 +9607,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                     RefreshVisibilityMask();
                     m_VisibilityMaskDirty = false;
                 }
-                const bool sharedTexturesReady = !requireSharedTextures || m_Bridge.SharedTexturesReady();
+                bool sharedTexturesReady = !requireSharedTextures || m_Bridge.SharedTexturesReady();
                 if (requireSharedTextures && !sharedTexturesReady)
                 {
                     const ULONGLONG now = GetTickCount64();
@@ -9021,7 +9639,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                             right.width, right.height, right.format, right.handleType, right.queueFamilyIndex);
                         lastLoggedSharedTextureGeneration = sharedTextureLayout;
                     }
-                    if (requireSharedTextures && !ImportSharedGameTexturesIfNeeded())
+                    if (requireSharedTextures && !ImportSharedGameTexturesForFrame(sharedTexturesReady))
                         return 28;
                 }
 
@@ -9057,6 +9675,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 m_InputBridge.UpdateFrame(frameState.predictedDisplayTime, m_Bridge, m_Log);
                 RefreshFlipSubmitY();
 
+                const bool loading = m_Bridge.Loading();
                 bool layerReady = false;
                 bool poseMono2d = false;
                 bool addedMono2dQuad = false;
@@ -9089,6 +9708,11 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                         locatedCount,
                         viewState.viewStateFlags,
                         frameState.predictedDisplayTime));
+                    if(m_MenuSpaceChangeTime && frameState.predictedDisplayTime>=m_MenuSpaceChangeTime) {
+                        m_Bridge.NotifyReferenceSpaceChange();
+                        m_MenuSpaceChangeTime=0;
+                        for(auto& lock:m_OverlaySpatialLocks) lock.valid=false;
+                    }
                     // Do not Sleep for a game frame here. Waiting ~8ms past
                     // xrWaitFrame made xrEndFrame late, and displayTime matching
                     // then flipped submit poses between game-render and located
@@ -9110,10 +9734,14 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                         }
                         m_Bridge.PublishRuntimeViewConfig(runtimeViewConfig);
                     }
+                    m_CpuWarpReady=m_CpuTransport && locatedCount>=2 &&
+                        (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)!=0;
+                    if(m_CpuWarpReady) {m_CpuCurrentViews[0]=locatedViews[0];m_CpuCurrentViews[1]=locatedViews[1];}
                     L4D2VROpenXrPoseDesc gameRenderPose{};
                     uint32_t gameRenderPoseGeneration = 0;
-                    const bool readGameRenderPose =
-                        m_Bridge.ReadGameRenderPose(gameRenderPose, &gameRenderPoseGeneration);
+                    bool readGameRenderPose = m_CpuTransport
+                        ? (gameRenderPose=m_CpuSnapshotPose, gameRenderPoseGeneration=m_CpuSnapshotFrame, gameRenderPose.valid!=0)
+                        : m_Bridge.ReadGameRenderPose(gameRenderPose, &gameRenderPoseGeneration);
                     if ((viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0 && locatedCount >= 2)
                     {
                         const bool haveNewResolvedSharedFrame =
@@ -9121,7 +9749,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                             (sharedTextureFrameReady &&
                                 sharedTextureFrameGeneration != lastSubmittedSharedTextureFrameGeneration);
 
-                        if (sharedTexturesReady && haveNewResolvedSharedFrame)
+                        if (sharedTexturesReady && (haveNewResolvedSharedFrame || m_CpuWarpReady))
                         {
                             // Re-read the eye descriptors here, not only before
                             // xrWaitFrame. That earlier snapshot is up to a whole
@@ -9130,25 +9758,50 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                             // already-superseded slot and the image drags behind the
                             // head (2026-08-31). Both eyes still resolve to the same
                             // published slot, so they stay the same game frame.
-                            if (requireSharedTextures && !ImportSharedGameTexturesIfNeeded())
+                            if (requireSharedTextures && !ImportSharedGameTexturesForFrame(sharedTexturesReady))
                                 return 28;
-                            m_Bridge.NoteConsumingFrame(sharedTextureFrameId);
-                            for (uint32_t eye = 0; eye < 2; ++eye)
+                            if (sharedTexturesReady)
                             {
-                                if (!RenderEye(eye, submittedFrames, sharedTextureFrameId))
-                                    return 25;
-                            }
-                            m_Bridge.NoteConsumedFrame(sharedTextureFrameId);
+                                if(m_CpuTransport) { gameRenderPose=m_CpuSnapshotPose; gameRenderPoseGeneration=m_CpuSnapshotFrame; readGameRenderPose=gameRenderPose.valid!=0; }
+                                m_Bridge.NoteConsumingFrame(sharedTextureFrameId);
+                                LARGE_INTEGER pairStart{},pairEnd{},pairFrequency{};
+                                QueryPerformanceCounter(&pairStart);
+                                // CPU bridge has distinct command buffers, descriptors and
+                                // upload buffers for each eye. Submit both before draining
+                                // the queue once; complete before any resources are reused.
+                                for (uint32_t eye = 0; eye < 2; ++eye)
+                                {
+                                    if (!RenderEye(eye, submittedFrames, sharedTextureFrameId,!m_CpuTransport))
+                                        return 25;
+                                }
+                                if (m_CpuTransport) {
+                                    // Pair fence protects reuse; fallback retains old full wait.
+                                    if (m_BlitFence != VK_NULL_HANDLE) {
+                                        if (!PollBlitFence(UINT64_MAX)) return 25;
+                                    } else if (m_Vk.vkQueueWaitIdle(m_GraphicsQueue)!=VK_SUCCESS) return 25;
+                                }
+                                QueryPerformanceCounter(&pairEnd);QueryPerformanceFrequency(&pairFrequency);
+                                if(m_CpuTransport && pairFrequency.QuadPart>0) {
+                                    static double sum=0,maximum=0;static unsigned count=0;static ULONGLONG report=0;
+                                    const double ms=1000.0*double(pairEnd.QuadPart-pairStart.QuadPart)/pairFrequency.QuadPart;
+                                    sum+=ms;maximum=std::max(maximum,ms);++count;
+                                    if(GetTickCount64()-report>=5000) {
+                                        m_Log.Print("[BMVR pair v12] submit+upload+warp+wait avg=%.2fms max=%.2fms n=%u waitsPerPair=1 completion=fence-if-available persistentUploadMap=1",sum/count,maximum,count);
+                                        sum=maximum=0;count=0;report=GetTickCount64();
+                                    }
+                                }
+                                m_Bridge.NoteConsumedFrame(sharedTextureFrameId);
 
-                            eyeSwapchainsHaveContent = true;
-                            if (requireSharedTextures)
-                                lastSubmittedSharedTextureFrameGeneration = sharedTextureFrameGeneration;
-                            // Latch pose with the image we just copied. Do not
-                            // pick up a newer game pose on compositor re-submits.
-                            if (readGameRenderPose && gameRenderPose.valid)
-                            {
-                                lastGameRenderPose = gameRenderPose;
-                                lastGameRenderPoseGeneration = gameRenderPoseGeneration;
+                                eyeSwapchainsHaveContent = true;
+                                if (requireSharedTextures)
+                                    lastSubmittedSharedTextureFrameGeneration = sharedTextureFrameGeneration;
+                                // Latch pose with the image we just copied. Do not
+                                // pick up a newer game pose on compositor re-submits.
+                                if (readGameRenderPose && gameRenderPose.valid)
+                                {
+                                    lastGameRenderPose = gameRenderPose;
+                                    lastGameRenderPoseGeneration = gameRenderPoseGeneration;
+                                }
                             }
                         }
 
@@ -9197,6 +9850,12 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                                     locatedViews[projectionViewEye].fov,
                                     projectionViewEye,
                                     options.useSymmetricProjectionFov);
+                                if(m_CpuWarpReady && !poseMono2d) {
+                                    // Pixels were rotated from the image pose into this orientation.
+                                    // Keep render position: this warp is rotational, not positional.
+                                    projectionViews[eye].pose.orientation=locatedViews[projectionViewEye].pose.orientation;
+                                    projectionViews[eye].fov=locatedViews[projectionViewEye].fov;
+                                }
                                 if (options.mirrorProjectionHorizontal)
                                     projectionViews[eye].fov = MirrorProjectionFovHorizontal(projectionViews[eye].fov);
                                 projectionViews[eye].subImage.swapchain = m_Eyes[imageEye].handle;
@@ -9370,8 +10029,8 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                             // Matching pose+FOV on a stereo projection layer still
                             // diploped on Oculus 1.207 (Horizon Link, 2026-09-03).
                             // Submit that frame as one both-eyes quad instead.
-                            poseMono2d = haveGameRenderPose &&
-                                (projectionRenderPose.reserved1 & L4D2VR_OPENXR_POSE_FLAG_MONO) != 0;
+                            poseMono2d = loading || (haveGameRenderPose &&
+                                (projectionRenderPose.reserved1 & L4D2VR_OPENXR_POSE_FLAG_MONO) != 0);
                             if (options.swapProjectionViewOrder)
                             {
                                 std::swap(projectionViews[0], projectionViews[1]);
@@ -9387,7 +10046,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                         }
 
                         bool blittedAnyOverlayFrame = false;
-                        if (options.disableQuadOverlays)
+                        if (options.disableQuadOverlays || loading)
                         {
                             static ULONGLONG s_lastOverlayDisabledLogMs = 0;
                             const ULONGLONG nowMs = GetTickCount64();
@@ -9612,19 +10271,24 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                             // ~43° and 1.15m (too far vs the old projection).
                             // Crop to that letterbox and sit it ~arm's length
                             // at ~78° so it reads like MenuPanelScale=0.70.
-                            constexpr float kMenuQuadDistanceM = 0.65f;
-                            constexpr float kMenuQuadWidthM = 1.05f;
-                            constexpr float kMenuQuadContentScale = 0.70f;
+                            constexpr float kMenuQuadDistanceM = 1.30f;
+                            constexpr float kMenuQuadWidthM = 2.10f;
+                            L4D2VROpenXrMenuPointerDesc pointer{};
+                            L4D2VROpenXrInputStateDesc pointerInput{};
+                            m_Bridge.ReadMenuVisualState(pointer,pointerInput);
+                            const uint32_t sourceW=pointer.captureWidth>=64?pointer.captureWidth:16u;
+                            const uint32_t sourceH=pointer.captureHeight>=64?pointer.captureHeight:9u;
+                            const float kMenuQuadContentScale=pointer.contentScale>0.2f && pointer.contentScale<=1.f?pointer.contentScale:0.70f;
                             L4D2VROpenXrOverlayDesc menu{};
                             menu.distanceMeters = kMenuQuadDistanceM;
                             menu.widthMeters = kMenuQuadWidthM;
-                            menu.heightMeters = menu.widthMeters * 9.0f / 16.0f;
+                            menu.heightMeters = menu.widthMeters * float(sourceH) / float(sourceW);
                             menu.offsetMeters[1] = -0.02f;
 
                             XrPosef menuCenter{};
                             menuCenter.orientation = XrQuaternionf{ 0.0f, 0.0f, 0.0f, 1.0f };
-                            const bool haveMenuCenter = lastGameRenderPose.valid != 0;
-                            if (haveMenuCenter)
+                            const bool haveMenuCenter = lastGameRenderPose.valid != 0 || (pointer.active && pointer.panelValid);
+                            if (lastGameRenderPose.valid)
                             {
                                 menuCenter.orientation = NormalizeOpenXrQuaternion(lastGameRenderPose.orientation);
                                 menuCenter.position = XrVector3f{
@@ -9634,7 +10298,15 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                                 };
                             }
 
-                            XrRect2Di crop = AspectFitImageRect(m_Eyes[0].width, m_Eyes[0].height, 16u, 9u);
+                            if(pointer.active && pointer.panelValid) {
+                                menuCenter.orientation=NormalizeOpenXrQuaternion(pointer.panelAnchor.orientation);
+                                menuCenter.position={pointer.panelAnchor.position[0],pointer.panelAnchor.position[1],pointer.panelAnchor.position[2]};
+                                menu.distanceMeters=pointer.panelDistance;
+                                menu.widthMeters=pointer.panelWidth;
+                                menu.heightMeters=menu.widthMeters*float(sourceH)/float(sourceW);
+                                menu.offsetMeters[1]=pointer.panelYOffset;
+                            }
+                            XrRect2Di crop = AspectFitImageRect(m_Eyes[0].width, m_Eyes[0].height, sourceW, sourceH);
                             {
                                 const int32_t cw = std::max(1, static_cast<int32_t>(
                                     static_cast<float>(crop.extent.width) * kMenuQuadContentScale + 0.5f));
@@ -9659,6 +10331,15 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                                 locatedViews,
                                 locatedCount,
                                 haveMenuCenter ? &menuCenter : nullptr);
+                            if (loading && locatedCount >= 2)
+                            {
+                                quad.pose.orientation = locatedViews[0].pose.orientation;
+                                const auto forward = RotateOpenXrVector(quad.pose.orientation, XrVector3f{0,0,-menu.distanceMeters});
+                                quad.pose.position = {
+                                    (locatedViews[0].pose.position.x + locatedViews[1].pose.position.x)*.5f + forward.x,
+                                    (locatedViews[0].pose.position.y + locatedViews[1].pose.position.y)*.5f + forward.y,
+                                    (locatedViews[0].pose.position.z + locatedViews[1].pose.position.z)*.5f + forward.z};
+                            }
                             quad.size.width = menu.widthMeters;
                             quad.size.height = menu.heightMeters;
                             addedMono2dQuad = true;
@@ -9681,6 +10362,9 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                             lastSubmittedOverlayFrameGeneration = overlayFrameGeneration;
                     }
                 }
+
+                if (!loading && frameState.shouldRender && locatedViews.size() >= 2 && overlayLayerCount)
+                    AppendMenuVisuals(overlayLayers, overlayLayerCount, locatedViews);
 
                 XrCompositionLayerProjection layer{ XR_TYPE_COMPOSITION_LAYER_PROJECTION };
                 layer.space = m_AppSpace;
@@ -9803,11 +10487,13 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         {
             if (m_VkDevice != VK_NULL_HANDLE && m_Vk.vkDeviceWaitIdle)
                 m_Vk.vkDeviceWaitIdle(m_VkDevice);
+            m_Fsr.Shutdown();
             m_InputBridge.Shutdown();
             for (VulkanGameEyeTexture& eye : m_GameEyes)
                 DestroyImportedGameEye(eye);
             for (VulkanGameEyeTexture& overlay : m_OverlayTextures)
                 DestroyImportedGameEye(overlay);
+            DestroyOverlaySwapchain(m_MenuVisualSprite);
             for (VulkanEyeSwapchain& overlaySwapchain : m_OverlaySwapchains)
                 DestroyOverlaySwapchain(overlaySwapchain);
             for (VulkanEyeSwapchain& eye : m_Eyes)
@@ -9841,7 +10527,10 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             if (m_Session != XR_NULL_HANDLE && m_Xr.xrDestroySession)
                 m_Xr.xrDestroySession(m_Session);
             if (m_VkDevice != VK_NULL_HANDLE && m_Vk.vkDestroyDevice)
+            {
+                DestroyCpuUploads();
                 m_Vk.vkDestroyDevice(m_VkDevice, nullptr);
+            }
             if (m_VkInstance != VK_NULL_HANDLE && m_Vk.vkDestroyInstance)
                 m_Vk.vkDestroyInstance(m_VkInstance, nullptr);
             if (m_Instance != XR_NULL_HANDLE && m_Xr.xrDestroyInstance)
@@ -9868,6 +10557,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         XrEnvironmentBlendMode m_BlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
         OpenXrInputBridge m_InputBridge;
         bool m_SessionRunning = false;
+        XrTime m_MenuSpaceChangeTime = 0;
         bool m_HandTrackingExtensionEnabled = false;
         bool m_WantHandTracking = false;
         bool m_VisibilityMaskExtensionEnabled = false;
@@ -9877,6 +10567,30 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         VkInstance m_VkInstance = VK_NULL_HANDLE;
         VkPhysicalDevice m_PhysicalDevice = VK_NULL_HANDLE;
         VkDevice m_VkDevice = VK_NULL_HANDLE;
+        bool m_CpuTransport = false;
+        DWORD m_CpuParentPid = 0;
+        BMVR_CpuMapping m_CpuMapping;
+        SharedGpuCpuReader m_SharedGpuReader;
+        bool m_SharedGpuAwaitingFirstPair = false;
+        bool m_SharedGpuSnapshotValid = false;
+        uint64_t m_SharedGpuSnapshotNonce = 0;
+        float m_SharedGpuFovX = 90.f, m_SharedGpuAspect = 1.f;
+        uint32_t m_CpuWidth = 0, m_CpuHeight = 0, m_CpuSnapshotFrame = 0;
+        std::vector<uint8_t> m_CpuPixels;
+        L4D2VROpenXrPoseDesc m_CpuSnapshotPose{};
+        int64_t m_CpuCaptureQpc=0;
+        struct CpuUpload {
+            VkBuffer buffer = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE; VkDeviceSize size = 0;
+            void* mapped = nullptr;
+            VkImage image = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; VkImageView fsrView = VK_NULL_HANDLE; VkDeviceMemory imageMemory = VK_NULL_HANDLE;
+            VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED; VkFormat format = VK_FORMAT_UNDEFINED;
+            uint32_t width = 0, height = 0, frame = 0;
+        };
+        XrView m_CpuCurrentViews[2]{};
+        bool m_CpuWarpReady=false;
+        std::array<CpuUpload, 2+L4D2VR_OPENXR_OVERLAY_COUNT> m_CpuUploads{};
+        std::array<BMVR_CpuMapping,L4D2VR_OPENXR_OVERLAY_COUNT> m_CpuOverlayMappings;
+        std::array<std::vector<uint8_t>,L4D2VR_OPENXR_OVERLAY_COUNT> m_CpuOverlayPixels;
         VkQueue m_GraphicsQueue = VK_NULL_HANDLE;
         uint32_t m_GraphicsQueueFamily = UINT32_MAX;
         VkPhysicalDeviceMemoryProperties m_MemoryProperties{};
@@ -9903,6 +10617,8 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         VkDescriptorSetLayout m_BlitDescriptorSetLayout = VK_NULL_HANDLE;
         VkDescriptorPool m_BlitDescriptorPool = VK_NULL_HANDLE;
         VkPipelineLayout m_BlitPipelineLayout = VK_NULL_HANDLE;
+        bmvr_fsr::VulkanFsr<VulkanDispatch> m_Fsr;
+        bool m_FsrEnabled = []{ char v[8]{}; return GetEnvironmentVariableA("BMVR_FSR",v,sizeof(v))==1 && v[0]=='1'; }();
         VkPipeline m_BlitPipeline = VK_NULL_HANDLE;
         VkPipeline m_BlitPipelineFlipY = VK_NULL_HANDLE;
         std::array<VkDescriptorSet, kBlitDescriptorSetCount> m_BlitDescriptorSets{};

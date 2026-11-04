@@ -1,11 +1,83 @@
 #pragma once
 
 #include <cstdint>
-#include <cctype>
+#include <atomic>
 #include <cstring>
+#include <type_traits>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
+// The bridge is mapped by two processes (Win32 game and x64 helper). A local
+// mutex does not synchronize the other process. Keep the wire layout as plain
+// 32-bit words, but access sequence counters with process-shared interlocked
+// operations. Ordinary ++/loads can be merged or reordered by the compiler.
+inline uint32_t L4D2VR_OpenXrAtomicLoad(const uint32_t& word)
+{
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+#if defined(_MSC_VER)
+    return static_cast<uint32_t>(_InterlockedCompareExchange(
+        reinterpret_cast<volatile long*>(const_cast<uint32_t*>(&word)), 0, 0));
+#else
+    return __atomic_load_n(&word, __ATOMIC_SEQ_CST);
+#endif
+}
+
+inline void L4D2VR_OpenXrAtomicStore(uint32_t& word, uint32_t value)
+{
+#if defined(_MSC_VER)
+    _InterlockedExchange(reinterpret_cast<volatile long*>(&word), static_cast<long>(value));
+#else
+    __atomic_store_n(&word, value, __ATOMIC_SEQ_CST);
+#endif
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+
+inline uint32_t L4D2VR_OpenXrBeginPublish(uint32_t& sequence)
+{
+    uint32_t value = L4D2VR_OpenXrAtomicLoad(sequence);
+    // One publisher owns each counter; the game also serializes its writers.
+    // Recover an unfinished odd sequence rather than expose an even payload.
+    if (value & 1u)
+        ++value;
+    const uint32_t odd = value + 1u;
+    L4D2VR_OpenXrAtomicStore(sequence, odd);
+    return odd;
+}
+
+inline void L4D2VR_OpenXrEndPublish(uint32_t& sequence, uint32_t odd)
+{
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    L4D2VR_OpenXrAtomicStore(sequence, odd + 1u);
+}
+
+template<class T>
+inline bool L4D2VR_OpenXrReadSnapshot(const uint32_t& sequence, const T& shared,
+    T& snapshot, uint32_t* generation = nullptr, int attempts = 3)
+{
+    static_assert(std::is_trivially_copyable<T>::value, "Shared payload must be trivial");
+    for (int attempt = 0; attempt < attempts; ++attempt)
+    {
+        const uint32_t before = L4D2VR_OpenXrAtomicLoad(sequence);
+        if (!before || (before & 1u))
+            continue;
+        T candidate{};
+        std::memcpy(&candidate, &shared, sizeof(T));
+        const uint32_t after = L4D2VR_OpenXrAtomicLoad(sequence);
+        if (before == after && !(after & 1u))
+        {
+            std::memcpy(&snapshot, &candidate, sizeof(T));
+            if (generation)
+                *generation = after;
+            return true;
+        }
+    }
+    return false;
+}
+#include <cctype>
 
 constexpr uint32_t L4D2VR_OPENXR_BRIDGE_MAGIC = 0x5258344Cu; // L4XR
-constexpr uint32_t L4D2VR_OPENXR_BRIDGE_VERSION = 14;
+constexpr uint32_t L4D2VR_OPENXR_BRIDGE_VERSION = 19;
 // 13: XR_KHR_visibility_mask hidden triangle list (NDC xy per eye).
 // 14: helperConsumingFrameId / helperConsumedFrameId (helper -> game blit
 //     progress; the game reuses a publish slot only once the helper's blit
@@ -382,6 +454,22 @@ struct L4D2VROpenXrVisibilityMaskDesc
     L4D2VROpenXrVisibilityMaskEyeDesc eyes[L4D2VR_OPENXR_EYE_COUNT] = {};
 };
 
+// v15: menu input is independent of the frozen world image on pause.
+struct L4D2VROpenXrMenuPointerDesc
+{
+    uint32_t active = 0;
+    uint32_t hit = 0;
+    float u = 0.5f, v = 0.5f;
+    uint32_t rayValid = 0;
+    float rayOrigin[3] = {};
+    float rayDirection[3] = {};
+    uint32_t captureWidth=0,captureHeight=0;
+    float contentScale=0.70f;
+    uint32_t panelValid=0;
+    L4D2VROpenXrPoseDesc panelAnchor{};
+    float panelDistance=1.30f,panelWidth=2.10f,panelYOffset=-0.02f;
+};
+
 struct L4D2VROpenXrBridgeState
 {
     uint32_t magic = L4D2VR_OPENXR_BRIDGE_MAGIC;
@@ -425,4 +513,7 @@ struct L4D2VROpenXrBridgeState
     uint32_t helperConsumedFrameId = 0;
     uint32_t helperConsumedCount = 0;
     uint32_t reservedTail0 = 0;
+    uint32_t referenceSpaceEpoch = 0; // helper increments after runtime recenter takes effect
+    uint32_t menuPointerGeneration = 0;
+    L4D2VROpenXrMenuPointerDesc menuPointer = {};
 };

@@ -500,11 +500,5 @@ void VR::UpdateCrowbarMelee()
     m_PerformingMelee = true;
     PulseAimHaptic(3999);
 
-    static int s_hitLog;
-    if (s_hitLog < 16)
-    {
-        Game::logMsg("Crowbar MotionSwing hit vel=%.0f in/s origin=(%.1f,%.1f,%.1f) frac=%.2f",
-            velocityIps, m_MeleeTraceOrigin.x, m_MeleeTraceOrigin.y, m_MeleeTraceOrigin.z, tr.fraction);
-        ++s_hitLog;
-    }
+
 }

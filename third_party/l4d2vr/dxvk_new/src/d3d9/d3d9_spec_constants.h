@@ -122,10 +122,13 @@ namespace dxvk {
       if (bitCount == 32)
         return val;
 
-      return module.opBitFieldUExtract(
-        module.defIntType(32, 0), val,
-        module.consti32(bitOffset + layout.bitOffset),
-        module.consti32(bitCount));
+      // Equivalent unsigned extraction using operations that SPIRV-Tools
+      // can fold after pipeline specialization. Keeping OpBitFieldUExtract
+      // here leaves inactive color/depth sampler aliases visible to Metal.
+      uint32_t shifted = module.opShiftRightLogical(uintType, val,
+        module.constu32(bitOffset + layout.bitOffset));
+      return module.opBitwiseAnd(uintType, shifted,
+        module.constu32((uint32_t(1) << bitCount) - 1));
     }
 
   private:

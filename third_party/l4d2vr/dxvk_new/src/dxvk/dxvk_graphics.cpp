@@ -1,3 +1,4 @@
+#include "../util/util_bmvr_slow.h"
 #include <iomanip>
 
 #include "../util/util_time.h"
@@ -1220,6 +1221,9 @@ namespace dxvk {
   DxvkGraphicsPipelineInstance* DxvkGraphicsPipeline::createInstance(
     const DxvkGraphicsPipelineStateInfo& state,
           bool                           doCreateBasePipeline) {
+    static std::atomic<unsigned> slowBudget{0};
+    BmvrSlowScope slowScope("createInstance", slowBudget);
+
     VkPipeline baseHandle = VK_NULL_HANDLE;
     VkPipeline fastHandle = VK_NULL_HANDLE;
 
@@ -1390,7 +1394,8 @@ namespace dxvk {
     info.basePipelineIndex  = -1;
 
     VkPipeline pipeline = VK_NULL_HANDLE;
-    VkResult vr = vk->vkCreateGraphicsPipelines(vk->device(), VK_NULL_HANDLE, 1, &info, nullptr, &pipeline);
+    VkResult vr = vk->vkCreateGraphicsPipelines(vk->device(), m_device->bmvrPipelineCache(), 1, &info, nullptr, &pipeline);
+    if (vr == VK_SUCCESS) m_device->noteBmvrPipelineCreated();
 
     if (vr && vr != VK_PIPELINE_COMPILE_REQUIRED_EXT)
       Logger::err(str::format("DxvkGraphicsPipeline: Failed to create base pipeline: ", vr));
@@ -1401,6 +1406,9 @@ namespace dxvk {
 
   VkPipeline DxvkGraphicsPipeline::getOptimizedPipeline(
     const DxvkGraphicsPipelineStateInfo& state) {
+    static std::atomic<unsigned> slowBudget{0};
+    BmvrSlowScope slowScope("getOptimizedPipeline", slowBudget);
+
     DxvkGraphicsPipelineFastInstanceKey key(m_device,
       m_shaders, state, m_flags, m_specConstantMask);
 
@@ -1485,7 +1493,8 @@ namespace dxvk {
     }
 
     VkPipeline pipeline = VK_NULL_HANDLE;
-    VkResult vr = vk->vkCreateGraphicsPipelines(vk->device(), VK_NULL_HANDLE, 1, &info, nullptr, &pipeline);
+    VkResult vr = vk->vkCreateGraphicsPipelines(vk->device(), m_device->bmvrPipelineCache(), 1, &info, nullptr, &pipeline);
+    if (vr == VK_SUCCESS) m_device->noteBmvrPipelineCreated();
 
     if (vr != VK_SUCCESS) {
       Logger::err(str::format("DxvkGraphicsPipeline: Failed to compile pipeline: ", vr));
