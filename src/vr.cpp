@@ -31,6 +31,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <set>
 #include <new>
 #include <string>
 #include <vector>
@@ -739,6 +740,22 @@ namespace
                 std::snprintf(sb, sizeof(sb), " sc %ld,%ld-%ld,%ld", sc.left, sc.top, sc.right, sc.bottom);
                 line += sb;
             }
+            {
+                DWORD zOn = 0, zWrite = 0, stencilOn = 0;
+                device->GetRenderState(D3DRS_ZENABLE, &zOn);
+                device->GetRenderState(D3DRS_ZWRITEENABLE, &zWrite);
+                device->GetRenderState(D3DRS_STENCILENABLE, &stencilOn);
+                IDirect3DSurface9* depthSurface = nullptr;
+                D3DSURFACE_DESC depthDesc{};
+                if (SUCCEEDED(device->GetDepthStencilSurface(&depthSurface)) && depthSurface)
+                {
+                    depthSurface->GetDesc(&depthDesc);
+                    depthSurface->Release();
+                }
+                char zb[64];
+                std::snprintf(zb, sizeof(zb), " z=%lu zw=%lu st=%lu ds=%ux%u", zOn, zWrite, stencilOn, depthDesc.Width, depthDesc.Height);
+                line += zb;
+            }
             std::string reads;
             for (DWORD stage = 0; stage < 16; ++stage)
             {
@@ -784,23 +801,59 @@ namespace
         if (AuditLogging() && g_AuditConstMat[0] && t_AuditMaterial[0]
             && std::strstr(t_AuditMaterial, g_AuditConstMat) && g_AuditLines < kAuditMaxLines)
         {
+            // Non-zero constants, 8 registers per line (log lines are capped
+            // at 1 KB; a single line cut off the higher registers).
             auto dumpConsts = [&](const char* tag, const float* c, int n) {
-                std::string out;
-                char b[96];
-                for (int i = 0; i < n; ++i)
+                for (int base = 0; base < n; base += 8)
                 {
-                    const float* v = c + i * 4;
-                    if (v[0] == 0.f && v[1] == 0.f && v[2] == 0.f && v[3] == 0.f)
-                        continue;
-                    std::snprintf(b, sizeof(b), " c%d=(%.4g,%.4g,%.4g,%.4g)", i, v[0], v[1], v[2], v[3]);
-                    out += b;
+                    std::string out;
+                    char b[112];
+                    for (int i = base; i < base + 8 && i < n; ++i)
+                    {
+                        const float* v = c + i * 4;
+                        if (v[0] == 0.f && v[1] == 0.f && v[2] == 0.f && v[3] == 0.f)
+                            continue;
+                        std::snprintf(b, sizeof(b), " c%d=(%.6g,%.6g,%.6g,%.6g)", i, v[0], v[1], v[2], v[3]);
+                        out += b;
+                    }
+                    if (!out.empty())
+                        Game::logMsg("audit consts e%d %s %s:%s", eye, t_AuditMaterial, tag, out.c_str());
                 }
-                Game::logMsg("audit consts e%d %s %s:%s", eye, t_AuditMaterial, tag, out.c_str());
                 ++g_AuditLines;
             };
             AuditFlushGroup();
             dumpConsts("VS", g_AuditVsConst, 48);
-            dumpConsts("PS", g_AuditPsConst, 32);
+            dumpConsts("PS", g_AuditPsConst, 64);
+            // The bound shaders' bytecode, once per shader, as
+            // VR/audit-<vs|ps>-<ptr>.dxso (match against DXVK_SHADER_DUMP_PATH).
+            {
+                static std::set<const void*> s_savedShaders;
+                IDirect3DVertexShader9* vsh = nullptr;
+                IDirect3DPixelShader9* psh = nullptr;
+                device->GetVertexShader(&vsh);
+                device->GetPixelShader(&psh);
+                Game::logMsg("audit shaders e%d %s vs=%p ps=%p", eye, t_AuditMaterial, (void*)vsh, (void*)psh);
+                auto save = [&](const char* kind, const void* key, auto* sh) {
+                    UINT size = 0;
+                    if (!sh || s_savedShaders.count(key) || FAILED(sh->GetFunction(nullptr, &size)) || !size)
+                        return;
+                    std::vector<char> buf(size);
+                    if (FAILED(sh->GetFunction(buf.data(), &size)))
+                        return;
+                    char name[64];
+                    std::snprintf(name, sizeof(name), "audit-%s-%p.dxso", kind, key);
+                    if (FILE* f = std::fopen(bmvr::VrFilePath(name).c_str(), "wb"))
+                    {
+                        std::fwrite(buf.data(), 1, size, f);
+                        std::fclose(f);
+                    }
+                    s_savedShaders.insert(key);
+                };
+                save("vs", vsh, vsh);
+                save("ps", psh, psh);
+                if (vsh) vsh->Release();
+                if (psh) psh->Release();
+            }
             // Once per eye: the eye-sized textures this draw samples (light
             // accumulation etc.) as VR/audit-<mat>-e<eye>-s<stage>.bmp.
             static int s_dumped[3];
@@ -3071,6 +3124,13 @@ void VR::OnLevelInit(const char* newmap)
     m_MenuPanelPoseValid = false;
     m_WeaponMenuPrevEntity = 0;
     m_WeaponMenuPrevKind = 0;
+    m_GmanModelIndex[0] = m_GmanModelIndex[1] = -1;
+    m_GmanMapState = 0;
+    m_GmanMapChecks = 0;
+    m_GmanMapCheckMs = 0;
+    m_GmanScanMs = 0;
+    m_GmanEntityCount = 0;
+    m_GmanGestureActive.store(false, std::memory_order_relaxed);
     Game::logMsg("LevelInit map=%s eligible=%d", m_CurrentMapName.c_str(), m_GameplayEligible ? 1 : 0);
     m_PhysicalCrowbarModel = nullptr;
     m_PhysicalCrowbarLoadTries = 0;
@@ -3082,7 +3142,6 @@ void VR::OnLevelInit(const char* newmap)
         bmvr::EndRisky(L"menu_vr");
         bmvr::KickHudIconPreload();
     }
-    ApplyRenderTargetFramebufferOverride();
 }
 
 bool VR::ShouldCompositorSubmit() const
@@ -3140,108 +3199,6 @@ void VR::OnLevelShutdown()
     m_MenuLastVisibleMs = 0;
     m_MenuPanelPoseValid = false;
     Game::logMsg("LevelShutdown");
-}
-
-void VR::ApplyRenderTargetFramebufferOverride(void* materialSystem)
-{
-    if (!bmvr::TryFramebufferOverride())
-        return;
-    void* mat = materialSystem;
-    if (!mat && m_Game)
-        mat = m_Game->m_MaterialSystem;
-    if (!mat)
-        return;
-
-    static uint32_t s_setW = 0;
-    static uint32_t s_setH = 0;
-
-    uint32_t w = 0, h = 0;
-    static bool s_latchedOffscreen = false;
-    if (bmvr::TryOffscreenWorldGrow() && bmvr::ComputeWorldRtOverrideSize(w, h))
-    {
-        if (s_latchedOffscreen && s_setW != 0)
-        {
-            // Do not follow live SteamVR SS. G-buffers are sized at map load.
-            return;
-        }
-    }
-    else if (bmvr::TryOffscreenWorldGrow())
-    {
-        // Pin HWND until FullFrame itself is eye-sized. Advertising the eye
-        // size here is what created 3168 G-buffers behind a 2560 FullFrame
-        // (flashlight missing, ghost world, 2026-09-01).
-        s_latchedOffscreen = false;
-        uint32_t winW = 0, winH = 0;
-        if (!bmvr::QueryWindowClientSize(winW, winH))
-            return;
-        w = winW;
-        h = winH;
-        static uint32_t s_pinFfW, s_pinFfH;
-        if (s_pinFfW != bmvr::g_FullFrameActualWidth || s_pinFfH != bmvr::g_FullFrameActualHeight)
-        {
-            s_pinFfW = bmvr::g_FullFrameActualWidth;
-            s_pinFfH = bmvr::g_FullFrameActualHeight;
-            uint32_t eyeW = 0, eyeH = 0;
-            bmvr::ComputeOffscreenEyeSize(eyeW, eyeH);
-            Game::logMsg(
-                "RT FB override pin HWND %ux%u (FullFrame %ux%u != eye %ux%u; G-buffer must not outgrow FullFrame)",
-                w, h, s_pinFfW, s_pinFfH, eyeW, eyeH);
-        }
-    }
-    else
-    {
-        s_latchedOffscreen = false;
-        uint32_t winW = 0, winH = 0;
-        if (s_setW != 0 && bmvr::QueryWindowClientSize(winW, winH)
-            && (s_setW != winW || s_setH != winH))
-        {
-            w = winW;
-            h = winH;
-        }
-        else
-            return;
-    }
-
-    void** vt = nullptr;
-    __try
-    {
-        vt = *reinterpret_cast<void***>(mat);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        vt = nullptr;
-    }
-    if (!vt || !vt[Offsets::kIMaterialSystem_SetRTFBOverrideVt]
-        || !vt[Offsets::kIMaterialSystem_GetRTFBDimensionsVt])
-        return;
-
-    if (s_setW == w && s_setH == h)
-        return;
-
-    using SetFn = void(__thiscall*)(void*, int, int);
-    using GetFn = void(__thiscall*)(void*, int&, int&);
-    int gotW = 0;
-    int gotH = 0;
-    __try
-    {
-        bmvr::BeginRisky(L"fb_override");
-        reinterpret_cast<SetFn>(vt[Offsets::kIMaterialSystem_SetRTFBOverrideVt])(
-            mat, static_cast<int>(w), static_cast<int>(h));
-        reinterpret_cast<GetFn>(vt[Offsets::kIMaterialSystem_GetRTFBDimensionsVt])(
-            mat, gotW, gotH);
-        s_setW = w;
-        s_setH = h;
-        uint32_t offW = 0, offH = 0;
-        s_latchedOffscreen = bmvr::ComputeWorldRtOverrideSize(offW, offH);
-        bmvr::EndRisky(L"fb_override");
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        Game::logMsg("SetRenderTargetFrameBufferSizeOverrides SEH %ux%u", w, h);
-        return;
-    }
-    Game::logMsg("SetRenderTargetFrameBufferSizeOverrides %ux%u (Get %dx%d) HWND unchanged",
-        w, h, gotW, gotH);
 }
 
 void VR::LogFullFrameSizeIfReady()
@@ -3383,7 +3340,6 @@ bool VR::InitOpenVR()
     }
     Game::logMsg("OpenVR recommended RT %ux%u (eye size %ux%u)",
         recW, recH, m_RenderWidth, m_RenderHeight);
-    ApplyRenderTargetFramebufferOverride();
     RefreshIpdFromHmd();
 
     float l_left = 0, l_right = 0, l_top = 0, l_bottom = 0;
@@ -10827,7 +10783,7 @@ namespace
         up = HudRotate(up, left, kPitch);
         left = HudRotate(left, fwd, kRoll);
         up = HudRotate(up, fwd, kRoll);
-        constexpr float kLift = 1.05f;
+        constexpr float kLift = 2.2f;
         constexpr float kAlong = -0.55f;
         constexpr float kAcross = 0.3f;
         const Vector center = ctrlPos + up * kLift + fwd * kAlong + left * kAcross;
@@ -11093,8 +11049,12 @@ void VR::DrawHandHud(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
         if (offOk)
         {
             HudPanel handPanel{};
+            // On the gun the glove sits at its tuned spot: the panel goes with it.
+            Vector handHudOrigin = rightDominant ? leftOrigin : rightOrigin;
+            if (rightDominant ? WantsOffhandGloveWeaponGripCurl() : WantsRightGloveWeaponGripCurl())
+                handHudOrigin = handHudOrigin + GunGripHandOffset(!rightDominant, rightDominant ? rightAng : leftAng);
             BuildHandHudPanel(
-                rightDominant ? leftOrigin : rightOrigin,
+                handHudOrigin,
                 rightDominant ? leftAng : rightAng,
                 !rightDominant, handPanel);
             if (handPanel.valid && !HudIsBackfacing(handPanel, eyeOrig))
@@ -11902,6 +11862,14 @@ bool VR::WantsOffhandGloveWeaponGripCurl() const
     return m_TwoHandActive && !bmvr::g_LeftHanded;
 }
 
+Vector VR::GunGripHandOffset(bool rightHand, const QAngle& gunAngles) const
+{
+    Vector fwd, right, up;
+    QAngle::AngleVectors(gunAngles, &fwd, &right, &up);
+    return right * (rightHand ? -bmvr::g_VrHandsGunGripRight : bmvr::g_VrHandsGunGripRight)
+        + up * bmvr::g_VrHandsGunGripUp + fwd * bmvr::g_VrHandsGunGripForward;
+}
+
 namespace vm_numpad
 {
     struct Offsets
@@ -12350,6 +12318,7 @@ void VR::TickMatQueueFromRenderView()
         UpdateAimCrosshair();
         UpdateRpgLaserPoint();
     }
+    UpdateGmanGesture();
     // Glove lighting samples GetLightForPoint here, not in the draw path.
     if (m_GameplayEligible && m_HmdPoseValid)
     {
@@ -12368,6 +12337,119 @@ void VR::TickMatQueueFromRenderView()
     // QoL SetValue(mat_vsync) crashed the first RenderView (2026-08-26).
     // Crosshair stays in bmvr.cfg. Only mat_queue_mode is written after warmup.
     UpdateAutoMatQueueMode();
+}
+
+namespace
+{
+    // World only (no entities, so the G-Man himself never blocks the ray).
+    class CTraceFilterWorldOnlyBmvr : public CTraceFilter
+    {
+    public:
+        CTraceFilterWorldOnlyBmvr() : CTraceFilter(nullptr, 0) {}
+        bool ShouldHitEntity(IHandleEntity*, int) override { return false; }
+        TraceType GetTraceType() const override { return TraceType::TRACE_WORLD_ONLY; }
+    };
+}
+
+void VR::UpdateGmanGesture()
+{
+    auto setActive = [&](bool on) {
+        if (m_GmanGestureActive.load(std::memory_order_relaxed) != on)
+        {
+            m_GmanGestureActive.store(on, std::memory_order_relaxed);
+            static int s_log;
+            if (s_log < 16)
+            {
+                ++s_log;
+                Game::logMsg("G-Man gesture %s", on ? "armed (G-Man in view)" : "off");
+            }
+        }
+    };
+    if (!bmvr::g_VrGmanGesture || !m_Game || !m_GameplayEligible || !m_HmdPoseValid || PauseUiActive())
+    {
+        setActive(false);
+        return;
+    }
+    const DWORD now = GetTickCount();
+
+    // Map start: is a G-Man model precached at all? The precache table can
+    // still be filling during the first frames, so ask up to 10 times, once
+    // a second; after that maps without him cost nothing.
+    if (m_GmanMapState == 0)
+    {
+        if (m_GmanMapCheckMs != 0 && now - m_GmanMapCheckMs < 1000)
+            return;
+        m_GmanMapCheckMs = now;
+        ++m_GmanMapChecks;
+        m_GmanModelIndex[0] = m_Game->ModelPrecacheIndex("models/gman.mdl");
+        m_GmanModelIndex[1] = m_Game->ModelPrecacheIndex("models/gman_high.mdl");
+        if (m_GmanModelIndex[0] > 0 || m_GmanModelIndex[1] > 0)
+        {
+            m_GmanMapState = 1;
+            Game::logMsg("G-Man gesture: map %s uses the G-Man (model index %d/%d)",
+                m_CurrentMapName.c_str(), m_GmanModelIndex[0], m_GmanModelIndex[1]);
+        }
+        else if (m_GmanMapChecks >= 10)
+        {
+            m_GmanMapState = 2;
+        }
+        return;
+    }
+    if (m_GmanMapState != 1)
+        return;
+
+    // He can enter the PVS (be created on the client) at any time.
+    if (m_GmanScanMs == 0 || now - m_GmanScanMs >= 1000)
+    {
+        m_GmanScanMs = now;
+        m_GmanEntityCount = m_Game->CollectEntitiesWithModelIndex(m_GmanModelIndex, 2, m_GmanEntities, 4);
+    }
+
+    const Vector body = m_HasStereoBodyOrigin ? m_StereoBodyOrigin : m_SetupOrigin;
+    if (body.LengthSqr() <= 1.f)
+    {
+        setActive(false);
+        return;
+    }
+    const Vector eye = GetViewOrigin(body);
+    Vector fwd{}, right{}, up{};
+    GetViewBasis(&fwd, &right, &up);
+    if (VectorNormalize(fwd) <= 0.01f)
+    {
+        setActive(false);
+        return;
+    }
+    // ~40 m covers him behind the far windows; the cone is about the
+    // headset's view (cos 50 deg).
+    constexpr float kMaxDist = 1600.f;
+    constexpr float kMinCos = 0.64f;
+    bool seen = false;
+    for (int i = 0; i < m_GmanEntityCount && !seen; ++i)
+    {
+        Vector origin{};
+        const int mi = m_Game->VisibleEntityModelIndex(m_GmanEntities[i], origin);
+        if (mi <= 0 || (mi != m_GmanModelIndex[0] && mi != m_GmanModelIndex[1]))
+            continue;
+        const Vector head = origin + Vector(0.f, 0.f, 60.f);
+        Vector to = head - eye;
+        const float dist = VectorNormalize(to);
+        if (dist < 1.f || dist > kMaxDist || to.Dot(fwd) < kMinCos)
+            continue;
+        // Line of sight against solid world only: glass and grates let it
+        // through, walls do not (also covers a stale origin out of the PVS).
+        if (m_Game->m_EngineTrace)
+        {
+            CTraceFilterWorldOnlyBmvr filter;
+            Ray_t ray;
+            ray.Init(eye, head);
+            CGameTrace tr{};
+            m_Game->m_EngineTrace->TraceRay(ray, CONTENTS_SOLID, &filter, &tr);
+            if (tr.fraction < 0.98f && !tr.startsolid)
+                continue;
+        }
+        seen = true;
+    }
+    setActive(seen);
 }
 
 void VR::UpdateAutoMatQueueMode()
@@ -17369,8 +17451,6 @@ void VR::Update()
         ++m_EligiblePresents;
     if (m_GameplayEligible && inGame && m_EligiblePresents == 120 && bmvr::TryHmdFramebuffer())
         bmvr::EndRisky(L"hmd_fb");
-    if (m_GameplayEligible && inGame && m_EligiblePresents == 120 && bmvr::TryFramebufferOverride())
-        bmvr::EndRisky(L"fb_override");
     if (m_GameplayEligible && inGame && m_EligiblePresents == 120 && bmvr::TryDrawHud())
         bmvr::EndRisky(L"drawhud");
     if (m_GameplayEligible && inGame && m_EligiblePresents == 120 && bmvr::TryHmdNative())

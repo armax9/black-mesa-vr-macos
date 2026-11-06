@@ -220,6 +220,15 @@ static DWORD WINAPI InitBMVR(LPVOID param)
         bmvr::abi::build=bmvr::abi::Build::Stable19042901;
     else { bmvr::Log("Game ABI: unsupported client; VR hooks disabled"); return 0; }
     bmvr::Log("Game ABI selected: %s; common v53 gameplay fixes",bmvr::abi::build == bmvr::abi::Build::Beta26234270 ? "public-beta26234270" : bmvr::abi::Beta()?"public-beta25844216":"stable19042901");
+    // Test switch: hold back the hooks so the engine's first render target pass runs without them, the startup
+    // order some real launches get (bloom targets eye-sized). Harness: BMVR_TEST_INIT_DELAY_MS.
+    char delayText[16]{};
+    if (GetEnvironmentVariableA("BMVR_TEST_INIT_DELAY_MS", delayText, sizeof(delayText)) > 0)
+    {
+        const int delayMs = atoi(delayText);
+        bmvr::Log("Test: mod init held back %d ms", delayMs);
+        Sleep(delayMs > 0 ? delayMs : 0);
+    }
     g_Game = new Game();
     return 0;
 }

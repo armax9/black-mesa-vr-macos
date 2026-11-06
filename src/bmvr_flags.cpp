@@ -1,4 +1,5 @@
 #include "bmvr_flags.h"
+#include "bmvr_version.h"
 #include "openxr_bridge_protocol.h"
 
 #ifndef NOMINMAX
@@ -107,7 +108,7 @@ namespace bmvr
     float g_VrLaserStartForward = 0.f;
     bool g_AimDebug = false;
     bool g_OffCenterTest = false;
-    bool g_OffCenterEyes = false;
+    bool g_OffCenterEyes = true;
     bool g_FakeRuntime = false;
     bool g_MirrorBothEyes = false;
     // Fixes: on by default, a config key can turn each off.
@@ -139,7 +140,7 @@ namespace bmvr
     bool g_SprintAimedPose = true;
     // Optional features: off unless enabled in VR/config.txt.
     bool g_ShoulderGestures = true;
-    bool g_SettingsTriangleHold = false;
+    bool g_SettingsTriangleHold = true;
     bool g_WeaponMenuSettingsGear = true;
     bool g_WeaponMenuTilt = true;
     bool g_CrouchStickHold = false;
@@ -157,6 +158,20 @@ namespace bmvr
     bool g_RightEyeFirst = false;
     bool g_OcclusionTrackerPerEye = true;
     bool g_PixelVisPerEye = true;
+    bool g_FlareEyeAxis = true;
+    bool g_LightCullEyeView = true;
+    bool g_FlareSharedLayout = true;
+    float g_FlareHazeScale = 0.f;
+    float g_FlareHazeMinSize = 0.5f;
+    float g_FlareGhostScale = 0.f;
+    float g_FlareFadeAngle = 45.f;
+    float g_FlareLightScale = 1.f;
+    bool g_ViewProjNormalFix = true;
+    bool g_EyeBloom = true;
+    bool g_FxaaApply = false;
+    float g_FxaaSubpixel = 0.25f;
+    float g_FxaaEdgeThreshold = 0.166f;
+    float g_FxaaEdgeThresholdMin = 0.0833f;
     float g_GlowHold = 0.f;
     bool g_FollowScriptedCamera = true;
     bool g_OccluderViewPerEye = true;
@@ -165,6 +180,15 @@ namespace bmvr
     float g_VrHandsPoseRotY = 180.f;
     float g_VrHandsPoseRotZ = 0.f;
     float g_VrHandsIndexRollDeg = 90.f;
+    float g_VrHandsRollDeg = 90.f;
+    float g_VrHandsGunGripRight = 1.2f;
+    float g_VrHandsGunGripUp = 0.f;
+    float g_VrHandsGunGripForward = 0.f;
+    bool g_VrGmanGesture = true;
+    float g_VrGmanFingerStraight = 0.3f;
+    float g_VrGmanThumbCurl = 1.f;
+    float g_VrGmanThumbSwing = 0.6f;
+    bool g_VrGmanGestureForce = false;
     // ~one hand-length back along aim after yaw 180 (user: gloves sat ahead
     // of the controller). Flip the Z sign in VR/config.txt if this goes the
     // wrong way on a given headset.
@@ -266,7 +290,6 @@ namespace bmvr
     static bool g_TryVguiPaint = true;
     static bool g_TryGameUiActivate = true;
     static bool g_TryMeleeTrace = true;
-    static bool g_TryFbOverride = true;
     // Keep stereo CViewSetup/viewport at 2560 GB size so deferred flashlight
     // apply runs; HMD fov+aspect+IPD; squash-blit into 1584 eyes. Not an RT
     // resize (ff_hmdfit / ff_gbfit). Sticky fl_gbmatch. Default on; leftover
@@ -708,8 +731,36 @@ namespace bmvr
                 if (v >= 0.f && v <= 2.f)
                     g_GlowHold = v;
             }
+            else if (std::strcmp(n, "FlareSharedLayout") == 0)
+                g_FlareSharedLayout = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "FlareHazeScale") == 0)
+                g_FlareHazeScale = std::clamp(static_cast<float>(atof(val)), 0.f, 1.f);
+            else if (std::strcmp(n, "FlareFadeAngle") == 0)
+                g_FlareFadeAngle = std::clamp(static_cast<float>(atof(val)), 0.f, 90.f);
+            else if (std::strcmp(n, "FlareLightScale") == 0)
+                g_FlareLightScale = std::clamp(static_cast<float>(atof(val)), 0.f, 1.f);
+            else if (std::strcmp(n, "FlareGhostScale") == 0)
+                g_FlareGhostScale = std::clamp(static_cast<float>(atof(val)), 0.f, 1.f);
+            else if (std::strcmp(n, "FlareHazeMinSize") == 0)
+                g_FlareHazeMinSize = std::clamp(static_cast<float>(atof(val)), 0.05f, 4.f);
+            else if (std::strcmp(n, "LightCullEyeView") == 0)
+                g_LightCullEyeView = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "FlareEyeAxis") == 0)
+                g_FlareEyeAxis = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "PixelVisPerEye") == 0)
                 g_PixelVisPerEye = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "ViewProjNormalFix") == 0)
+                g_ViewProjNormalFix = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "EyeBloom") == 0)
+                g_EyeBloom = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "FxaaApply") == 0)
+                g_FxaaApply = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "FxaaSubpixel") == 0)
+                g_FxaaSubpixel = std::clamp(static_cast<float>(atof(val)), 0.f, 1.f);
+            else if (std::strcmp(n, "FxaaEdgeThreshold") == 0)
+                g_FxaaEdgeThreshold = std::clamp(static_cast<float>(atof(val)), 0.f, 0.5f);
+            else if (std::strcmp(n, "FxaaEdgeThresholdMin") == 0)
+                g_FxaaEdgeThresholdMin = std::clamp(static_cast<float>(atof(val)), 0.f, 0.1f);
             else if (std::strcmp(n, "OccluderViewPerEye") == 0)
                 g_OccluderViewPerEye = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "RightEyeFirst") == 0)
@@ -736,6 +787,38 @@ namespace bmvr
             }
             else if (std::strcmp(n, "VrHandsIndexRollDeg") == 0)
                 g_VrHandsIndexRollDeg = static_cast<float>(atof(val));
+            else if (std::strcmp(n, "VrHandsGunGripRight") == 0)
+                g_VrHandsGunGripRight = std::clamp(static_cast<float>(atof(val)), -8.f, 8.f);
+            else if (std::strcmp(n, "VrHandsGunGripUp") == 0)
+                g_VrHandsGunGripUp = std::clamp(static_cast<float>(atof(val)), -8.f, 8.f);
+            else if (std::strcmp(n, "VrHandsGunGripForward") == 0)
+                g_VrHandsGunGripForward = std::clamp(static_cast<float>(atof(val)), -12.f, 12.f);
+            else if (std::strcmp(n, "VrHandsRollDeg") == 0)
+            {
+                const float s = static_cast<float>(atof(val));
+                if (s >= -180.f && s <= 180.f)
+                    g_VrHandsRollDeg = s;
+            }
+            else if (std::strcmp(n, "VrGmanGesture") == 0)
+                g_VrGmanGesture = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrGmanFingerStraight") == 0)
+            {
+                const float v = static_cast<float>(atof(val));
+                if (v >= 0.f && v <= 0.5f)
+                    g_VrGmanFingerStraight = v;
+            }
+            else if (std::strcmp(n, "VrGmanThumbCurl") == 0)
+            {
+                const float v = static_cast<float>(atof(val));
+                if (v >= 0.f && v <= 2.f)
+                    g_VrGmanThumbCurl = v;
+            }
+            else if (std::strcmp(n, "VrGmanThumbSwing") == 0)
+            {
+                const float v = static_cast<float>(atof(val));
+                if (v >= 0.f && v <= 1.5f)
+                    g_VrGmanThumbSwing = v;
+            }
             else if (std::strcmp(n, "VrHandsPoseOffsetMeters") == 0)
             {
                 float x = 0.f, y = 0.f, z = -0.20f;
@@ -958,8 +1041,6 @@ namespace bmvr
         }
         else if (name == "melee_vm")
             g_TryMeleeTrace = false;
-        else if (name == "fb_override")
-            g_TryFbOverride = false;
         else if (name == "fl_gbmatch")
             g_TryFlashlightGbMatch = false;
         else if (name == "gb_leftskip")
@@ -1547,6 +1628,94 @@ namespace bmvr
         return 0;
     }
 
+    // The folder bms.exe is in, also in a test run (ExeDir() is then the test folder).
+    static std::wstring GameDir()
+    {
+        wchar_t path[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, path, MAX_PATH);
+        std::wstring full(path);
+        const size_t slash = full.find_last_of(L"\\/");
+        return slash == std::wstring::npos ? L"." : full.substr(0, slash);
+    }
+
+    // "<buildid> <engine.dll size>": the game build, from Steam's manifest when it is readable.
+    static std::string CurrentGameBuildId()
+    {
+        std::string id = "unknown";
+        FILE* f = nullptr;
+        _wfopen_s(&f, (GameDir() + L"\\..\\..\\appmanifest_362890.acf").c_str(), L"r");
+        if (f)
+        {
+            char line[256];
+            while (fgets(line, sizeof(line), f))
+            {
+                const char* k = std::strstr(line, "\"buildid\"");
+                if (!k)
+                    continue;
+                int build = 0;
+                if (sscanf_s(k + 9, " \"%d\"", &build) == 1)
+                    id = std::to_string(build);
+                break;
+            }
+            fclose(f);
+        }
+        WIN32_FILE_ATTRIBUTE_DATA info{};
+        if (GetFileAttributesExW((GameDir() + L"\\bin\\engine.dll").c_str(), GetFileExInfoStandard, &info))
+            id += " " + std::to_string(info.nFileSizeLow);
+        return id;
+    }
+
+    // Skip entries and crash flags record what died on one mod and game build. After either changes they say nothing
+    // (a wrong-version install would disable features for good), so move them aside and start clean. Runs before the
+    // skip file is read. A first run with no stamp counts as a change.
+    static void ClearSkipsOnBuildChange()
+    {
+        const std::string want = std::string("mod ") + BMVR_COMMIT + " " + __DATE__ + " " + __TIME__ + " game " + CurrentGameBuildId();
+        const std::wstring stampPath = GameDir() + L"\\bmvr_build_stamp.txt";
+        std::string have;
+        FILE* f = nullptr;
+        _wfopen_s(&f, stampPath.c_str(), L"r");
+        if (f)
+        {
+            char buf[256]{};
+            if (fgets(buf, sizeof(buf), f))
+                have = buf;
+            fclose(f);
+            while (!have.empty() && (have.back() == '\n' || have.back() == '\r'))
+                have.pop_back();
+        }
+        if (have == want)
+            return;
+        int moved = 0;
+        const auto moveAside = [&moved](const std::wstring& path) {
+            const std::wstring old = path + L".old";
+            DeleteFileW(old.c_str());
+            if (MoveFileW(path.c_str(), old.c_str()))
+                ++moved;
+        };
+        std::vector<std::wstring> dirs = FlagDirs();
+        dirs.push_back(GameDir());
+        dirs.push_back(GameDir() + L"\\bin");
+        dirs.push_back(ModuleDir());
+        std::sort(dirs.begin(), dirs.end());
+        dirs.erase(std::unique(dirs.begin(), dirs.end()), dirs.end());
+        for (const auto& dir : dirs)
+        {
+            moveAside(dir + L"\\bmvr_skip.txt");
+            WIN32_FIND_DATAW fd{};
+            HANDLE h = FindFirstFileW((dir + L"\\bmvr_in_*.flag").c_str(), &fd);
+            if (h == INVALID_HANDLE_VALUE)
+                continue;
+            do
+                moveAside(dir + L"\\" + fd.cFileName);
+            while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+        DeleteFileW(stampPath.c_str());
+        WriteUtf8File(stampPath, want.c_str(), true);
+        Log("Build changed (was '%s', now '%s'): moved %d skip/crash files aside as .old", have.c_str(), want.c_str(), moved);
+    }
+
     void InitFromDisk()
     {
         if (g_Inited)
@@ -1556,6 +1725,7 @@ namespace bmvr
         StartWatchdog();
         DetectCampaignSession();
         ReadUserConfig(ExeDir() + L"\\VR\\config.txt");
+        ClearSkipsOnBuildChange();
         ReadSkipFile(SkipPath());
         ReadSkipFile(ModuleDir() + L"\\bmvr_skip.txt");
         ConsumeIfStuck(L"msaa", g_MsaaAllowed, "msaa", "HL2VR scene MSAA");
@@ -1615,8 +1785,6 @@ namespace bmvr
         // does not permanently disable the researched path.
         ConsumeIfStuck(L"melee_vm", g_TryMeleeTrace, "melee_vm",
             "crowbar TraceRay viewmodel-origin rewrite");
-        ConsumeIfStuck(L"fb_override", g_TryFbOverride, "fb_override",
-            "IMaterialSystem::SetRenderTargetFrameBufferSizeOverrides");
         // Skip-file already ignores fl_gbmatch. ConsumeIfStuck still disabled
         // it from leftover bmvr_in_fl_gbmatch.flag (BeginRisky held when the
         // first simulator pair died). Next launch then double-RVed 1280 into
@@ -1752,7 +1920,6 @@ namespace bmvr
     bool TryVguiPaint() { return g_TryVguiPaint; }
     bool TryGameUiActivate() { return g_TryGameUiActivate; }
     bool TryMeleeTrace() { return g_TryMeleeTrace; }
-    bool TryFramebufferOverride() { return g_TryFbOverride; }
     bool TryFlashlightGbMatch() { return g_TryFlashlightGbMatch; }
     bool TryGbLeftSkip() { return g_TryGbLeftSkip; }
     bool TryDrawHud() { return g_TryDrawHud; }
@@ -2185,20 +2352,34 @@ namespace bmvr
         return true;
     }
 
-    bool ComputeWorldRtOverrideSize(uint32_t& width, uint32_t& height)
+    // Bloom chain, sized from the current eye size at creation instead of the
+    // engine's frame buffer size. Divisors are the engine's own ratios for these
+    // targets. Targets not listed and not grown elsewhere keep the engine's
+    // window-based size (_rt_Hud, _rt_DofBlur).
+    bool EyeScaledRtSize(const char* name, uint32_t& width, uint32_t& height)
     {
-        if (!g_TryOffscreenWorldGrow || !g_TryOffscreenHmd)
+        struct Entry { const char* name; uint32_t divisor; };
+        static const Entry kTable[] = {
+            { "_rt_Small2FB0", 2 }, { "_rt_Small2FB1", 2 },
+            { "_rt_SmallFB0", 4 }, { "_rt_SmallFB1", 4 }, { "_rt_SmallFB2", 4 }, { "_rt_SmallFB3", 4 },
+            { "_rt_Small8FB0", 8 }, { "_rt_Small8FB1", 8 },
+            { "_rt_Small16FB0", 16 }, { "_rt_Small16FB1", 16 },
+            { "_rt_Small32FB0", 32 }, { "_rt_Small32FB1", 32 },
+        };
+        if (!name)
             return false;
-        uint32_t eyeW = 0, eyeH = 0;
-        if (!ComputeOffscreenEyeSize(eyeW, eyeH))
-            return false;
-        if (g_FullFrameActualWidth < 640 || g_FullFrameActualHeight < 360)
-            return false;
-        if (!SizesNear(g_FullFrameActualWidth, eyeW) || !SizesNear(g_FullFrameActualHeight, eyeH))
-            return false;
-        width = eyeW;
-        height = eyeH;
-        return true;
+        for (const Entry& entry : kTable)
+        {
+            if (std::strcmp(name, entry.name) != 0)
+                continue;
+            uint32_t eyeW = 0, eyeH = 0;
+            if (!ComputeGrownWorldFramebuffer(eyeW, eyeH))
+                return false;
+            width = eyeW / entry.divisor;
+            height = eyeH / entry.divisor;
+            return true;
+        }
+        return false;
     }
 
     bool ComputeGrownWorldGbuffer(uint32_t& width, uint32_t& height)

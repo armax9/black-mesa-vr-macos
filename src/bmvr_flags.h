@@ -124,7 +124,7 @@ namespace bmvr
     // caller pins HWND — advertising 3168 here before FullFrame grew is what
     // created 3168 G-buffers behind a 2560 FullFrame (flashlight + ghost world,
     // 2026-09-01).
-    bool ComputeWorldRtOverrideSize(uint32_t& width, uint32_t& height);
+    bool EyeScaledRtSize(const char* name, uint32_t& width, uint32_t& height);
     bool HaveHmdFramebufferSize(uint32_t& width, uint32_t& height);
     // Cached game HWND (Valve001 / "Black Mesa"). Null while the window is
     // missing; re-searched at most every 250 ms. Never call FindWindow per
@@ -389,6 +389,34 @@ namespace bmvr
     // the head moves). The right eye gets its own queries for all its views
     // (incl. floor/water reflections). false = stock (A/B aid).
     extern bool g_PixelVisPerEye;
+    extern bool g_FlareEyeAxis;
+    extern bool g_LightCullEyeView;
+    extern bool g_FlareSharedLayout;
+    extern float g_FlareHazeScale;
+    extern float g_FlareHazeMinSize;
+    extern float g_FlareGhostScale;
+    extern float g_FlareFadeAngle;
+    extern float g_FlareLightScale;
+    // ViewProjNormalFix (default true, cvar bmvr_viewproj_normal_fix): vertex
+    // shaders that turn normals into view space with cViewProj rows (Black
+    // Mesa's rope g-buffer shader) get those rows without the off-centre
+    // projection's forward part, so an off-centre eye (OffCenterEyes) writes
+    // the same normal as a centred one. Without it the left eye's ropes went
+    // dark over spotlit walls (normal-offset shadow bias into their own
+    // shadow). false = stock rows (A/B aid). No effect on centred eyes.
+    extern bool g_ViewProjNormalFix;
+    // EyeBloom (default false, cvar bmvr_eye_bloom): test switch. true lets
+    // the stock bloom chain (downsample / blur pyramid / bloomadd), the
+    // auto-exposure histogram (lumcompare) and engine_post's bloom var run
+    // on the eyes unchanged. false = the eye skip (2026-09-03 ghosts).
+    extern bool g_EyeBloom;
+    // FXAA quality parameters. The game never passes the mat_fxaa_* cvars to the
+    // shader, so it runs with all of them at 0. FxaaApply (default false = that
+    // stock behaviour) sends these instead. Values are FXAA 3.11's own terms.
+    extern bool g_FxaaApply;
+    extern float g_FxaaSubpixel;
+    extern float g_FxaaEdgeThreshold;
+    extern float g_FxaaEdgeThresholdMin;
     // GlowHold (seconds, default 0 = off, cvar bmvr_glow_hold): a glow
     // that dims keeps its brightest recent value this long, then fades over
     // the same time, so partial occlusion (dirty glass, the edge of an eye's
@@ -419,6 +447,32 @@ namespace bmvr
     // Applied only to hand poses around aim forward (weapons stay unrolled).
     // Left = -deg, right = +deg. Flip the sign if palms go the wrong way.
     extern float g_VrHandsIndexRollDeg;
+    // Glove-only roll around the controller's forward axis so the drawn hands
+    // match a hand wrapped around the grip (thumb up) instead of lying flat.
+    // Left = -deg, right = +deg, same convention as the Index roll. One value
+    // for every controller: on Index the pose already carries
+    // g_VrHandsIndexRollDeg, so the glove adds only the difference (90 = as
+    // before). Not applied to a hand posed on a weapon; never touches the
+    // tracked pose, so guns and aim are unaffected.
+    extern float g_VrHandsRollDeg;
+    extern float g_VrHandsGunGripRight;
+    extern float g_VrHandsGunGripUp;
+    extern float g_VrHandsGunGripForward;
+    // Gesture easter egg: while the G-Man is in front of you, grip shows only
+    // the middle finger extended.
+    extern bool g_VrGmanGesture;
+    // How far past the glove's rest pose the gesture finger bends back
+    // (curl units, 0 = rest pose with its natural bend, default 0.3 ~ 20 degrees
+    // per joint, tuned in the headset 2026-11-04). Config VrGmanFingerStraight, cvar bmvr_gman_finger_straight.
+    extern float g_VrGmanFingerStraight;
+    // Gesture thumb: g_VrGmanThumbCurl scales its joint angles (1 = rests on the
+    // folded fingers, more presses into them), g_VrGmanThumbSwing is the sideways
+    // swing at its root in radians (0 = plain curl, which goes through the fingers).
+    // Config VrGmanThumbCurl / VrGmanThumbSwing, cvars bmvr_gman_thumb_curl / _swing.
+    extern float g_VrGmanThumbCurl;
+    extern float g_VrGmanThumbSwing;
+    // Test aid (cvar bmvr_gman_gesture_force, not saved): gesture on without a G-Man in view.
+    extern bool g_VrGmanGestureForce;
     // L4D2VR BuildControllerWorld local translation (meters, before model
     // scale). Controller basis Z is -forward, so a negative local Z moves the
     // mesh further along aim. HEV gloves sat behind the controller; -0.10 m
@@ -510,7 +564,6 @@ namespace bmvr
     bool TryVguiPaint();
     bool TryGameUiActivate();
     bool TryMeleeTrace();
-    bool TryFramebufferOverride();
     // Stereo view stays 2560 (G-buffer size) with HMD fov/aspect/IPD so the
     // deferred flashlight apply runs, then squash-blit into 1584 eyes.
     // Sticky fl_gbmatch.

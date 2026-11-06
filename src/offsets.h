@@ -70,6 +70,15 @@ public:
         "56 57 8B F9 8B 0D ? ? ? ? 8B 01 FF 50 24", 6 } : Offset{ "client.dll", 0x16AD56,
         "56 57 8B F9 8B 0D ? ? ? ? 8B 01 FF 50 24", 6 });
 
+    // engine_post material proxy bind: copies two global float[4]s into
+    // $FXAAInternalC and $FXAAInternalQ (the push imm32s at +15 and +34). Their
+    // only filler is skipped because every caller passes 0 for its enable
+    // argument, so the mat_fxaa_* cvars never reach the shader.
+    Offset EnginePostProxyBind{ "client.dll", 0x1F41F0,
+        "56 8B F1 8B 4E 04 85 C9 74 0C 8B 01 6A 04 68 ? ? ? ? FF 50 34 8B 4E 08 85 C9 74 0C 8B 01 6A 04 68 ? ? ? ? FF 50 34" };
+    static constexpr int kEnginePostBindFxaaC = 15;
+    static constexpr int kEnginePostBindFxaaQ = 34;
+
     Offset CreateMove = bmvr::abi::Latest() ? Offset{ "client.dll", 0x102590,
         "55 8B EC E8 ? ? ? ? 8B C8 85 C9 75 06 B0 01 5D C2 08 00" } : (bmvr::abi::Beta() ? Offset{ "client.dll", 0x102410,
         "55 8B EC E8 ? ? ? ? 8B C8 85 C9 75 06 B0 01 5D C2 08 00" } : Offset{ "client.dll", 0x110310,
@@ -494,6 +503,11 @@ public:
         "55 8B EC 83 B9 C4 2A 00 00 00 75 14 68 ? ? ? ? FF 15 ? ? ? ? 83 C4 04 33 C0 5D C2 20 00 8B 0D" } : (bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x49A30,
         "55 8B EC 83 B9 C4 2A 00 00 00 75 14 68 ? ? ? ? FF 15 ? ? ? ? 83 C4 04 33 C0 5D C2 20 00 8B 0D" } : Offset{ "materialsystem.dll", 0x49660,
         "55 8B EC 83 B9 A0 2A 00 00 00 75 14 68 ? ? ? ? FF 15 ? ? ? ? 83 C4 04 33 C0 5D C2 20 00 8B 0D" });
+
+    // Latest-beta target creation signature; older builds use CreateNamedRTEx above.
+    static constexpr int kCreateNamedRTExRva = 0x49A30;
+    static constexpr const char* kCreateNamedRTExSig =
+        "55 8B EC 83 B9 C4 2A 00 00 00 75 14 68 ? ? ? ? FF 15 ? ? ? ? 83 C4 04 33 C0 5D C2 20 00 8B 0D";
     // CreateNamedRenderTargetTextureEx2 (Begin+Ex+End). Same args as Ex.
     Offset CreateNamedRTEx2 = bmvr::abi::Latest() ? Offset{ "materialsystem.dll", 0x499D0,
         "55 8B EC 83 B9 C4 2A 00 00 00 75 14 68 ? ? ? ? FF 15 ? ? ? ? 83 C4 04 33 C0 5D C2 20 00 8B 01" } : (bmvr::abi::Beta() ? Offset{ "materialsystem.dll", 0x499D0,
@@ -591,6 +605,20 @@ public:
     // GetFractionVisible 0xD48B0 and find-or-create query for a view 0xD4560.
     static constexpr uint32_t kPixelVisGetFractionRva = 0xD48B0;
     static constexpr uint32_t kPixelVisQueryForViewRva = 0xD4560;
+    // CLensflare's world-to-pixel helper (cdecl: world, size[2], out).  Reads the
+    // view and projection matrices from the render context; diagnostic hook only.
+    static constexpr uint32_t kLensflareWorldToScreenRva = 0x223960;
+    // The frame's view frustum, filled once a frame from the main view, and the
+    // function that builds one (cdecl: origin, angles, near, far, fov, aspect, out).
+    static constexpr uint32_t kClientFrameFrustumRva = 0x6C585C;
+    static constexpr uint32_t kGeneratePerspectiveFrustumRva = 0x2FF7C0;
+    // CLensflare's visibility fraction (thiscall: pvs-related ptr, world pos).
+    static constexpr uint32_t kLensflareFractionRva = 0x222890;
+    // CLensflare quad draw (thiscall: material, x, y, w, h, color, angle; pixels).
+    static constexpr uint32_t kLensflareDrawQuadRva = 0x2221D0;
+    // CLensflare element draw (thiscall: scale, world pos by value, element, size).
+    static constexpr uint32_t kLensflareElementRva = 0x221DE0;
+    static constexpr uint32_t kClientMaterialsPtrRva = 0x702A90;
 
     Offset ProcessUsercmds = bmvr::abi::Latest() ? Offset{ "server.dll", 0x532D40,
         "55 8B EC B8 ? ? ? ? E8 ? ? ? ? A1 ? ? ? ? 33 C5 89 45 FC 8B 45 0C 8B 55 08", 0, true } : (bmvr::abi::Beta() ? Offset{ "server.dll", 0x532AC0,
@@ -636,7 +664,6 @@ public:
     static constexpr int kIMaterialVar_SetVecValue3Vt = 11;
     static constexpr int kIMaterialVar_VecValOffset = 0xC;
     static constexpr int kIMaterialVar_TypeOffset = 0x1C;
-    static constexpr int kIMaterialSystem_SetRTFBOverrideVt = 142; // +0x238
     static constexpr int kIMaterialSystem_GetRTFBDimensionsVt = 143; // +0x23C
 
     // CBlackMesaPlayer (server). Impulse int +0xe44; flashlight virtuals.

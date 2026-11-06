@@ -265,6 +265,276 @@ static unsigned __fastcall PixelVisQueryForViewStats(void* ecx, void* edx, void*
     return g_OrigPixelVisQueryForView(ecx, set, viewId);
 }
 
+// Lens flares lay out their ghosts and fade them by the distance from the middle
+// of the render target. On an off-centre eye that is not where the eye looks, so
+// the same light got different ghosts and brightness in each eye. The position
+// helper hands the layout coordinates relative to the eye's view axis; the quad
+// draw shifts them back.
+using FlareWorldToScreenFn = void(__cdecl*)(const float* world, const float* size, float* out);
+static FlareWorldToScreenFn g_OrigFlareWorldToScreen = nullptr;
+using FlareDrawQuadFn = void(__thiscall*)(void* flare, void* material, int x, int y, int w, int h, void* color, float angle);
+static FlareDrawQuadFn g_OrigFlareDrawQuad = nullptr;
+static void* const* g_FlareMaterials = nullptr;
+static bool g_FlareLogOn = false;
+static float g_FlareAxisShiftX = 0.f;
+static float g_FlareAxisShiftY = 0.f;
+static bool g_FlareElementOnLight = true;
+static float g_FlareAngleFade = 1.f;
+
+// Diagnostic, BMVR_FLARE_LOG=1: what a lens flare's position is computed from.
+// One line per flare and eye when the projection or on-screen state changes,
+// otherwise once a second.
+static void FlareLogPosition(const float* world, const float* size, const float* out, const float* view, const float* proj)
+{
+    static int s_lines;
+    if (s_lines >= 20000)
+        return;
+    const int eye = Hooks::m_VR ? Hooks::m_VR->m_StereoEye : 0;
+    const bool onScreen = out[0] >= 0.f && out[1] >= 0.f && out[0] <= size[0] && out[1] <= size[1];
+    const int sig = static_cast<int>(proj[0] * 100.f) * 31 + static_cast<int>(proj[2] * 100.f) * 17
+        + static_cast<int>(proj[5] * 100.f) * 7 + static_cast<int>(proj[6] * 100.f) + (onScreen ? 100000 : 0);
+    const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(static_cast<int>(world[0]))) << 32)
+        ^ (static_cast<uint32_t>(static_cast<int>(world[1])) << 2) ^ static_cast<uint32_t>(eye);
+    struct Seen { int sig; ULONGLONG nextMs; };
+    static std::unordered_map<uint64_t, Seen> s_seen;
+    const ULONGLONG now = GetTickCount64();
+    auto [it, fresh] = s_seen.try_emplace(key, Seen{ sig, 0 });
+    if (!fresh && it->second.sig == sig && now < it->second.nextMs)
+        return;
+    const bool changed = !fresh && it->second.sig != sig;
+    it->second = Seen{ sig, now + 1000 };
+    ++s_lines;
+    // Camera position implied by the view matrix.
+    const float cam[3] = {
+        -(view[0] * view[3] + view[4] * view[7] + view[8] * view[11]),
+        -(view[1] * view[3] + view[5] * view[7] + view[9] * view[11]),
+        -(view[2] * view[3] + view[6] * view[7] + view[10] * view[11]) };
+    Game::logMsg("flare %s t=%llu eye=%d view=%d stereo=%d world=(%.0f,%.0f,%.0f) size=%.0fx%.0f out=(%.0f,%.0f)%s"
+        " proj=(%.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f | %.3f %.3f)"
+        " viewFwd=(%.3f %.3f %.3f) cam=(%.1f,%.1f,%.1f) tid=%lu",
+        changed ? "CHANGE" : "state", now, eye, g_ClientCurrentViewId ? g_ClientCurrentViewId() : -1,
+        Hooks::m_VR && Hooks::m_VR->StereoWorldPassActive() ? 1 : 0,
+        world[0], world[1], world[2], size[0], size[1], out[0], out[1], onScreen ? "" : " OFFSCREEN",
+        proj[0], proj[1], proj[2], proj[3], proj[4], proj[5], proj[6], proj[7],
+        proj[10], proj[11], proj[14], proj[15],
+        view[8], view[9], view[10], cam[0], cam[1], cam[2], GetCurrentThreadId());
+}
+
+static void __cdecl FlareWorldToScreenHook(const float* world, const float* size, float* out)
+{
+    g_OrigFlareWorldToScreen(world, size, out);
+    g_FlareAxisShiftX = 0.f;
+    g_FlareAxisShiftY = 0.f;
+    if (!g_FlareMaterials || !*g_FlareMaterials)
+        return;
+    void* materials = *g_FlareMaterials;
+    using GetContextFn = void*(__thiscall*)(void*);
+    void* ctx = (*reinterpret_cast<GetContextFn**>(materials))[0x19C / 4](materials);
+    if (!ctx)
+        return;
+    using VoidFn = void(__thiscall*)(void*);
+    using GetMatrixFn = void(__thiscall*)(void*, int, float*);
+    void** vt = *reinterpret_cast<void***>(ctx);
+    reinterpret_cast<VoidFn>(vt[0x08 / 4])(ctx);
+    float view[16] = {}, proj[16] = {};
+    reinterpret_cast<GetMatrixFn>(vt[0x78 / 4])(ctx, 0, view);
+    reinterpret_cast<GetMatrixFn>(vt[0x78 / 4])(ctx, 1, proj);
+    reinterpret_cast<VoidFn>(vt[0x0C / 4])(ctx);
+    reinterpret_cast<VoidFn>(vt[0x04 / 4])(ctx);
+    if (g_FlareLogOn)
+        FlareLogPosition(world, size, out, view, proj);
+    // Where the view axis lands: NDC (-m02, -m12), screen y pointing down.
+    if (bmvr::g_FlareEyeAxis && g_OrigFlareDrawQuad)
+    {
+        g_FlareAxisShiftX = -proj[2] * size[0] * 0.5f;
+        g_FlareAxisShiftY = proj[6] * size[1] * 0.5f;
+        // One layout for both eyes, from the point between them: the angle to
+        // the axis decides how the rays turn, and near the axis it differs a
+        // lot per eye. Each eye then gets that layout at its own view of the light.
+        const int eye = Hooks::m_VR ? Hooks::m_VR->m_StereoEye : 0;
+        if (bmvr::g_FlareSharedLayout && (eye == 1 || eye == 2))
+        {
+            const float depth = -(view[8] * world[0] + view[9] * world[1] + view[10] * world[2] + view[11]);
+            if (depth > 1.f)
+            {
+                const float halfIpd = Hooks::m_VR->m_Ipd * Hooks::m_VR->m_IpdScale * Hooks::m_VR->m_VRScale * 0.5f;
+                const float parallax = proj[0] * halfIpd / depth * size[0] * 0.5f;
+                g_FlareAxisShiftX += eye == 1 ? parallax : -parallax;
+            }
+        }
+        out[0] -= g_FlareAxisShiftX;
+        out[1] -= g_FlareAxisShiftY;
+    }
+    // Fade by the angle off the view axis, seen from between the eyes.
+    g_FlareAngleFade = 1.f;
+    if (bmvr::g_FlareFadeAngle > 0.f && proj[0] > 0.01f && proj[5] > 0.01f && size[0] > 0.f && size[1] > 0.f)
+    {
+        const float tanX = (out[0] - size[0] * 0.5f) / (size[0] * 0.5f) / proj[0];
+        const float tanY = (out[1] - size[1] * 0.5f) / (size[1] * 0.5f) / proj[5];
+        const float deg = std::atan(std::sqrt(tanX * tanX + tanY * tanY)) * 57.29578f;
+        g_FlareAngleFade = (std::max)(0.f, 1.f - deg / bmvr::g_FlareFadeAngle);
+    }
+}
+
+// Element types 1 and 4 sit on the line from the light through the middle, at a
+// set fraction: 0 is on the light. The other types are always on the light.
+using FlareElementFn = void(__thiscall*)(void* flare, float scale, float x, float y, float z, const unsigned char* element, float* size);
+static FlareElementFn g_OrigFlareElement = nullptr;
+
+static void __fastcall FlareElementHook(void* ecx, void* edx, float scale, float x, float y, float z, const unsigned char* element, float* size)
+{
+    (void)edx;
+    const int type = *reinterpret_cast<const int*>(element);
+    const float along = *reinterpret_cast<const float*>(element + 0x30);
+    g_FlareElementOnLight = !(type == 1 || type == 4) || std::abs(along) < 0.01f;
+    g_OrigFlareElement(ecx, scale, x, y, z, element, size);
+    g_FlareElementOnLight = true;
+}
+
+static void __fastcall FlareDrawQuadHook(void* ecx, void* edx, void* material, int x, int y, int w, int h, void* color, float angle)
+{
+    (void)edx;
+    // Layers placed away from the light (see FlareElementHook) wash out the view
+    // in a headset: the large square ones most, the rest as moving ghosts.
+    const int eyeH = Hooks::m_VR ? static_cast<int>(Hooks::m_VR->m_RenderHeight) : 0;
+    const bool onLight = g_FlareElementOnLight;
+    const bool square = std::abs(w - h) * 8 < (std::max)(w, h);
+    const bool haze = !onLight && square && w > bmvr::g_FlareHazeMinSize * eyeH;
+    const float scale = (onLight ? bmvr::g_FlareLightScale : (haze ? bmvr::g_FlareHazeScale : bmvr::g_FlareGhostScale)) * g_FlareAngleFade;
+    // Smaller as well as dimmer, down to half size.
+    const float shrink = 0.5f + 0.5f * g_FlareAngleFade;
+    const int drawW = static_cast<int>(w * shrink);
+    const int drawH = static_cast<int>(h * shrink);
+    x += (w - drawW) / 2;
+    y += (h - drawH) / 2;
+    if (g_FlareLogOn && Hooks::m_VR && Hooks::m_VR->m_StereoEye != 0)
+    {
+        static int s_quads;
+        if (s_quads < 120)
+        {
+            ++s_quads;
+            Game::logMsg("flarequad eye=%d mat=%p %dx%d at %d,%d %s", Hooks::m_VR->m_StereoEye, material, w, h, x, y,
+                onLight ? "light" : (haze ? "haze" : "ghost"));
+        }
+    }
+    unsigned char dim[4];
+    if (color && scale < 1.f)
+    {
+        if (scale <= 0.f)
+            return;
+        std::memcpy(dim, color, 4);
+        for (int i = 0; i < 3; ++i)
+            dim[i] = static_cast<unsigned char>(dim[i] * scale);
+        color = dim;
+    }
+    g_OrigFlareDrawQuad(ecx, material, x + static_cast<int>(g_FlareAxisShiftX), y + static_cast<int>(g_FlareAxisShiftY), drawW, drawH, color, angle);
+}
+
+// Same switch: how visible the flare is for each eye. Below the draw threshold
+// the position above is never computed, so this also covers hidden flares.
+using FlareFractionFn = float(__thiscall*)(void* flare, void* leaf, const float* pos);
+static FlareFractionFn g_OrigFlareFraction = nullptr;
+
+static float __fastcall FlareFractionLog(void* ecx, void* edx, void* leaf, const float* pos)
+{
+    (void)edx;
+    const float f = g_OrigFlareFraction(ecx, leaf, pos);
+    static int s_lines;
+    if (s_lines >= 30000)
+        return f;
+    const int eye = Hooks::m_VR ? Hooks::m_VR->m_StereoEye : 0;
+    const int bucket = f <= 0.02f ? 0 : (f < 0.98f ? 1 : 2);
+    struct Seen { int bucket; ULONGLONG nextMs; };
+    static std::unordered_map<uint64_t, Seen> s_seen;
+    const uint64_t key = (static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ecx)) << 2) | static_cast<uint32_t>(eye);
+    const ULONGLONG now = GetTickCount64();
+    auto [it, fresh] = s_seen.try_emplace(key, Seen{ bucket, 0 });
+    if (!fresh && it->second.bucket == bucket && now < it->second.nextMs)
+        return f;
+    const bool changed = !fresh && it->second.bucket != bucket;
+    it->second = Seen{ bucket, now + 500 };
+    ++s_lines;
+    float view[16] = {};
+    if (g_FlareMaterials && *g_FlareMaterials)
+    {
+        void* materials = *g_FlareMaterials;
+        using GetContextFn = void*(__thiscall*)(void*);
+        void* ctx = (*reinterpret_cast<GetContextFn**>(materials))[0x19C / 4](materials);
+        if (ctx)
+        {
+            using VoidFn = void(__thiscall*)(void*);
+            using GetMatrixFn = void(__thiscall*)(void*, int, float*);
+            void** vt = *reinterpret_cast<void***>(ctx);
+            reinterpret_cast<VoidFn>(vt[0x08 / 4])(ctx);
+            reinterpret_cast<GetMatrixFn>(vt[0x78 / 4])(ctx, 0, view);
+            reinterpret_cast<VoidFn>(vt[0x0C / 4])(ctx);
+            reinterpret_cast<VoidFn>(vt[0x04 / 4])(ctx);
+        }
+    }
+    Game::logMsg("flarefrac %s t=%llu eye=%d view=%d f=%.3f world=(%.0f,%.0f,%.0f) cam=(%.1f,%.1f,%.1f)",
+        changed ? "CHANGE" : "state", now, eye, g_ClientCurrentViewId ? g_ClientCurrentViewId() : -1, f,
+        pos[0], pos[1], pos[2],
+        -(view[0] * view[3] + view[4] * view[7] + view[8] * view[11]),
+        -(view[1] * view[3] + view[5] * view[7] + view[9] * view[11]),
+        -(view[2] * view[3] + view[6] * view[7] + view[10] * view[11]));
+    return f;
+}
+
+static void InstallFlareHooks(uintptr_t client)
+{
+    // New absolute data addresses are verified for build 26234270 only.
+    if (!client || !bmvr::abi::Latest()) return;
+    static const unsigned char kPosPrologue[] = { 0x55, 0x8B, 0xEC, 0x81, 0xEC, 0xE4, 0x00, 0x00, 0x00 };
+    static const unsigned char kQuadPrologue[] = { 0x55, 0x8B, 0xEC, 0x81, 0xEC, 0x20, 0x02, 0x00, 0x00 };
+    auto* pos = reinterpret_cast<unsigned char*>(client + Offsets::kLensflareWorldToScreenRva);
+    auto* quad = reinterpret_cast<unsigned char*>(client + Offsets::kLensflareDrawQuadRva);
+    if (std::memcmp(pos, kPosPrologue, sizeof(kPosPrologue)) != 0
+        || std::memcmp(quad, kQuadPrologue, sizeof(kQuadPrologue)) != 0)
+    {
+        Game::logMsg("Lens flare eye axis: client+0x%X / +0x%X MISMATCH (off)",
+            Offsets::kLensflareWorldToScreenRva, Offsets::kLensflareDrawQuadRva);
+        Game::noteMissingOffset("Lens flare position + quad draw (per-eye flare layout)");
+        return;
+    }
+    g_FlareMaterials = reinterpret_cast<void* const*>(client + Offsets::kClientMaterialsPtrRva);
+    if (MH_CreateHook(quad, reinterpret_cast<LPVOID>(&FlareDrawQuadHook),
+            reinterpret_cast<LPVOID*>(&g_OrigFlareDrawQuad)) != MH_OK
+        || MH_EnableHook(quad) != MH_OK)
+    {
+        g_OrigFlareDrawQuad = nullptr;
+        Game::logMsg("Lens flare eye axis: quad hook failed (off)");
+        return;
+    }
+    if (MH_CreateHook(pos, reinterpret_cast<LPVOID>(&FlareWorldToScreenHook),
+            reinterpret_cast<LPVOID*>(&g_OrigFlareWorldToScreen)) != MH_OK
+        || MH_EnableHook(pos) != MH_OK)
+    {
+        Game::logMsg("Lens flare eye axis: position hook failed (off)");
+        return;
+    }
+    static const unsigned char kElementPrologue[] = { 0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x2C, 0x56, 0x57 };
+    auto* element = reinterpret_cast<unsigned char*>(client + Offsets::kLensflareElementRva);
+    if (std::memcmp(element, kElementPrologue, sizeof(kElementPrologue)) != 0
+        || MH_CreateHook(element, reinterpret_cast<LPVOID>(&FlareElementHook),
+            reinterpret_cast<LPVOID*>(&g_OrigFlareElement)) != MH_OK
+        || MH_EnableHook(element) != MH_OK)
+        Game::logMsg("Lens flare layers: element hook failed, all layers stay on");
+    Game::logMsg("Lens flare eye axis hooks on (FlareEyeAxis=%d)", bmvr::g_FlareEyeAxis ? 1 : 0);
+
+    char v[8] = {};
+    if (!GetEnvironmentVariableA("BMVR_FLARE_LOG", v, sizeof(v)) || v[0] != '1')
+        return;
+    g_FlareLogOn = true;
+    Game::logMsg("flare log on (BMVR_FLARE_LOG)");
+    static const unsigned char kFractionPrologue[] = { 0x55, 0x8B, 0xEC, 0x8B, 0x45, 0x08, 0x83, 0xEC, 0x1C };
+    auto* frac = reinterpret_cast<unsigned char*>(client + Offsets::kLensflareFractionRva);
+    if (std::memcmp(frac, kFractionPrologue, sizeof(kFractionPrologue)) != 0)
+        Game::logMsg("flare log: fraction client+0x%X MISMATCH (off)", Offsets::kLensflareFractionRva);
+    else if (MH_CreateHook(frac, reinterpret_cast<LPVOID>(&FlareFractionLog),
+            reinterpret_cast<LPVOID*>(&g_OrigFlareFraction)) == MH_OK)
+        MH_EnableHook(frac);
+}
+
 static void InstallPixelVisStats(uintptr_t client)
 {
     char v[8] = {};
@@ -321,6 +591,7 @@ static void InstallPixelVisPerEye()
     }
     g_ClientCurrentViewId = reinterpret_cast<ClientCurrentViewIdFn>(target);
     InstallPixelVisStats(client);
+    InstallFlareHooks(client);
     // Headless A/B aid: BMVR_PIXELVIS_NOGRACE=1 keeps the stock 1-frame age.
     char noGrace[8] = {};
     const bool grace = !(GetEnvironmentVariableA("BMVR_PIXELVIS_NOGRACE", noGrace, sizeof(noGrace)) && noGrace[0] == '1');
@@ -3786,6 +4057,40 @@ namespace
         return false;
     }
 
+    // EyeBloom: the bloom pyramid binds its window-proportional targets
+    // (_rt_Small2FB0 960x540 ...) with SetRenderTarget and a viewport that
+    // covers exactly that target. ClampStereoViewport grew such a viewport to
+    // the eye, so DrawScreenSpaceRectangle (dest relative to the viewport)
+    // drew the bright-pass into the top-left 960/eyeW x 540/eyeH of its
+    // target and engine_post stretched it into a scene stamp in the eye's
+    // top-left corner (bm_c2a5a, 2026-11-04). A viewport that is the whole
+    // bound target, when that target is neither the eye nor the window, stays
+    // as is.
+    bool LooksLikeWindowExtent(int w, int h);
+    bool EyeBloomOwnRtViewport(void* ctx, int x, int y, int width, int height)
+    {
+        if (!bmvr::g_EyeBloom || !Hooks::m_VR || x != 0 || y != 0 || width <= 0 || height <= 0)
+            return false;
+        int rtW = 0, rtH = 0;
+        if (!QueryContextColorRtSize(ctx, rtW, rtH, nullptr) || rtW != width || rtH != height)
+            return false;
+        if (rtW == static_cast<int>(Hooks::m_VR->m_RenderWidth) && rtH == static_cast<int>(Hooks::m_VR->m_RenderHeight))
+            return false;
+        // The pyramid is sized from the eye (_rt_Small2FB0 1736x1768 for a
+        // 3472x3536 eye), so the test is "not the eye and not the window": a
+        // 1736x1768 viewport grown to the eye put the bright-pass in the
+        // top-left quarter (headset, On A Rail / c2a5a, 2026-11-04).
+        if (LooksLikeWindowExtent(rtW, rtH))
+            return false;
+        static int s_keepLog;
+        if (s_keepLog < 6)
+        {
+            ++s_keepLog;
+            Game::logMsg("EyeBloom: viewport kept at its own target %dx%d", rtW, rtH);
+        }
+        return true;
+    }
+
     void ClampStereoViewport(int& x, int& y, int& width, int& height)
     {
         if (!Hooks::m_VR)
@@ -5036,10 +5341,8 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
 
     EnsureServerFlashlightHook();
     if (m_VR)
-    {
-        m_VR->ApplyRenderTargetFramebufferOverride();
         m_VR->LogFullFrameSizeIfReady();
-    }
+    ApplyFxaaParams();
 
     const bool queued = m_Game && m_Game->GetMatQueueMode() != 0;
     SourceRenderQueueBuildScope sourceRenderQueueBuildScope(m_VR, queued);
@@ -6135,7 +6438,6 @@ void __fastcall Hooks::dLevelInit(void* ecx, void* edx, const char* newmap)
     if (m_VR)
     {
         m_VR->OnLevelInit(newmap);
-        m_VR->ApplyRenderTargetFramebufferOverride();
     }
     if (hkLevelInit.fOriginal)
         hkLevelInit.fOriginal(ecx, newmap);
@@ -6239,7 +6541,8 @@ void __fastcall Hooks::dViewport(void* ecx, void* edx, int x, int y, int width, 
 {
     NoteMatContext(ecx);
     const int trW = width, trH = height;
-    ClampStereoViewport(x, y, width, height);
+    if (!EyeBloomOwnRtViewport(ecx, x, y, width, height))
+        ClampStereoViewport(x, y, width, height);
     if (bmvr::g_PassTraceFrames > 0)
         Game::logMsg("trace: Viewport %dx%d -> %d,%d %dx%d", trW, trH, x, y, width, height);
     if (hkViewport.fOriginal)
@@ -6251,7 +6554,8 @@ void __fastcall Hooks::dGetViewport(void* ecx, void* edx, int& x, int& y, int& w
     (void)edx;
     NoteMatContext(ecx);
     CallOriginalGetViewport(ecx, x, y, width, height);
-    ClampStereoViewport(x, y, width, height);
+    if (!EyeBloomOwnRtViewport(ecx, x, y, width, height))
+        ClampStereoViewport(x, y, width, height);
 }
 
 void __fastcall Hooks::dGetRenderTargetDimensions(void* ecx, void* edx, int& width, int& height)
@@ -6962,7 +7266,7 @@ void __fastcall Hooks::dDrawScreenSpaceRectangle(void* ecx, void* edx, IMaterial
             ++s_gatedPost;
         }
     }
-    if (StereoBloomMaterial(matName) && stereoEyePost && !eyeEnginePost)
+    if (!bmvr::g_EyeBloom && StereoBloomMaterial(matName) && stereoEyePost && !eyeEnginePost)
     {
         static int s_skipBloom;
         if (s_skipBloom < 12)
@@ -7148,13 +7452,16 @@ void __fastcall Hooks::dDrawScreenSpaceRectangle(void* ecx, void* edx, IMaterial
             matName, origX, origY, origW, origH, destX, destY, width, height, srcWidth, srcHeight,
             srcX0, srcY0, srcX1, srcY1, rtName, rtW, rtH);
     }
-    // engine_post on an eye. Its src texture is the window/4 small FB
+    // engine_post on an eye. With the bloom chain sized from the eye the src
+    // rect already matches and the composite is 1:1 (measured 2026-11-05); the
+    // remap below is for the small-eye fallback, where the chain stays window
+    // sized. It stretched the eye up to 10 px and softened it by about 20 %.
+    // Its src texture is the window/4 small FB
     // (320x160 for 1280x640), but the engine sizes the src rect from the eye
     // (287x295 for 1152x1184), so v ran to 1.84 and the composite, which also
     // samples _rt_FullFrameFB through those texcoords, landed in the top 54 %
     // (headless bm_c1a0a, MulticoreMode, 2026-10-30). Map the rect onto the
-    // whole src texture whenever dest covers the eye. Growing _rt_Small*FB*
-    // instead zoomed and warped the picture (RUNTIME.md, 2026-09-03).
+    // whole src texture whenever dest covers the eye.
     // If the context viewport is not the eye on a 1x eye RT, pin it too.
     int vpX = 0, vpY = 0, vpW = 0, vpH = 0;
     bool vpPinned = false;
@@ -7162,7 +7469,14 @@ void __fastcall Hooks::dDrawScreenSpaceRectangle(void* ecx, void* edx, IMaterial
     {
         const char* varName = "none";
         float bloomOrig = 0.f;
-        const bool bloomSet = ZeroEnginePostBloomForEye(material, matName, varName, bloomOrig);
+        bool bloomSet = false;
+        if (bmvr::g_EyeBloom)
+        {
+            RestoreEnginePostBloom();
+            varName = "kept (EyeBloom)";
+        }
+        else
+            bloomSet = ZeroEnginePostBloomForEye(material, matName, varName, bloomOrig);
         CallOriginalGetViewport(ecx, vpX, vpY, vpW, vpH);
         int rtW = 0, rtH = 0;
         QueryContextColorRtSize(ecx, rtW, rtH, nullptr);
@@ -9650,11 +9964,136 @@ void __cdecl Hooks::dSpriteQuad(float* origin, float width, float height, unsign
         hkSpriteQuad.fOriginal(origin, width, height, color);
 }
 
+namespace
+{
+    // Last back-buffer size the engine asked for, printed with each render target it creates. Bloom targets are
+    // eye/2 in headset sessions and window/2 headless; this shows which size each creation saw, and who asked.
+    struct BackBufferTrace
+    {
+        int origW, origH, w, h;
+        void* caller;
+        bool stereo;
+    };
+    BackBufferTrace g_LastBackBuffer{};
+
+    struct BackBufferTraceScope
+    {
+        int& w;
+        int& h;
+        int origW;
+        int origH;
+        void* caller;
+        ~BackBufferTraceScope()
+        {
+            g_LastBackBuffer = { origW, origH, w, h, caller,
+                Hooks::m_VR && Hooks::m_VR->StereoWorldPassActive() };
+        }
+    };
+
+    // "client.dll+0x1234" for a code address, for log lines.
+    void DescribeCodeAddress(void* addr, char* out, size_t outSize)
+    {
+        HMODULE mod = nullptr;
+        char path[MAX_PATH] = "?";
+        if (addr && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                static_cast<LPCSTR>(addr), &mod) && mod)
+            GetModuleFileNameA(mod, path, MAX_PATH);
+        const char* base = std::strrchr(path, '\\');
+        base = base ? base + 1 : path;
+        sprintf_s(out, outSize, "%s+0x%X", base,
+            mod ? static_cast<unsigned>(reinterpret_cast<uintptr_t>(addr) - reinterpret_cast<uintptr_t>(mod)) : 0u);
+    }
+
+    void RtActualSize(ITexture* tex, int& w, int& h)
+    {
+        w = h = 0;
+        if (!tex)
+            return;
+        __try
+        {
+            w = tex->GetActualWidth();
+            h = tex->GetActualHeight();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            w = h = 0;
+        }
+    }
+
+    // One line per render target the engine creates (first 256).
+    void LogRtTrace(void* materialSystem, const char* name, int reqW, int reqH, int mode, ITexture* tex, void* caller)
+    {
+        static int s_count;
+        if (s_count >= 256)
+            return;
+        ++s_count;
+        int aw, ah;
+        RtActualSize(tex, aw, ah);
+        const BackBufferTrace bb = g_LastBackBuffer;
+        char callerText[96];
+        char bbCallerText[96];
+        DescribeCodeAddress(caller, callerText, sizeof(callerText));
+        DescribeCodeAddress(bb.caller, bbCallerText, sizeof(bbCallerText));
+        int fbW = 0, fbH = 0;
+        __try
+        {
+            using GetFn = void(__thiscall*)(void*, int&, int&);
+            void** vt = *reinterpret_cast<void***>(materialSystem);
+            reinterpret_cast<GetFn>(vt[Offsets::kIMaterialSystem_GetRTFBDimensionsVt])(materialSystem, fbW, fbH);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            fbW = fbH = 0;
+        }
+        Game::logMsg("RtTrace %s req=%dx%d mode=%d fb=%dx%d actual=%dx%d thread=%lu stereo=%d caller=%s lastBB=%dx%d(orig %dx%d) bbStereo=%d bbCaller=%s",
+            name ? name : "null", reqW, reqH, mode, fbW, fbH, aw, ah, GetCurrentThreadId(),
+            Hooks::m_VR && Hooks::m_VR->StereoWorldPassActive() ? 1 : 0, callerText,
+            bb.w, bb.h, bb.origW, bb.origH, bb.stereo ? 1 : 0, bbCallerText);
+    }
+}
+
+void Hooks::ApplyFxaaParams()
+{
+    static float* s_console = nullptr;
+    static float* s_quality = nullptr;
+    static bool s_resolved = false;
+    if (!s_resolved)
+    {
+        s_resolved = true;
+        if (m_Game && m_Game->m_Offsets && m_Game->m_Offsets->EnginePostProxyBind.valid)
+        {
+            const auto* bind = reinterpret_cast<const uint8_t*>(
+                static_cast<uintptr_t>(m_Game->m_Offsets->EnginePostProxyBind.address));
+            s_console = *reinterpret_cast<float* const*>(bind + Offsets::kEnginePostBindFxaaC);
+            s_quality = *reinterpret_cast<float* const*>(bind + Offsets::kEnginePostBindFxaaQ);
+            // The two blocks are neighbours. Anything else means this is not the
+            // code we read, so leave the game's memory alone.
+            if (s_quality != s_console + 4)
+            {
+                s_console = s_quality = nullptr;
+                Game::noteMissingOffset("FXAA parameter blocks in the engine_post proxy");
+            }
+        }
+        Game::logMsg("FXAA parameters %s (FxaaApply=%d)", s_console ? "available" : "NOT available on this game build",
+            bmvr::g_FxaaApply ? 1 : 0);
+    }
+    if (!s_console || !s_quality)
+        return;
+    // The shader reads only this block: x sub-pixel, z edge, w dark edge. The
+    // game's own filler puts the dark edge value in the console block instead,
+    // which no shader register reads. Off restores the zeros the game runs with.
+    const bool on = bmvr::g_FxaaApply;
+    s_quality[0] = on ? bmvr::g_FxaaSubpixel : 0.f;
+    s_quality[2] = on ? bmvr::g_FxaaEdgeThreshold : 0.f;
+    s_quality[3] = on ? bmvr::g_FxaaEdgeThresholdMin : 0.f;
+}
+
 void __fastcall Hooks::dGetBackBufferDimensions(void* ecx, void* edx, int& width, int& height)
 {
     (void)edx;
     if (hkGetBackBufferDimensions.fOriginal)
         hkGetBackBufferDimensions.fOriginal(ecx, width, height);
+    BackBufferTraceScope traceScope{ width, height, width, height, _ReturnAddress() };
     if (m_VR && m_VR->HudPaintActive())
     {
         int x = 0, y = 0, w = 0, h = 0;
@@ -10000,6 +10439,39 @@ void __fastcall Hooks::dNewRendererUpdatePerCamera(void* ecx, void* edx, void* a
             v->m_flOffCenterBottom, v->m_flOffCenterTop, v->origin.x, v->origin.y, v->origin.z,
             v->angles.x, v->angles.y, v->angles.z, view);
     }
+    // The light loop tests against the frame's frustum, built from the main view.
+    // In VR that view follows the gun aim, so a light behind the hand went out
+    // with the head facing it. Test against the view being rendered instead.
+    if (bmvr::abi::Latest() && bmvr::g_LightCullEyeView && view && m_VR && m_VR->m_StereoEye != 0)
+    {
+        using GenerateFrustumFn = void(__cdecl*)(const void* origin, const void* angles, float, float, float, float, void*);
+        static GenerateFrustumFn s_generate = nullptr;
+        static void* s_frustum = nullptr;
+        static bool s_checked = false;
+        if (!s_checked)
+        {
+            s_checked = true;
+            static const unsigned char kPrologue[] = { 0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x28, 0x8D, 0x45, 0xF0 };
+            const auto client = reinterpret_cast<uintptr_t>(GetModuleHandleA("client.dll"));
+            const auto* fn = reinterpret_cast<const unsigned char*>(client + Offsets::kGeneratePerspectiveFrustumRva);
+            if (client && std::memcmp(fn, kPrologue, sizeof(kPrologue)) == 0)
+            {
+                s_generate = reinterpret_cast<GenerateFrustumFn>(client + Offsets::kGeneratePerspectiveFrustumRva);
+                s_frustum = reinterpret_cast<void*>(client + Offsets::kClientFrameFrustumRva);
+                Game::logMsg("Light culling follows each eye's view (LightCullEyeView)");
+            }
+            else
+            {
+                Game::logMsg("Light culling: frustum builder client+0x%X MISMATCH (off)", Offsets::kGeneratePerspectiveFrustumRva);
+                Game::noteMissingOffset("Frame frustum builder (per-eye light culling)");
+            }
+        }
+        if (s_generate)
+        {
+            const auto* v = static_cast<const CViewSetup*>(view);
+            s_generate(&v->origin, &v->angles, v->zNear, v->zFar, v->fov, v->m_flAspectRatio, s_frustum);
+        }
+    }
     hkNewRendererUpdatePerCamera.fOriginal(ecx, a1, view, secondary, a4);
 }
 
@@ -10046,13 +10518,13 @@ float __fastcall Hooks::dGetScreenAspectRatio(void* ecx, void* edx)
 ITexture* __fastcall Hooks::dCreateNamedRTEx(void* ecx, void* edx, const char* name, int w, int h, int sizeMode, int format, int depth, unsigned textureFlags, unsigned renderTargetFlags)
 {
     (void)edx;
+    void* const rtCaller = _ReturnAddress();
+    const int rtReqW = w, rtReqH = h, rtReqMode = sizeMode;
     {
         const char* map = PeekLevelName();
         if (map && map[0])
             bmvr::NoteEngineMapName(map);
     }
-    if (m_VR)
-        m_VR->ApplyRenderTargetFramebufferOverride(ecx);
 
     uint32_t fbW = 0, fbH = 0;
     const bool haveFb = bmvr::TryHmdFramebuffer() && bmvr::HaveHmdFramebufferSize(fbW, fbH);
@@ -10164,6 +10636,25 @@ ITexture* __fastcall Hooks::dCreateNamedRTEx(void* ecx, void* edx, const char* n
             }
         }
     }
+    uint32_t tableW = 0, tableH = 0;
+    if (bmvr::EyeScaledRtSize(name, tableW, tableH))
+    {
+        static int s_tableLog;
+        if (s_tableLog < 32)
+        {
+            ++s_tableLog;
+            Game::logMsg("CreateNamedRT %s mode=%d depth=%d -> %ux%u LITERAL, own depth (eye size table)",
+                name, sizeMode, depth, tableW, tableH);
+        }
+        w = static_cast<int>(tableW);
+        h = static_cast<int>(tableH);
+        sizeMode = RT_SIZE_LITERAL;
+        // Own depth buffer of the same size. With the engine's shared depth the
+        // viewport on a target taller than the window is cut to the window's
+        // height: the bright pass filled only the top of the target and left
+        // stale pixels below, which engine_post then showed as a ghost.
+        depth = MATERIAL_RT_DEPTH_SEPARATE;
+    }
     const int oldW = w;
     const int oldH = h;
     if (wantGrow && oldW >= 640 && oldH >= 360
@@ -10273,6 +10764,7 @@ ITexture* __fastcall Hooks::dCreateNamedRTEx(void* ecx, void* edx, const char* n
         --bmvr::Hl2vrMsaaScope::Depth();
     if (msaaScope && s_msaaArmed)
         bmvr::EndRisky(L"msaa");
+    LogRtTrace(ecx, name, rtReqW, rtReqH, rtReqMode, tex, rtCaller);
     if (tex && name && (fullMode || namedFb || namedGb || wantGrow))
     {
         int aw = 0, ah = 0;
@@ -10384,8 +10876,6 @@ void bmvr::InstallEarlyFramebufferHook()
     if (attempted)
         return;
     attempted = true;
-    if (!TryHmdFramebuffer())
-        return;
 
     const MH_STATUS mh = MH_Initialize();
     if (mh != MH_OK && mh != MH_ERROR_ALREADY_INITIALIZED)
@@ -10402,6 +10892,31 @@ void bmvr::InstallEarlyFramebufferHook()
         Log("Framebuffer hook: materialsystem.dll not loaded yet");
         return;
     }
+    // CreateDevice runs on the engine's thread, with the eye size known, and the engine
+    // allocates its full-frame targets right after it returns. Hook the allocator here
+    // rather than from the Game thread: that thread gets there only after client.dll
+    // and the helper's first located views, so on a fast start (seen with SteamVR on
+    // Windows) both allocation passes had finished, FullFrame stayed at the window size
+    // and the whole session ran on the window-blit fallback.
+    {
+        const Offset createRt = [] {
+            Offset recent{ "materialsystem.dll", Offsets::kCreateNamedRTExRva, Offsets::kCreateNamedRTExSig, 0, true };
+            if (recent.valid) return recent;
+            return Offset{ "materialsystem.dll", 0x49660,
+                "55 8B EC 83 B9 A0 2A 00 00 00 75 14 68 ? ? ? ? FF 15 ? ? ? ? 83 C4 04 33 C0 5D C2 20 00 8B 0D", 0, true };
+        }();
+        if (createRt.valid && !Hooks::hkCreateNamedRTEx.pTarget)
+        {
+            if (Hooks::hkCreateNamedRTEx.createHook((LPVOID)createRt.address, &Hooks::dCreateNamedRTEx) != 0
+                || Hooks::hkCreateNamedRTEx.enableHook() != 0)
+                Log("CreateNamedRTEx early hook failed rva=0x%X", createRt.offset);
+            else
+                Log("Hook enabled: CreateNamedRTEx rva=0x%X (before the first render target)", createRt.offset);
+        }
+    }
+
+    if (!TryHmdFramebuffer())
+        return;
 
     int off = SigScanner::VerifyOffset("materialsystem.dll", 0x53EF0,
         "55 8B EC 8B 0D ? ? ? ? 8B 01 8B 80 58 04 00 00 5D FF E0");

@@ -96,10 +96,22 @@ ControllerPitchTilt=-35.0
 ControllerPitchTiltTouch=0
 ControllerPitchTiltIndex=0
 ControllerPitchTiltVive=-45.0
-# Touch aim origin sits ahead of grip. Extra ox pulls the gun back along
-# -forward (same as numpad 7/9). If you already saved 5.5 extras in
-# VR/viewmodel_offsets.txt for crowbar/glock/grenade, reset those (numpad 0)
-# or they will double with this default.
+# Player preference on top of the per-controller tilt above, in degrees
+# (negative = gun points lower). Also in the VR settings panel (bmvr_gun_pitch).
+GunPitchOffset=0
+# Hand models rolled thumb-up around the controller, in degrees, to match a
+# hand around a grip instead of lying flat (90 = palms facing each other).
+# Mirrored per hand, all controllers (Index included); not for a hand on a
+# weapon. Also in the VR settings panel (bmvr_hand_roll).
+VrHandsRollDeg=90
+# Support hand on the gun, game units along the gun: right, up, toward the muzzle
+# (bmvr_hand_gun_right, _up, _forward). Also in the VR settings panel.
+VrHandsGunGripRight=1.2
+VrHandsGunGripUp=0
+VrHandsGunGripForward=0
+# While the G-Man is in front of you, grip extends only the middle finger.
+VrGmanGesture=true
+# Touch aim origin sits ahead of the grip. Pulls the gun back along -forward.
 ViewmodelPosOffsetXTouch=5.5
 
 # 0.91 was BM/L4D2 scale; user 2026-08-25: ~25% smaller than that → 0.68.
@@ -159,6 +171,9 @@ MulticoreMode=true
 # into the window, so geometry edges stay aliased; gloves drawn into the eyes
 # still get MSAA. Named per-eye RTs would AA the scene like L4D2VR.
 AntiAliasing=0
+
+# Asymmetric per-eye projection; existing user setting is preserved on upgrade.
+OffCenterEyes=true
 
 # Motion / comfort
 Haptics=true
@@ -227,9 +242,7 @@ RefractCopyRtScale=0.5
 EnvmapScaleWorld=1
 EnvmapScaleModels=1
 FollowScriptedCamera=true
-GunPitchOffset=0
 Msaa=0
-OffCenterEyes=false
 VrCrosshairDot=false
 ScopeEye=right
 CrouchStickHold=false
@@ -241,7 +254,52 @@ VrHandThrow=true
 ThrowScale=3.75
 MenuHeightOffsetMeters=-0.02
 ShoulderGestures=true
-SettingsTriangleHold=false
+
+# Hold Triangle/Y 0.6 s = VR settings panel; a tap pauses on release.
+# false = Triangle/Y pauses on press; open the panel from the weapon menu's gear.
+SettingsTriangleHold=true
+
+# Optional features, off by default:
+# Weapon menu: VR gear slot below the crowbar (opens the VR settings panel).
+# false hides it, but only while SettingsTriangleHold=true (else the panel
+# could not be opened at all).
 WeaponMenuSettingsGear=true
 WeaponMenuTilt=true
 VrSettingsPause=true
+
+# Bloom and auto-exposure on the eyes (bmvr_eye_bloom). Also in the VR settings panel.
+EyeBloom=true
+
+# Deferred lights are culled from each eye's view (bmvr_light_cull_eye). false = the main view,
+# which follows the gun aim: lights behind the hand go out.
+LightCullEyeView=true
+
+# Lens flares laid out around each eye's view axis, so both eyes show the same flare
+# (bmvr_flare_eye_axis). false = around the image centre, as on a flat screen.
+FlareEyeAxis=true
+# Both eyes use one flare layout, from the point between them (bmvr_flare_shared).
+FlareSharedLayout=true
+# A flat screen shows about 37 degrees up and down, so a flare leaves it and its built-in fade is done.
+# A headset shows far more, and a flat layer that far out looks tilted: fade out by this angle
+# off the view axis (bmvr_flare_fade_angle, 0 = no fade).
+FlareFadeAngle=45
+# Strength of the layers on the light (bmvr_flare_light).
+FlareLightScale=1
+# Flare layers placed away from the light are off by default: they wash out the view in a headset.
+# Strength of the large square ones: 0 off, 1 stock (bmvr_flare_haze).
+# A square layer away from the light this wide, as a fraction of the eye height, counts (bmvr_flare_haze_size).
+FlareHazeScale=0
+FlareHazeMinSize=0.5
+# Strength of the other layers away from the light (bmvr_flare_ghosts). All three are in the VR settings panel.
+FlareGhostScale=0
+
+# FXAA settings, also in the VR settings panel and as bmvr_fxaa_* console commands.
+# The game never passes the mat_fxaa_* cvars to the shader and runs FXAA with all values at 0.
+# FxaaApply=true sends these values instead. false keeps the stock behaviour.
+FxaaApply=false
+# Sub-pixel smoothing: 0 off, 0.25 about as sharp as with FxaaApply=false, 0.75 FXAA's own default, 1 softest.
+FxaaSubpixel=0.25
+# Edge contrast needed to smooth: 0.063 most edges, 0.166 FXAA default, 0.333 fewest.
+FxaaEdgeThreshold=0.166
+# Darks below this contrast are skipped: 0.0312 treats most, 0.0833 FXAA default.
+FxaaEdgeThresholdMin=0.0833

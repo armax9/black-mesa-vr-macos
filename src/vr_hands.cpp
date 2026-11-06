@@ -47,6 +47,18 @@ namespace
         return asset.bindMatrices[static_cast<size_t>(joint)];
     }
 
+    VrHandMatrix4 MakeLocalYRotation(float radians)
+    {
+        VrHandMatrix4 out = VrHandMath::Identity();
+        const float c = std::cos(radians);
+        const float s = std::sin(radians);
+        VrHandMath::Set(out, 0, 0, c);
+        VrHandMath::Set(out, 0, 2, s);
+        VrHandMath::Set(out, 2, 0, -s);
+        VrHandMath::Set(out, 2, 2, c);
+        return out;
+    }
+
     VrHandMatrix4 MakeLocalZRotation(float radians)
     {
         VrHandMatrix4 out = VrHandMath::Identity();
@@ -109,6 +121,7 @@ namespace
         bool valveBiped = false;
         bool gripFrameValid = false;
         float gripFrame[3][4]{};
+        bool rightHand = false;
         int fingerJoint[vr::VRFinger_Count][3]{};
         std::vector<VrHandMatrix4> bindLocal;
         std::vector<int> order;
@@ -119,6 +132,7 @@ namespace
         bool paletteValid = false;
         float lastCurl[vr::VRFinger_Count]{};
         float lastGripCurlMin = -1.f;
+        float lastGmanThumb[3]{};
     };
 
     void BuildHandRig(const VrHandMeshAsset& asset, HandRig& rig)
@@ -131,6 +145,7 @@ namespace
         if (!rightHand && !leftHand)
             return;
 
+        rig.rightHand = rightHand;
         const char suffix = rightHand ? 'r' : 'l';
         static const char* kFingerNames[vr::VRFinger_Count] =
         {
@@ -209,7 +224,8 @@ namespace
         HandRig& rig,
         const vr::VRSkeletalSummaryData_t& summary,
         std::vector<VrHandMatrixRows3x4>& outPalette,
-        float gripCurlMin)
+        float gripCurlMin,
+        float gmanThumb = 0.f)
     {
         if (!rig.built)
             BuildHandRig(asset, rig);
@@ -219,7 +235,7 @@ namespace
         float curls[vr::VRFinger_Count];
         for (int finger = 0; finger < vr::VRFinger_Count; ++finger)
         {
-            float curl = std::clamp(summary.flFingerCurl[finger], 0.0f, 1.0f);
+            float curl = std::clamp(summary.flFingerCurl[finger], -0.5f, 1.0f);
             if (gripCurlMin > 0.f)
             {
                 // Thumb (finger 0): keep nearly open so it does not clip into
@@ -230,9 +246,21 @@ namespace
             }
             curls[finger] = curl;
         }
+        // Gesture thumb: lies across the folded fingers instead of curling
+        // through them, which takes a swing at its root as well as a curl.
+        // Only the ripped gloves have these hinges; others just curl.
+        const float thumbWeight = rig.valveBiped ? gmanThumb : 0.f;
+        if (!rig.valveBiped && gmanThumb > curls[0])
+            curls[0] = gmanThumb;
+        const float gmanThumbState[3] = {
+            thumbWeight,
+            thumbWeight * bmvr::g_VrGmanThumbCurl,
+            thumbWeight * bmvr::g_VrGmanThumbSwing,
+        };
         const size_t n = asset.jointNames.size();
         if (rig.paletteValid && outPalette.size() == n && rig.lastGripCurlMin == gripCurlMin
-            && std::memcmp(curls, rig.lastCurl, sizeof(curls)) == 0)
+            && std::memcmp(curls, rig.lastCurl, sizeof(curls)) == 0
+            && std::memcmp(gmanThumbState, rig.lastGmanThumb, sizeof(gmanThumbState)) == 0)
             return true;
 
         static const float kMaxCurlRadians[vr::VRFinger_Count][3] =
@@ -243,6 +271,8 @@ namespace
             { 1.15f, 1.25f, 0.90f },
             { 1.15f, 1.25f, 0.90f },
         };
+        // Thumb joint angles of the gesture at g_VrGmanThumbCurl 1.
+        static const float kGmanThumbRadians[3] = { 0.30f, 0.60f, 0.40f };
 
         std::vector<VrHandMatrix4>& localMatrices = rig.scratchLocal;
         std::vector<VrHandMatrix4>& modelMatrices = rig.scratchModel;
@@ -253,9 +283,20 @@ namespace
             for (int segment = 0; segment < 3; ++segment)
             {
                 const size_t joint = static_cast<size_t>(rig.fingerJoint[finger][segment]);
+                float radians = sign * curls[finger] * kMaxCurlRadians[finger][segment];
+                if (finger == 0 && thumbWeight > 0.f)
+                {
+                    radians = (1.f - thumbWeight) * radians + gmanThumbState[1] * kGmanThumbRadians[segment];
+                    if (segment == 0)
+                    {
+                        // The rigs are mirrored, so the swing changes sign per hand.
+                        const float swing = (rig.rightHand ? -1.f : 1.f) * gmanThumbState[2];
+                        localMatrices[joint] = VrHandMath::Multiply(localMatrices[joint], MakeLocalYRotation(swing));
+                    }
+                }
                 localMatrices[joint] = VrHandMath::Multiply(
                     localMatrices[joint],
-                    MakeLocalZRotation(sign * curls[finger] * kMaxCurlRadians[finger][segment]));
+                    MakeLocalZRotation(radians));
             }
         }
 
@@ -276,6 +317,7 @@ namespace
                 asset.inverseBindMatrices[joint]));
         }
         std::memcpy(rig.lastCurl, curls, sizeof(curls));
+        std::memcpy(rig.lastGmanThumb, gmanThumbState, sizeof(gmanThumbState));
         rig.lastGripCurlMin = gripCurlMin;
         rig.paletteValid = true;
         return true;
@@ -765,7 +807,28 @@ bool BmVrGloves::DrawForEye(
             || (!rightHand && g_Game->m_VR->WantsOffhandGloveWeaponGripCurl()));
         if (TryGetSummary(input, actions[i], summary))
         {
-            if (!BuildSummaryCurlPalette(hand.asset, hand.rig, summary, hand.palette, gripCurl ? 0.40f : 0.f))
+            // G-Man in view: grip folds every finger but the middle one.
+            // Grip drives the middle/ring/pinky curls, so their max is the
+            // grip pull; the gesture follows it in and out. The fingers fold
+            // over the first half of the pull, then the thumb comes over
+            // them: moved together, it passes through them on the way.
+            float gmanThumb = 0.f;
+            if (!gripCurl && g_Game && g_Game->m_VR && (g_Game->m_VR->GmanGestureActive() || bmvr::g_VrGmanGestureForce))
+            {
+                const float grip = std::max({ summary.flFingerCurl[2], summary.flFingerCurl[3], summary.flFingerCurl[4] });
+                if (grip > 0.05f)
+                {
+                    const float fold = std::min(1.f, grip / 0.5f);
+                    gmanThumb = std::clamp((grip - 0.5f) / 0.3f, 0.f, 1.f);
+                    summary.flFingerCurl[1] = fold;
+                    // Negative curl = bent back past the rest pose's
+                    // natural bend (BuildSummaryCurlPalette allows it).
+                    summary.flFingerCurl[2] = -bmvr::g_VrGmanFingerStraight * fold;
+                    summary.flFingerCurl[3] = fold;
+                    summary.flFingerCurl[4] = fold;
+                }
+            }
+            if (!BuildSummaryCurlPalette(hand.asset, hand.rig, summary, hand.palette, gripCurl ? 0.40f : 0.f, gmanThumb))
                 BuildBindPosePalette(hand.asset, hand.palette);
         }
         else if (hand.palette.empty())
@@ -795,21 +858,40 @@ bool BmVrGloves::DrawForEye(
             posOffset.y += bmvr::g_VrHandsRightPoseOffY;
             posOffset.z += bmvr::g_VrHandsRightPoseOffZ;
         }
+        // Hands around a grip sit thumb-up, not palm-down: roll the drawn
+        // glove (only) around the controller's forward axis, mirrored per
+        // hand. One setting for every controller: Index poses already carry
+        // VrHandsIndexRollDeg (that roll also feeds crowbar/flashlight), so
+        // the glove only adds the difference. Also on a hand holding the gun:
+        // rolled, it sits under the gun instead of on its side.
+        QAngle gloveAngles = *angles[i];
+        const bool assetGripFrame = g_Game && g_Game->m_VR && g_Game->m_VR->m_OpenXrHelperBridgeActive
+            && family == L4D2VR_OPENXR_CONTROLLER_FAMILY_TOUCH && hand.rig.gripFrameValid;
+        // The Mac Touch path already derives thumb-up orientation from the asset.
+        // Treat the author's neutral 90 degrees as zero extra roll on that path.
+        float gloveRoll = bmvr::g_VrHandsRollDeg - (assetGripFrame ? 90.f : 0.f);
+        if (family == L4D2VR_OPENXR_CONTROLLER_FAMILY_KNUCKLES)
+            gloveRoll -= bmvr::g_VrHandsIndexRollDeg;
+        if (gloveRoll != 0.f)
+            gloveAngles.z += rightHand ? gloveRoll : -gloveRoll;
+        // Support hand on the gun: toward the gun, so the gun sits in the palm.
+        Vector gloveOrigin = *origins[i];
+        if (gripCurl && g_Game && g_Game->m_VR)
+            gloveOrigin = gloveOrigin + g_Game->m_VR->GunGripHandOffset(rightHand, *angles[1 - i]);
         VrHandMatrix4 world = VrHandMath::BuildControllerWorld(
-            *origins[i],
-            *angles[i],
+            gloveOrigin,
+            gloveAngles,
             sourceUnitsPerMeter,
             scale,
             posOffset,
             rotOffset);
-        if (g_Game && g_Game->m_VR && g_Game->m_VR->m_OpenXrHelperBridgeActive
-            && family==L4D2VR_OPENXR_CONTROLLER_FAMILY_TOUCH && hand.rig.gripFrameValid) {
+        if (assetGripFrame) {
             // Asset-defined palm frame, not the legacy GLB yaw/roll calibration.
             // Corrected frame uses knuckles->wrist for +Y (v17 used its inverse).
-            Vector f,r,u; QAngle::AngleVectors(*angles[i],&f,&r,&u);
+            Vector f,r,u; QAngle::AngleVectors(gloveAngles,&f,&r,&u);
             const float k=sourceUnitsPerMeter*scale;
-            const float controller[3][4]={{r.x*k,u.x*k,-f.x*k,origins[i]->x},
-                {r.y*k,u.y*k,-f.y*k,origins[i]->y},{r.z*k,u.z*k,-f.z*k,origins[i]->z}};
+            const float controller[3][4]={{r.x*k,u.x*k,-f.x*k,gloveOrigin.x},
+                {r.y*k,u.y*k,-f.y*k,gloveOrigin.y},{r.z*k,u.z*k,-f.z*k,gloveOrigin.z}};
             float inv[3][4]{},model[3][4]{};
             bmvr_grip::inverse(hand.rig.gripFrame,inv);bmvr_grip::mul(controller,inv,model);
             world=VrHandMath::Identity();
