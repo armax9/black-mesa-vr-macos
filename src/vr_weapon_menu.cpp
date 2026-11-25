@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 #include <d3d9.h>
+#include "bmvr_seh.h"
 
 namespace
 {
@@ -67,7 +68,7 @@ namespace
         if (!vm)
             return -1;
         int parity = -1;
-        __try
+        BMVR_TRY
         {
             parity = *reinterpret_cast<const unsigned char*>(
                 reinterpret_cast<uintptr_t>(vm) + 0x9F8);
@@ -1760,9 +1761,7 @@ void VR::Recenter(const char* why)
     m_HmdOriginLatched = false;
     m_MenuPanelPoseValid = false;
     ++m_MenuOverlayEpoch;
-    if (bmvr::g_RecenterResetsYaw)
-        m_RotationOffsetY.store(0.f, std::memory_order_release);
-    Game::logMsg("Recenter (%s)%s", why, bmvr::g_RecenterResetsYaw ? " + yaw" : "");
+    Game::logMsg("Recenter (%s)", why);
 }
 
 void VR::RecenterPosition(const char* why)
@@ -2025,8 +2024,11 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
         };
         packInto(kWeaponHex, static_cast<int>(sizeof(kWeaponHex) / sizeof(kWeaponHex[0])));
         // VR settings: one cell below the crowbar, outside the weapon brick.
-        // Hidden only when the Triangle/Y hold can still open the panel.
-        const bool showGear = bmvr::g_WeaponMenuSettingsGear || !bmvr::g_SettingsTriangleHold;
+        // Hidden only while some button still opens the panel (with mapping:
+        // VR settings mapped anywhere; fixed layout: the Triangle/Y hold).
+        const bool panelButton = m_ButtonMapActive ? bmvr::VrSettingsMapped(m_ControllerFamily)
+                                                   : bmvr::g_SettingsTriangleHold;
+        const bool showGear = bmvr::g_WeaponMenuSettingsGear || !panelButton;
         if (showGear && placed < kMaxMenuSlots && take(0, -2))
         {
             WeaponMenuSlot& gear = m_WeaponMenuSlots[placed];

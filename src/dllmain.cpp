@@ -4,29 +4,43 @@
 #include "bmvr_version.h"
 #include <cstdint>
 #include <cstring>
+#include "bmvr_seh.h"
+#include "bmvr_crashinfo.h"
 
 static LONG CALLBACK FaultVeh(PEXCEPTION_POINTERS info)
 {
     if (!info || !info->ExceptionRecord || !info->ContextRecord)
         return EXCEPTION_CONTINUE_SEARCH;
     const DWORD code = info->ExceptionRecord->ExceptionCode;
-    if (code != 0xC0000005 && code != 0xC000001D && code != 0xC0000094)
+    // Fatal codes too (heap corruption, fail fast, stack overflow): those
+    // end the process and were never written (user 2026-11-20: a crash on a
+    // save load left no fault line). They also get a minidump.
+    const bool fatal = bmvr::crashinfo::IsFatalCode(code);
+    if (code != 0xC0000005 && code != 0xC000001D && code != 0xC0000094 && !fatal)
         return EXCEPTION_CONTINUE_SEARCH;
-    static DWORD seen[8];
+    if (fatal)
+        bmvr::crashinfo::DumpNow(info, "fatal exception code");
+    // 32 distinct addresses per process (was 8: a run's real crash could be
+    // past the cap behind caught faults).
+    static DWORD seen[32];
     static volatile LONG count = 0;
     const DWORD eip = info->ContextRecord->Eip;
     const LONG n = InterlockedIncrement(&count);
-    if (n > 8)
+    if (n > 32 && !fatal)
         return EXCEPTION_CONTINUE_SEARCH;
-    seen[n - 1] = eip;
-    for (LONG i = 0; i < n - 1; ++i)
+    if (n > 32)
+        InterlockedExchange(&count, 32);
+    const LONG slot = n > 32 ? 31 : n - 1;
+    seen[slot] = eip;
+    for (LONG i = 0; i < slot; ++i)
     {
         if (seen[i] == eip)
             return EXCEPTION_CONTINUE_SEARCH;
     }
 
     char body[1600];
-    int used = snprintf(body, sizeof(body), "fault eip=%08X code=%08X\n", eip, code);
+    int used = snprintf(body, sizeof(body), "fault eip=%08X code=%08X tid=%lu tick=%lu\n", eip, code,
+        GetCurrentThreadId(), GetTickCount());
     HMODULE mod = nullptr;
     if (GetModuleHandleExA(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -43,7 +57,7 @@ static LONG CALLBACK FaultVeh(PEXCEPTION_POINTERS info)
     for (int frame = 0; frame < 12 && used < static_cast<int>(sizeof(body)) - 80; ++frame)
     {
         DWORD next = 0, ret = 0;
-        __try
+        BMVR_TRY
         {
             next = *reinterpret_cast<DWORD*>(static_cast<uintptr_t>(ebp));
             ret = *reinterpret_cast<DWORD*>(static_cast<uintptr_t>(ebp + 4));
@@ -212,14 +226,26 @@ static DWORD WINAPI InitBMVR(LPVOID param)
     const auto* nt=reinterpret_cast<const IMAGE_NT_HEADERS*>(base+dos->e_lfanew);
     const unsigned char beta[] = {0x55,0x8B,0xEC,0x83,0xEC,0x24,0x53,0x56,0x57,0x8B,0x7D,0x08,0x8B,0xF1,0x85,0xFF};
     const unsigned char stable[] = {0x55,0x8B,0xEC,0x83,0xEC,0x24,0x53,0x56,0x8B,0x75,0x08,0x57,0x8B,0xF9,0x85,0xF6};
-    if (nt->OptionalHeader.SizeOfImage > 0x29CC70+sizeof(beta) && std::memcmp(base+0x29CC70,beta,sizeof(beta))==0)
+    if (nt->OptionalHeader.SizeOfImage > 0x2A01B0+sizeof(beta) && std::memcmp(base+0x2A01B0,beta,sizeof(beta))==0)
+    {
+        const auto* engine = reinterpret_cast<const unsigned char*>(GetModuleHandleA("engine.dll"));
+        const unsigned char paint[] = {0x55,0x8B,0xEC,0x83,0xEC,0x18,0x53,0x8B,0xD9,0x8B,0x0D};
+        const auto* engineDos = reinterpret_cast<const IMAGE_DOS_HEADER*>(engine);
+        const auto* engineNt = engine ? reinterpret_cast<const IMAGE_NT_HEADERS*>(engine + engineDos->e_lfanew) : nullptr;
+        bmvr::abi::build = engineNt && engineNt->OptionalHeader.SizeOfImage > 0x23B600 + sizeof(paint)
+            && std::memcmp(engine + 0x23B600, paint, sizeof(paint)) == 0
+            ? bmvr::abi::Build::Stable26713286 : bmvr::abi::Build::Beta26627981;
+    }
+    else if (nt->OptionalHeader.SizeOfImage > 0x29CC70+sizeof(beta) && std::memcmp(base+0x29CC70,beta,sizeof(beta))==0)
         bmvr::abi::build=bmvr::abi::Build::Beta26234270;
     else if (nt->OptionalHeader.SizeOfImage > 0x29BA10+sizeof(beta) && std::memcmp(base+0x29BA10,beta,sizeof(beta))==0)
         bmvr::abi::build=bmvr::abi::Build::Beta25844216;
     else if (nt->OptionalHeader.SizeOfImage > 0x29D930+sizeof(stable) && std::memcmp(base+0x29D930,stable,sizeof(stable))==0)
         bmvr::abi::build=bmvr::abi::Build::Stable19042901;
     else { bmvr::Log("Game ABI: unsupported client; VR hooks disabled"); return 0; }
-    bmvr::Log("Game ABI selected: %s; common v53 gameplay fixes",bmvr::abi::build == bmvr::abi::Build::Beta26234270 ? "public-beta26234270" : bmvr::abi::Beta()?"public-beta25844216":"stable19042901");
+    bmvr::Log("Game ABI selected: %s; common v53 gameplay fixes",bmvr::abi::Stable267() ? "stable26713286" : bmvr::abi::Current() ? "public-beta26627981" : bmvr::abi::build == bmvr::abi::Build::Beta26234270 ? "public-beta26234270" : bmvr::abi::Beta()?"public-beta25844216":"stable19042901");
+    // One caught fault on purpose: checks BMVR_TRY keeps EBX/ESI/EDI (bmvr_seh.h).
+    bmvr::seh::SelfTest();
     // Test switch: hold back the hooks so the engine's first render target pass runs without them, the startup
     // order some real launches get (bloom targets eye-sized). Harness: BMVR_TEST_INIT_DELAY_MS.
     char delayText[16]{};
@@ -233,7 +259,7 @@ static DWORD WINAPI InitBMVR(LPVOID param)
     return 0;
 }
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
 {
     switch (reason)
     {
@@ -248,12 +274,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         char faultLog[8]{};
         if (GetEnvironmentVariableA("BMVR_FAULT_DIAG",faultLog,sizeof(faultLog))==1 && faultLog[0]=='1')
             AddVectoredExceptionHandler(1, FaultVeh);
+        bmvr::crashinfo::Install();
         bmvr::StartWatchdog();
         bmvr::SetStage("dll_attach");
         CreateThread(nullptr, 0, InitBMVR, hModule, 0, nullptr);
         break;
     }
     case DLL_PROCESS_DETACH:
+        bmvr::crashinfo::NoteDetach(reserved != nullptr);
         RestoreDesktopDisplayModes();
         L4D2VR_ShutdownReShadeVRBridge();
         L4D2VR_ShutdownSystemMouseInputSuppression();

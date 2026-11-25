@@ -48,6 +48,8 @@ namespace dxvk {
     }
 
     const DxsoShaderMetaInfo& GetMeta() const { return m_meta; }
+    // BMVR: the shader can discard pixels (texkill).
+    bool BmvrUsesKill() const { return m_bmvrUsesKill; }
     const DxsoDefinedConstants& GetConstants() const { return m_constants; }
 
     D3D9ShaderMasks GetShaderMask() const { return D3D9ShaderMasks{ m_usedSamplers, m_usedRTs }; }
@@ -76,6 +78,7 @@ namespace dxvk {
     DxsoProgramInfo       m_info;
     DxsoShaderMetaInfo    m_meta;
     DxsoDefinedConstants  m_constants;
+    bool                  m_bmvrUsesKill = false;
     int32_t               m_maxDefinedFloatConst = -1;
     int32_t               m_maxDefinedIntConst = -1;
     int32_t               m_maxDefinedBoolConst = -1;
@@ -175,6 +178,10 @@ namespace dxvk {
     // BMVR: the module was built from bytecode whose cViewProj-turned normals
     // read c253-c255 instead of c8-c10 (filled per draw by the device).
     bool bmvrViewProjNormals = false;
+    // BMVR: screen-aligned particle shader (spritecard): first registers of
+    // cModelView (3) and cProj (4), both read only by dp4. -1 = not one.
+    int bmvrParticleModelView = -1;
+    int bmvrParticleProj = -1;
 
   };
 

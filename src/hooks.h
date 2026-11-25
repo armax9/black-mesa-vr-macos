@@ -64,6 +64,7 @@ typedef void(__thiscall* tViewport)(void* thisptr, int x, int y, int width, int 
 typedef void(__thiscall* tGetViewport)(void* thisptr, int& x, int& y, int& width, int& height);
 typedef void(__thiscall* tGetRenderTargetDimensions)(void* thisptr, int& width, int& height);
 typedef void(__thiscall* tDepthRange)(void* thisptr, float zNear, float zFar);
+typedef void(__thiscall* tSetHeightClipMode)(void* thisptr, int mode);
 typedef void(__thiscall* tMatBind)(void* thisptr, IMaterial* material, void* proxyData);
 typedef void(__thiscall* tDrawModelExecute)(void* thisptr, void* state, const ModelRenderInfo_t& info, void* pCustomBoneToWorld);
 typedef void*(__cdecl* tLightcacheFindNearest)(int x, int y, int z, int flags);
@@ -84,6 +85,7 @@ typedef void(__cdecl* tClientPvsVoid)();
 typedef void(__thiscall* tOcclusionBeginView)(void* thisptr, int viewId, int a2, const float* plane, bool a4);
 typedef void(__thiscall* tOccluderSetView)(void* thisptr, const float* origin, float fov, const float* worldToView,
     const float* viewToProjection, const float* nearPlane);
+typedef void(__thiscall* tDrawWorldLists)(void* thisptr, void* renderContext, void* list, unsigned long flags, float waterZAdjust);
 typedef bool(__thiscall* tOccluderIsOccluded)(void* thisptr, const float* mins, const float* maxs);
 typedef void(__thiscall* tComputeViewMatrices)(void* thisptr, void* worldToView, void* viewToProjection, void* worldToProjection);
 typedef ITexture*(__thiscall* tCreateNamedRTEx)(void* thisptr, const char* name, int w, int h, int sizeMode, int format, int depth, unsigned textureFlags, unsigned renderTargetFlags);
@@ -93,6 +95,7 @@ typedef void(__thiscall* tDrawTexturedRect)(void* thisptr, int x0, int y0, int x
 typedef void(__thiscall* tPanelSetSize)(void* thisptr, unsigned int vpanel, int wide, int tall);
 typedef float(__thiscall* tGetViewModelFOV)(void* thisptr);
 typedef BOOL(WINAPI* tGetCursorPos)(LPPOINT point);
+typedef BOOL(WINAPI* tSetCursorPos)(int x, int y);
 typedef void(__thiscall* tEndFrame)(void* thisptr);
 typedef void(__thiscall* tTraceRay)(void* thisptr, const Ray_t& ray, unsigned int fMask, CTraceFilter* filter, CGameTrace* pTrace);
 typedef void(__thiscall* tImpulseCommands)(void* thisptr);
@@ -103,6 +106,9 @@ typedef void(__thiscall* tGrabSetTarget)(void* thisptr, Vector* pos, QAngle* ang
 typedef void(__thiscall* tGetShootAngles)(void* thisptr, QAngle* out);
 typedef void*(__cdecl* tGrenadeCreate)(int type, Vector* velocity, void* angImpulse, void* owner, void* thrower, int mode);
 typedef bool(__cdecl* tGrenadeThrowPosition)(void* grenade, Vector* pos, QAngle* ang, void* owner);
+typedef void(__fastcall* tSnarkThrow)(void* weapon, void* edx, void* owner, float fspeed, float uspeed);
+typedef void(__thiscall* tSetAbsVelocity)(void* entity, const Vector* velocity);
+typedef void*(__cdecl* tProjectileCreate)(int type, Vector* target, float speed, void* owner, void* thrower);
 typedef int(__thiscall* tGetAttachmentVec)(void* thisptr, int number, Vector* origin, QAngle* angles);
 typedef void(__cdecl* tFormatViewModelAttachment)(Vector* origin, bool inverse);
 typedef int(__thiscall* tGetAttachmentMatrix)(void* thisptr, int number, float* matrix);
@@ -127,6 +133,7 @@ typedef int(__stdcall* tSpriteRenderableDraw)(void* renderable, float scale, flo
     int rendermode, int renderfx, unsigned char* color, float hdr, unsigned* unk);
 typedef int(__thiscall* tEnvLaserDotDraw)(void* thisptr, unsigned flags);
 typedef void(__cdecl* tSpriteQuad)(float* origin, float width, float height, unsigned color);
+typedef void(__cdecl* tSpriteAxes)(int type, const float* origin, const float* angles, float* fwd, float* right, float* up);
 
 class Hooks
 {
@@ -149,6 +156,8 @@ public:
     static inline Hook<tGetRenderTargetDimensions> hkGetRenderTargetDimensionsQueued;
     static inline Hook<tDepthRange> hkDepthRange;
     static inline Hook<tDepthRange> hkDepthRangeQueued;
+    static inline Hook<tSetHeightClipMode> hkSetHeightClipMode;
+    static inline Hook<tSetHeightClipMode> hkSetHeightClipModeQueued;
     static inline Hook<tMatBind> hkMatBind;
     static inline Hook<tMatBind> hkMatBindQueued;
     static inline Hook<tDrawModelExecute> hkDrawModelExecute;
@@ -168,6 +177,7 @@ public:
     static inline Hook<tOcclusionBeginView> hkOcclusionBeginView;
     static inline Hook<tOccluderSetView> hkOccluderSetView;
     static inline Hook<tOccluderIsOccluded> hkOccluderIsOccluded;
+    static inline Hook<tDrawWorldLists> hkDrawWorldLists;
     // Set when a leftover main view was skipped / when a view marked the
     // client PVS notifiers; both cleared by the FRAME_RENDER_END check.
     static inline bool m_SkippedViewSinceCheck = false;
@@ -179,6 +189,7 @@ public:
     static inline Hook<tPanelSetSize> hkPanelSetSize;
     static inline Hook<tGetViewModelFOV> hkGetViewModelFOV;
     static inline Hook<tGetCursorPos> hkGetCursorPos;
+    static inline Hook<tSetCursorPos> hkSetCursorPos;
     static inline Hook<tEndFrame> hkEndFrame;
     static inline Hook<tTraceRay> hkTraceRay;
     static inline Hook<tImpulseCommands> hkImpulseCommands;
@@ -193,6 +204,9 @@ public:
     static inline Hook<tGetShootAngles> hkClientGetShootAngles;
     static inline Hook<tGrenadeCreate> hkGrenadeCreate;
     static inline Hook<tGrenadeThrowPosition> hkGrenadeThrowPosition;
+    static inline Hook<tSnarkThrow> hkSnarkThrow;
+    static inline Hook<tGrenadeThrowPosition> hkSnarkPlace;
+    static inline Hook<tProjectileCreate> hkProjectileCreate;
     static inline Hook<tGetAttachmentVec> hkGetAttachmentVec;
     static inline Hook<tFormatViewModelAttachment> hkFormatViewModelAttachment;
     static inline Hook<tGetAttachmentMatrix> hkGetAttachmentMatrix;
@@ -212,6 +226,7 @@ public:
     static inline Hook<tSpriteRenderableDraw> hkSpriteRenderableDraw;
     static inline Hook<tEnvLaserDotDraw> hkEnvLaserDotDraw;
     static inline Hook<tSpriteQuad> hkSpriteQuad;
+    static inline Hook<tSpriteAxes> hkSpriteAxes;
 
     Hooks() = default;
     explicit Hooks(Game* game);
@@ -230,6 +245,8 @@ public:
     static void __fastcall dGetViewport(void* ecx, void* edx, int& x, int& y, int& width, int& height);
     static void __fastcall dGetRenderTargetDimensions(void* ecx, void* edx, int& width, int& height);
     static void __fastcall dDepthRange(void* ecx, void* edx, float zNear, float zFar);
+    static void __fastcall dSetHeightClipMode(void* ecx, void* edx, int mode);
+    static void __fastcall dSetHeightClipModeQueued(void* ecx, void* edx, int mode);
     static void SetMatBindHooks(bool on);
     static void __fastcall dMatBind(void* ecx, void* edx, IMaterial* material, void* proxyData);
     static void __fastcall dDrawModelExecute(void* ecx, void* edx, void* state, const ModelRenderInfo_t& info, void* pCustomBoneToWorld);
@@ -237,6 +254,10 @@ public:
     static void __fastcall dPushRenderTargetAndViewport(void* ecx, void* edx, ITexture* pTexture, ITexture* pDepthTexture, int nViewX, int nViewY, int nViewW, int nViewH);
     static void __fastcall dPopRenderTargetAndViewport(void* ecx, void* edx);
     static void __fastcall dDrawScreenSpaceRectangle(void* ecx, void* edx, IMaterial* material,
+        int destX, int destY, int width, int height,
+        float srcX0, float srcY0, float srcX1, float srcY1,
+        int srcWidth, int srcHeight, void* clientRenderable, int xDice, int yDice);
+    static void __fastcall dDrawScreenSpaceRectangleBody(void* ecx, void* edx, IMaterial* material,
         int destX, int destY, int width, int height,
         float srcX0, float srcY0, float srcX1, float srcY1,
         int srcWidth, int srcHeight, void* clientRenderable, int xDice, int yDice);
@@ -254,6 +275,7 @@ public:
         const float* viewToProjection, const float* nearPlane);
     static void ReplayOccluderView(int eye);
     static bool __fastcall dOccluderIsOccluded(void* ecx, void* edx, const float* mins, const float* maxs);
+    static void __fastcall dDrawWorldLists(void* ecx, void* edx, void* renderContext, void* list, unsigned long flags, float waterZAdjust);
     static void __fastcall dComputeViewMatrices(void* ecx, void* edx, void* worldToView, void* viewToProjection, void* worldToProjection);
     static void ApplyFxaaParams();
     static ITexture* __fastcall dCreateNamedRTEx(void* ecx, void* edx, const char* name, int w, int h, int sizeMode, int format, int depth, unsigned textureFlags, unsigned renderTargetFlags);
@@ -263,6 +285,7 @@ public:
     static void __fastcall dPanelSetSize(void* ecx, void* edx, unsigned int vpanel, int wide, int tall);
     static float __fastcall dGetViewModelFOV(void* ecx, void* edx);
     static BOOL WINAPI dGetCursorPos(LPPOINT point);
+    static BOOL WINAPI dSetCursorPos(int x, int y);
     static void __fastcall dEndFrame(void* ecx, void* edx);
     static void __fastcall dTraceRay(void* ecx, void* edx, const Ray_t& ray, unsigned int fMask, CTraceFilter* filter, CGameTrace* pTrace);
     static void __fastcall dImpulseCommands(void* ecx, void* edx);
@@ -276,7 +299,10 @@ public:
     static void __fastcall dGetShootAngles(void* ecx, void* edx, QAngle* out);
     static void __fastcall dClientGetShootAngles(void* ecx, void* edx, QAngle* out);
     static void* __cdecl dGrenadeCreate(int type, Vector* velocity, void* angImpulse, void* owner, void* thrower, int mode);
+    static void __fastcall dSnarkThrow(void* weapon, void* edx, void* owner, float fspeed, float uspeed);
+    static bool __cdecl dSnarkPlace(void* snark, Vector* pos, QAngle* ang, void* owner);
     static bool __cdecl dGrenadeThrowPosition(void* grenade, Vector* pos, QAngle* ang, void* owner);
+    static void* __cdecl dProjectileCreate(int type, Vector* target, float speed, void* owner, void* thrower);
     static int __fastcall dGetAttachmentVec(void* ecx, void* edx, int number, Vector* origin, QAngle* angles);
     static void __cdecl dFormatViewModelAttachment(Vector* origin, bool inverse);
     static int __fastcall dGetAttachmentMatrix(void* ecx, void* edx, int number, float* matrix);
@@ -299,6 +325,7 @@ public:
         int rendermode, int renderfx, unsigned char* color, float hdr, unsigned* unk);
     static int __fastcall dEnvLaserDotDraw(void* ecx, void* edx, unsigned flags);
     static void __cdecl dSpriteQuad(float* origin, float width, float height, unsigned color);
+    static void __cdecl dSpriteAxes(int type, const float* origin, const float* angles, float* fwd, float* right, float* up);
     static void EnsureServerFlashlightHook();
     static void EnsureClientFlashlightHook();
     static void EnsureBmFlashlightHook();
@@ -309,4 +336,6 @@ public:
     static bool EnsureWeaponVfxHooks();
     static void RestoreViewmodelArmHides();
     static void InvalidateLevelModelCaches();
+    // Level change (VR::OnLevelInit / OnLevelShutdown): drop the cached gun header.
+    static void ForgetViewmodelStudioHdr();
 };

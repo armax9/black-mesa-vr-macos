@@ -33,7 +33,9 @@
 #include "L4D2VR/sdk/sdk.h"
 #include "d3d9_vr.h"
 #include "d3d9_reshade_vr.h"
+#include <intrin.h>
 #include "bmvr_flags.h"
+#include "bmvr_prof.h"
 
 #include <algorithm>
 #include <atomic>
@@ -66,6 +68,31 @@ namespace {
 extern "C" volatile int g_BmvrD3dDrawTrace;
 extern "C" volatile int g_BmvrFlashlightMatrixFix;
 namespace bmvr { void Log(const char* fmt, ...); }
+
+
+namespace {
+  // Eye MSAA cost counters (per second): full resolves when a multisampled
+  // texture is sampled, StretchRect resolves (same size) and MS blits (scaled).
+  struct BmvrMsaaStats {
+    uint32_t sampleResolves = 0, rectResolves = 0, rectBlits = 0, cachedCopies = 0, dirtyMarks = 0, retiredCopies = 0, retires = 0, depthStandIns = 0, depthResolves = 0, standInClears = 0, bindResolves = 0, rectCopies = 0, lastRate = 0, directScaled = 0;
+    uint64_t pixels = 0;
+    DWORD last = 0;
+  } g_bmvrMsaaStats;
+
+  void BmvrMsaaStatsTick() {
+    const DWORD now = GetTickCount();
+    if (!g_bmvrMsaaStats.last) { g_bmvrMsaaStats.last = now; return; }
+    if (now - g_bmvrMsaaStats.last < 1000) return;
+    auto& s = g_bmvrMsaaStats;
+    const uint32_t rate = s.sampleResolves + s.cachedCopies;
+    if (s.sampleResolves || s.rectResolves || s.rectBlits || s.cachedCopies || s.depthStandIns || s.standInClears)
+      bmvr::Log("Eye MSAA cost/s: resolves=%u (Mpix=%llu) [eye copies %u, scaled from samples %u, sampled-as-texture resolves %u] copies from resolved=%u (from 1x post=%u) new writes=%u post switches=%u (depth resolved %u) 1x depth stand-ins=%u (clears %u) direct ms resolves=%u direct ms blits=%u",
+        s.sampleResolves, (unsigned long long)(s.pixels / 1000000ull), s.rectCopies, s.directScaled, s.bindResolves, s.cachedCopies, s.retiredCopies, s.dirtyMarks, s.retires, s.depthResolves, s.depthStandIns, s.standInClears, s.rectResolves, s.rectBlits);
+    s = BmvrMsaaStats{};
+    s.last = now;
+    s.lastRate = rate;
+  }
+}
 
 namespace dxvk {
 
@@ -1592,6 +1619,11 @@ namespace dxvk {
     if (unlikely(pPresentationParameters == nullptr))
       return D3DERR_INVALIDCALL;
 
+    {
+      D3D9DeviceLock lock = LockDevice();
+      BmvrPayCopyDebt("Reset");
+    }
+
     D3DPRESENT_PARAMETERS local = *pPresentationParameters;
     BmvrStripSwapchainMsaa(&local);
     BmvrKeepDesktopWindowed(&local);
@@ -1712,6 +1744,7 @@ namespace dxvk {
     const RECT*    pDestRect,
           HWND     hDestWindowOverride,
     const RGNDATA* pDirtyRegion) {
+    BMVR_PROF("d3d9 Present");
     return PresentEx(
       pSourceRect,
       pDestRect,
@@ -1842,15 +1875,17 @@ namespace dxvk {
         VR::TextureID texID = g_Game->m_VR->m_CreatingTextureID;
         HRESULT vrDescResult = D3DERR_INVALIDCALL;
 
+        // texture->, not texture.ref()->: Com::ref() adds a reference, so every
+        // VR texture created here was leaked (eye MSAA panel switches filled VRAM).
         if (texID == VR::Texture_LeftEye) {
-          texture.ref()->GetSurfaceLevel(0, &g_Game->m_VR->m_D9LeftEyeSurface);
+          texture->GetSurfaceLevel(0, &g_Game->m_VR->m_D9LeftEyeSurface);
           if (desc.MultiSample == D3DMULTISAMPLE_NONE) {
             textureTarget = &g_Game->m_VR->m_VKLeftEye;
             vrDescResult = g_D3DVR9->GetVRDesc(g_Game->m_VR->m_D9LeftEyeSurface, &texDesc);
           }
         }
         else if (texID == VR::Texture_RightEye) {
-          texture.ref()->GetSurfaceLevel(0, &g_Game->m_VR->m_D9RightEyeSurface);
+          texture->GetSurfaceLevel(0, &g_Game->m_VR->m_D9RightEyeSurface);
           if (desc.MultiSample == D3DMULTISAMPLE_NONE) {
             textureTarget = &g_Game->m_VR->m_VKRightEye;
             vrDescResult = g_D3DVR9->GetVRDesc(g_Game->m_VR->m_D9RightEyeSurface, &texDesc);
@@ -1858,41 +1893,41 @@ namespace dxvk {
         }
         else if (texID == VR::Texture_LeftEyeSubmit) {
           textureTarget = &g_Game->m_VR->m_VKLeftEye;
-          texture.ref()->GetSurfaceLevel(0, &g_Game->m_VR->m_D9LeftEyeSubmitSurface);
+          texture->GetSurfaceLevel(0, &g_Game->m_VR->m_D9LeftEyeSubmitSurface);
           vrDescResult = g_D3DVR9->GetVRDesc(g_Game->m_VR->m_D9LeftEyeSubmitSurface, &texDesc);
         }
         else if (texID == VR::Texture_RightEyeSubmit) {
           textureTarget = &g_Game->m_VR->m_VKRightEye;
-          texture.ref()->GetSurfaceLevel(0, &g_Game->m_VR->m_D9RightEyeSubmitSurface);
+          texture->GetSurfaceLevel(0, &g_Game->m_VR->m_D9RightEyeSubmitSurface);
           vrDescResult = g_D3DVR9->GetVRDesc(g_Game->m_VR->m_D9RightEyeSubmitSurface, &texDesc);
         }
         else if (texID == VR::Texture_NekoPostLinearInput) {
-          texture.ref()->GetSurfaceLevel(0, &g_Game->m_VR->m_D9NekoPostLinearInputSurface);
+          texture->GetSurfaceLevel(0, &g_Game->m_VR->m_D9NekoPostLinearInputSurface);
         }
         else if (texID == VR::Texture_NekoPostSmallInput) {
-          texture.ref()->GetSurfaceLevel(0, &g_Game->m_VR->m_D9NekoPostSmallInputSurface);
+          texture->GetSurfaceLevel(0, &g_Game->m_VR->m_D9NekoPostSmallInputSurface);
         }
         else if (texID == VR::Texture_HUD) {
           textureTarget = &g_Game->m_VR->m_VKHUD;
-          texture.ref()->GetSurfaceLevel(0, &g_Game->m_VR->m_D9HUDSurface);
+          texture->GetSurfaceLevel(0, &g_Game->m_VR->m_D9HUDSurface);
           vrDescResult = g_D3DVR9->GetVRDesc(g_Game->m_VR->m_D9HUDSurface, &texDesc);
         }
         else if (texID == VR::Texture_Scope) {
           textureTarget = &g_Game->m_VR->m_VKScope;
-          texture.ref()->GetSurfaceLevel(0, &g_Game->m_VR->m_D9ScopeSurface);
+          texture->GetSurfaceLevel(0, &g_Game->m_VR->m_D9ScopeSurface);
           vrDescResult = g_D3DVR9->GetVRDesc(g_Game->m_VR->m_D9ScopeSurface, &texDesc);
         }
         else if (texID == VR::Texture_RearMirror) {
           textureTarget = &g_Game->m_VR->m_VKRearMirror;
-          texture.ref()->GetSurfaceLevel(0, &g_Game->m_VR->m_D9RearMirrorSurface);
+          texture->GetSurfaceLevel(0, &g_Game->m_VR->m_D9RearMirrorSurface);
           vrDescResult = g_D3DVR9->GetVRDesc(g_Game->m_VR->m_D9RearMirrorSurface, &texDesc);
         }
         else if (texID == VR::Texture_DesktopMirror) {
-          texture.ref()->GetSurfaceLevel(0, &g_Game->m_VR->m_D9DesktopMirrorSurface);
+          texture->GetSurfaceLevel(0, &g_Game->m_VR->m_D9DesktopMirrorSurface);
         }
         else if (texID == VR::Texture_Blank) {
           textureTarget = &g_Game->m_VR->m_VKBlankTexture;
-          texture.ref()->GetSurfaceLevel(0, &g_Game->m_VR->m_D9BlankSurface);
+          texture->GetSurfaceLevel(0, &g_Game->m_VR->m_D9BlankSurface);
           vrDescResult = g_D3DVR9->GetVRDesc(g_Game->m_VR->m_D9BlankSurface, &texDesc);
         }
 
@@ -2186,7 +2221,9 @@ namespace dxvk {
     const RECT*              pSourceRect,
           IDirect3DSurface9* pDestinationSurface,
     const POINT*             pDestPoint) {
+    BMVR_PROF("d3d9 UpdateSurface");
     D3D9DeviceLock lock = LockDevice();
+    BmvrPayCopyDebt("UpdateSurface");
 
     D3D9Surface* src = static_cast<D3D9Surface*>(pSourceSurface);
     D3D9Surface* dst = static_cast<D3D9Surface*>(pDestinationSurface);
@@ -2264,7 +2301,9 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D9DeviceEx::UpdateTexture(
           IDirect3DBaseTexture9* pSourceTexture,
           IDirect3DBaseTexture9* pDestinationTexture) {
+    BMVR_PROF("d3d9 UpdateTexture");
     D3D9DeviceLock lock = LockDevice();
+    BmvrPayCopyDebt("UpdateTexture");
 
     if (!pDestinationTexture || !pSourceTexture)
       return D3DERR_INVALIDCALL;
@@ -2358,7 +2397,9 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D9DeviceEx::GetRenderTargetData(
           IDirect3DSurface9* pRenderTarget,
           IDirect3DSurface9* pDestSurface) {
+    BMVR_PROF("d3d9 GetRenderTargetData");
     D3D9DeviceLock lock = LockDevice();
+    BmvrPayCopyDebt("GetRenderTargetData");
 
     if (unlikely(IsDeviceLost())) {
       return D3DERR_DEVICELOST;
@@ -2482,7 +2523,11 @@ namespace dxvk {
           IDirect3DSurface9*   pDestSurface,
     const RECT*                pDestRect,
           D3DTEXTUREFILTERTYPE Filter) {
+    BMVR_PROF("d3d9 StretchRect");
     D3D9DeviceLock lock = LockDevice();
+
+    if (pDestSurface != nullptr && g_Game && g_Game->m_VR)
+      g_Game->m_VR->EyeRtNoteWrite(this, pDestSurface);
 
     D3D9Surface* dst = static_cast<D3D9Surface*>(pDestSurface);
     D3D9Surface* src = static_cast<D3D9Surface*>(pSourceSurface);
@@ -2502,11 +2547,51 @@ namespace dxvk {
                  srcTextureInfo->Desc()->Pool != D3DPOOL_DEFAULT))
       return D3DERR_INVALIDCALL;
 
-    Rc<DxvkImage> dstImage = dstTextureInfo->GetImage();
+    Rc<DxvkImage> dstImage = dstTextureInfo->BmvrActiveImage();
     Rc<DxvkImage> srcImage = srcTextureInfo->GetImage();
 
     if (dstImage == nullptr || srcImage == nullptr)
         return D3DERR_INVALIDCALL;
+
+    if (unlikely(m_bmvrDebtEye != nullptr)
+     && (BmvrCopyDebtTouches(srcTextureInfo) || BmvrCopyDebtTouches(dstTextureInfo)))
+      BmvrPayCopyDebt("StretchRect");
+
+    if (unlikely(bmvr::g_PostSwapArmThread != 0)
+     && BmvrTrySwapCopy(src, dst, pSourceRect, pDestRect))
+      return D3D_OK;
+
+    // Eye MSAA: every copy out of a multisampled eye (refraction / FullFrame
+    // copies, OpenXR ring, desktop mirror) used to resolve all 4 samples again,
+    // ~10 full-eye resolves per frame. Resolve once per written version into
+    // the texture's 1x resolve image and copy from that.
+    // A scaled copy of a freshly written eye (the engine's refraction copy into
+    // _rt_PowerOfTwoFB, once per refractive object: up to ~50 per eye per frame
+    // behind train windows) blits straight from the samples: no full-size
+    // resolve + second copy. Unscaled or already-resolved copies use the 1x image.
+    const LONG bmvrSrcW = pSourceRect ? pSourceRect->right - pSourceRect->left : LONG(srcImage->info().extent.width);
+    const LONG bmvrSrcH = pSourceRect ? pSourceRect->bottom - pSourceRect->top : LONG(srcImage->info().extent.height);
+    const LONG bmvrDstW = pDestRect ? pDestRect->right - pDestRect->left : LONG(dstImage->info().extent.width);
+    const LONG bmvrDstH = pDestRect ? pDestRect->bottom - pDestRect->top : LONG(dstImage->info().extent.height);
+    const bool bmvrScaled = bmvrSrcW != bmvrDstW || bmvrSrcH != bmvrDstH;
+    const bool bmvrDirectMsBlit = bmvrScaled && srcTextureInfo->MsaaNeedsResolve();
+    if (bmvrDirectMsBlit)
+      ++g_bmvrMsaaStats.directScaled;
+    if (!bmvrDirectMsBlit
+        && srcImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT
+        && srcTextureInfo->Desc()->MultiSample != D3DMULTISAMPLE_NONE
+        && !srcTextureInfo->IsDepthStencil()
+        && dstImage->info().sampleCount == VK_SAMPLE_COUNT_1_BIT) {
+      ++g_bmvrMsaaStats.rectCopies;
+      if (!srcTextureInfo->MsaaNeedsResolve())
+        ++g_bmvrMsaaStats.cachedCopies;
+      if (srcTextureInfo->BmvrRetired())
+        ++g_bmvrMsaaStats.retiredCopies;
+      BmvrResolveMsaaForSample(srcTextureInfo);
+      srcImage = srcTextureInfo->GetResolveImage();
+      if (srcImage == nullptr)
+        return D3DERR_INVALIDCALL;
+    }
 
     const DxvkFormatInfo* dstFormatInfo = lookupFormatInfo(dstImage->info().format);
     const DxvkFormatInfo* srcFormatInfo = lookupFormatInfo(srcImage->info().format);
@@ -2659,6 +2744,12 @@ namespace dxvk {
         return D3DERR_INVALIDCALL;
     }
 
+    if (srcImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT) {
+      if (fastPath) ++g_bmvrMsaaStats.rectResolves; else ++g_bmvrMsaaStats.rectBlits;
+      g_bmvrMsaaStats.pixels += uint64_t(srcCopyExtent.width) * srcCopyExtent.height;
+      BmvrMsaaStatsTick();
+    }
+
     if (fastPath) {
       if (needsResolve) {
         VkImageResolve region;
@@ -2744,6 +2835,7 @@ namespace dxvk {
     const RECT*              pRect,
           D3DCOLOR           Color) {
     D3D9DeviceLock lock = LockDevice();
+    BmvrPayCopyDebt("ColorFill");
 
     D3D9Surface* dst = static_cast<D3D9Surface*>(pSurface);
 
@@ -2769,7 +2861,7 @@ namespace dxvk {
     VkClearValue clearValue = { };
     DecodeD3DCOLOR(Color, clearValue.color.float32);
 
-    Rc<DxvkImage> image = dstTextureInfo->GetImage();
+    Rc<DxvkImage> image = dstTextureInfo->BmvrActiveImage();
 
     if (image->formatInfo()->aspectMask != VK_IMAGE_ASPECT_COLOR_BIT)
       return D3DERR_INVALIDCALL;
@@ -2897,6 +2989,7 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D9DeviceEx::SetRenderTarget(
           DWORD              RenderTargetIndex,
           IDirect3DSurface9* pRenderTarget) {
+    BMVR_PROF("d3d9 SetRenderTarget");
     D3D9DeviceLock lock = LockDevice();
 
     if (unlikely(pRenderTarget == nullptr && RenderTargetIndex == 0))
@@ -2906,6 +2999,9 @@ namespace dxvk {
     D3D9Surface* rt = static_cast<D3D9Surface*>(pRenderTarget);
     if (unlikely(rt != nullptr && rt->GetDevice() != this))
       return D3DERR_INVALIDCALL;
+
+    if (pRenderTarget != nullptr && g_Game && g_Game->m_VR)
+      g_Game->m_VR->EyeRtNoteWrite(this, pRenderTarget);
 
     return SetRenderTargetInternal(RenderTargetIndex, pRenderTarget);
   }
@@ -3103,6 +3199,7 @@ namespace dxvk {
   // Some games don't even call them.
 
   HRESULT STDMETHODCALLTYPE D3D9DeviceEx::BeginScene() {
+    BMVR_PROF("d3d9 BeginScene");
     D3D9DeviceLock lock = LockDevice();
 
     if (unlikely(m_inScene))
@@ -3115,6 +3212,7 @@ namespace dxvk {
 
 
   HRESULT STDMETHODCALLTYPE D3D9DeviceEx::EndScene() {
+    BMVR_PROF("d3d9 EndScene");
     D3D9DeviceLock lock = LockDevice();
 
     if (unlikely(!m_inScene))
@@ -3152,10 +3250,14 @@ namespace dxvk {
           D3DCOLOR Color,
           float    Z,
           DWORD    Stencil) {
+    BMVR_PROF("d3d9 Clear");
     if (unlikely(!Count && pRects))
       return D3D_OK;
 
     D3D9DeviceLock lock = LockDevice();
+
+    if (unlikely(m_bmvrDebtEye != nullptr))
+      BmvrCopyDebtCheckClear(Flags);
 
     // D3DCLEAR_ZBUFFER and D3DCLEAR_STENCIL are invalid flags
     // if there is no currently bound DS (which can be the autoDS)
@@ -3261,8 +3363,32 @@ namespace dxvk {
       VkOffset3D         offset,
       VkExtent3D         extent) {
       // Clear depth if we need to.
-      if (depthAspectMask != 0)
-        ClearImageView(alignment, offset, extent, m_state.depthStencil->GetDepthStencilView(true), depthAspectMask, clearValueDepth);
+      if (depthAspectMask != 0) {
+        BmvrResolvePendingDepth();
+        // Eye MSAA: a 1x pass (water reflection / refraction) with the 4x eye
+        // depth bound draws with the eye's 1x stand-in depth (BindFramebuffer),
+        // so its depth clear must land there too, not on the 4x depth.
+        D3D9CommonTexture* dsTex = m_state.depthStencil->GetCommonTexture();
+        D3D9CommonTexture* rt0Tex = GetCommonTexture(m_state.renderTargets[0].ptr());
+        const bool standIn = dsTex && dsTex->Desc()->MultiSample != D3DMULTISAMPLE_NONE && !dsTex->BmvrRetired()
+          && rt0Tex && !rt0Tex->IsNull() && rt0Tex->BmvrActiveImage()->info().sampleCount == VK_SAMPLE_COUNT_1_BIT;
+        if (standIn) {
+          const Rc<DxvkImageView>& dsv = m_state.depthStencil->GetResolveDepthStencilView(true);
+          if (dsTex->BmvrStandInClear()) {
+            dsTex->BmvrSetStandInClear(false);
+            VkClearValue cv = { };
+            cv.depthStencil = { 1.0f, 0u };
+            const VkImageAspectFlags aspects = dsv->formatInfo()->aspectMask;
+            EmitCs([cView = dsv, cAspects = aspects, cValue = cv] (DxvkContext* ctx) {
+              ctx->clearRenderTarget(cView, cAspects, cValue, 0u);
+            });
+          }
+          ++g_bmvrMsaaStats.standInClears;
+          ClearImageView(alignment, offset, extent, dsv, depthAspectMask, clearValueDepth);
+        } else {
+          ClearImageView(alignment, offset, extent, m_state.depthStencil->GetActiveDepthStencilView(true), depthAspectMask, clearValueDepth);
+        }
+      }
 
       // Clear render targets if we need to.
       if (Flags & D3DCLEAR_TARGET) {
@@ -3270,7 +3396,7 @@ namespace dxvk {
           if (!HasRenderTargetBound(rt))
             continue;
           const auto& rts = m_state.renderTargets[rt];
-          const auto& rtv = rts->GetRenderTargetView(srgb);
+          const auto& rtv = rts->GetActiveRenderTargetView(srgb);
 
           if (likely(rtv != nullptr)) {
             ClearImageView(alignment, offset, extent, rtv, VK_IMAGE_ASPECT_COLOR_BIT, clearValueColor);
@@ -3401,7 +3527,14 @@ namespace dxvk {
       // Source DrawViewModels uses DepthRange 0..0.1 so the gun always wins
       // against world Z. Gloves use the world range, so a hand in front of
       // the weapon still lost. Keep the full 0..1 range in stereo.
+      // Not the glow queries' "pixels possible" draw (0..0.01, must pass the
+      // depth test; see IsGlowCountDepthRange in hooks.cpp).
+      const bool glowCountRange = bmvr::g_GlowCountDepthFix
+          && effectiveViewport.MinZ == 0.0f
+          && effectiveViewport.MaxZ > 0.0099f
+          && effectiveViewport.MaxZ < 0.0101f;
       if (vr->m_StereoEye != 0
+          && !glowCountRange
           && effectiveViewport.MaxZ > 0.0f
           && effectiveViewport.MaxZ <= 0.15f) {
         static int s_vmZLog = 0;
@@ -3644,6 +3777,8 @@ namespace dxvk {
         case D3DRS_SRCBLEND:
         case D3DRS_SRCBLENDALPHA:
           m_dirty.set(D3D9DeviceDirtyFlag::BlendState);
+          if (State == D3DRS_ALPHABLENDENABLE && bmvr::g_AlphaToCoverage)
+            UpdateAlphaToCoverangeAndAlphaTest();   // BMVR alpha to coverage skips blended draws
           break;
 
         case D3DRS_COLORWRITEENABLE:
@@ -4098,6 +4233,7 @@ namespace dxvk {
 
 
   HRESULT STDMETHODCALLTYPE D3D9DeviceEx::SetTexture(DWORD Stage, IDirect3DBaseTexture9* pTexture) {
+    BMVR_PROF("d3d9 SetTexture");
     if (unlikely(InvalidSampler(Stage)))
       return D3D_OK;
 
@@ -4105,6 +4241,9 @@ namespace dxvk {
         && g_Game && g_Game->m_VR
         && pTexture->GetType() == D3DRTYPE_CUBETEXTURE)
       g_Game->m_VR->NoteSceneCubemap(pTexture);
+
+    if (pTexture != nullptr && g_Game && g_Game->m_VR)
+      pTexture = g_Game->m_VR->EyeRtSubstitute(pTexture);
 
     DWORD stateSampler = RemapSamplerState(Stage);
 
@@ -4480,13 +4619,174 @@ namespace dxvk {
     SetShaderConstants<DxsoProgramTypes::VertexShader, D3D9ConstantType::Float>(kBmvrVpnReg, saved, 3);
   }
 
+  // Screen-aligned particles (Source spritecard, ORIENTATION 0: smoke, fog,
+  // steam) add their corner offsets in view space: viewPos = mul4x3(pos,
+  // cModelView); viewPos.xy += corner; projPos = mul(viewPos, cProj). In a
+  // headset the view rolls with the head, so the sprites rolled with it.
+  // Per draw, cModelView gets the view turned about its forward axis until
+  // world up is straight up in it, and cProj the opposite turn: every particle
+  // centre lands where it did, only the corner offsets are turned so the
+  // sprite's up follows world up. They still turn with head yaw (billboards).
+  // One angle per draw (world up through the image centre); fades out looking
+  // straight up or down, where the horizon has no direction.
+  namespace {
+    // CTAB register (first index) of a float constant, or -1.
+    int BmvrCtabFloatReg(const DWORD* code, const char* name, uint32_t minCount) {
+      size_t i = 1;
+      for (int guard = 0; guard < 65536; ++guard) {
+        const DWORD tok = code[i];
+        if (tok == 0x0000FFFFu)
+          return -1;
+        if ((tok & 0xFFFFu) != 0xFFFEu)
+          return -1;  // the constant table comes before the first instruction
+        const uint32_t words = (tok >> 16) & 0x7FFFu;
+        if (words >= 7 && code[i + 1] == 0x42415443u /* 'CTAB' */) {
+          const auto* base = reinterpret_cast<const uint8_t*>(&code[i + 2]);
+          const uint32_t bytes = (words - 1) * 4;
+          const auto* hdr = reinterpret_cast<const uint32_t*>(base);
+          const uint32_t count = hdr[3], info = hdr[4];
+          if (info >= bytes || count > 4096 || info + count * 20ull > bytes)
+            return -1;
+          for (uint32_t c = 0; c < count; ++c) {
+            const uint8_t* e = base + info + c * 20;
+            uint32_t nameOff;
+            uint16_t set, reg, regCount;
+            std::memcpy(&nameOff, e, 4);
+            std::memcpy(&set, e + 4, 2);
+            std::memcpy(&reg, e + 6, 2);
+            std::memcpy(&regCount, e + 8, 2);
+            if (nameOff >= bytes)
+              continue;
+            const char* n = reinterpret_cast<const char*>(base + nameOff);
+            if (strnlen(n, bytes - nameOff) < bytes - nameOff && std::strcmp(n, name) == 0)
+              return (set == 2 /* D3DXRS_FLOAT4 */ && regCount >= minCount) ? int(reg) : -1;
+          }
+          return -1;
+        }
+        i += 1 + words;
+      }
+      return -1;
+    }
+
+    // True when every instruction that reads c[mv..mv+2] or c[proj..proj+3]
+    // is a dp4 (the column layout the per-draw turn assumes).
+    bool BmvrParticleRegsDp4Only(const DWORD* code, int mv, int proj) {
+      constexpr uint32_t kConst = 2;
+      size_t i = 1;
+      bool seenMv = false, seenProj = false;
+      for (int guard = 0; guard < 65536; ++guard) {
+        const DWORD tok = code[i];
+        if (tok == 0x0000FFFFu)
+          break;
+        const uint32_t op = tok & 0xFFFFu;
+        if (op == 0xFFFEu) {
+          i += 1 + ((tok >> 16) & 0x7FFFu);
+          continue;
+        }
+        const uint32_t len = (tok >> 24) & 0xFu;
+        if (op == 0x51 || op == 0x30 || op == 0x2F) {  // def/defi/defb
+          const DWORD t = code[i + 1];
+          const int reg = int(t & 0x7FFu);
+          if (BmvrRegType(t) == kConst && ((reg >= mv && reg < mv + 3) || (reg >= proj && reg < proj + 4)))
+            return false;
+          i += 1 + len;
+          continue;
+        }
+        for (uint32_t k = 2; k <= len; ++k) {
+          const DWORD t = code[i + k];
+          if (!(t & 0x80000000u) || BmvrRegType(t) != kConst)
+            continue;
+          const int reg = int(t & 0x7FFu);
+          const bool inMv = reg >= mv && reg < mv + 3;
+          const bool inProj = reg >= proj && reg < proj + 4;
+          if (!inMv && !inProj)
+            continue;
+          if (op != 9 /* dp4 */ || (t & (1u << 13)) /* relative */)
+            return false;
+          seenMv |= inMv;
+          seenProj |= inProj;
+        }
+        i += 1 + len;
+      }
+      return seenMv && seenProj;
+    }
+  }
+
+  bool D3D9DeviceEx::BmvrParticleLevelBegin(float saved[28]) {
+    auto* vs = m_state.vertexShader.ptr();
+    if (likely(!vs || vs->bmvrParticleModelView < 0))
+      return false;
+    if (!bmvr::g_ParticleLevel || !g_Game || !g_Game->m_VR || !g_Game->m_VR->m_IsVREnabled)
+      return false;
+    const uint32_t mv = uint32_t(vs->bmvrParticleModelView);
+    const uint32_t pr = uint32_t(vs->bmvrParticleProj);
+    const auto& c = m_state.vsConsts->fConsts;
+    // World up in view space = the z column of the view rotation.
+    const float ux = c[mv].data[2], uy = c[mv + 1].data[2];
+    const float n = std::sqrt(ux * ux + uy * uy);
+    if (n < 1e-4f)
+      return false;
+    // Turn that maps the view's up (0,1) onto world up's direction (ux,uy).
+    float phi = std::atan2(-ux, uy);
+    // Looking almost straight up/down: no horizon, ease back to stock.
+    const float fullFrom = 0.2f;
+    const float len = std::sqrt(ux * ux + uy * uy + c[mv + 2].data[2] * c[mv + 2].data[2]);
+    if (len > 1e-6f && n / len < fullFrom)
+      phi *= (n / len) / fullFrom;
+    if (std::fabs(phi) < 1e-4f)
+      return false;
+    const float cs = std::cos(phi), sn = std::sin(phi);
+    for (uint32_t k = 0; k < 4; k++) {
+      saved[k] = c[mv].data[k];
+      saved[4 + k] = c[mv + 1].data[k];
+    }
+    for (uint32_t r = 0; r < 4; r++)
+      for (uint32_t k = 0; k < 4; k++)
+        saved[12 + r * 4 + k] = c[pr + r].data[k];
+    // View position in the levelled view: v' = Rz(-phi) v.
+    float rows[2][4];
+    for (uint32_t k = 0; k < 4; k++) {
+      rows[0][k] = cs * saved[k] + sn * saved[4 + k];
+      rows[1][k] = -sn * saved[k] + cs * saved[4 + k];
+    }
+    // Projection of Rz(phi) v': each output's x/y coefficients turned by Rz(phi)^T.
+    float proj[4][4];
+    for (uint32_t r = 0; r < 4; r++) {
+      const float* p = &saved[12 + r * 4];
+      proj[r][0] = cs * p[0] + sn * p[1];
+      proj[r][1] = -sn * p[0] + cs * p[1];
+      proj[r][2] = p[2];
+      proj[r][3] = p[3];
+    }
+    SetShaderConstants<DxsoProgramTypes::VertexShader, D3D9ConstantType::Float>(mv, &rows[0][0], 2);
+    SetShaderConstants<DxsoProgramTypes::VertexShader, D3D9ConstantType::Float>(pr, &proj[0][0], 4);
+    static std::atomic<int> s_log{0};
+    if (s_log.fetch_add(1) < 4)
+      bmvr::Log("ParticleLevel: VS %p turned %.1f deg (eye %d)", (void*)vs, phi * 57.2958f, g_Game->m_VR->m_StereoEye);
+    return true;
+  }
+
+  void D3D9DeviceEx::BmvrParticleLevelEnd(const float saved[28]) {
+    auto* vs = m_state.vertexShader.ptr();
+    SetShaderConstants<DxsoProgramTypes::VertexShader, D3D9ConstantType::Float>(uint32_t(vs->bmvrParticleModelView), saved, 2);
+    SetShaderConstants<DxsoProgramTypes::VertexShader, D3D9ConstantType::Float>(uint32_t(vs->bmvrParticleProj), saved + 12, 4);
+  }
+
   namespace {
     struct BmvrViewProjNormalScope {
       D3D9DeviceEx* dev;
       bool on;
+      bool particle;
       float saved[12];
-      explicit BmvrViewProjNormalScope(D3D9DeviceEx* d) : dev(d) { on = dev->BmvrViewProjNormalsBegin(saved); }
-      ~BmvrViewProjNormalScope() { if (on) dev->BmvrViewProjNormalsEnd(saved); }
+      float particleSaved[28];
+      explicit BmvrViewProjNormalScope(D3D9DeviceEx* d) : dev(d) {
+        on = dev->BmvrViewProjNormalsBegin(saved);
+        particle = dev->BmvrParticleLevelBegin(particleSaved);
+      }
+      ~BmvrViewProjNormalScope() {
+        if (particle) dev->BmvrParticleLevelEnd(particleSaved);
+        if (on) dev->BmvrViewProjNormalsEnd(saved);
+      }
     };
   }
 
@@ -4495,6 +4795,7 @@ namespace dxvk {
           D3DPRIMITIVETYPE PrimitiveType,
           UINT             StartVertex,
           UINT             PrimitiveCount) {
+    BMVR_PROF("d3d9 DrawPrimitive");
     D3D9DeviceLock lock = LockDevice();
 
     if (unlikely(m_state.vertexDecl == nullptr))
@@ -4570,6 +4871,7 @@ namespace dxvk {
           UINT             NumVertices,
           UINT             StartIndex,
           UINT             PrimitiveCount) {
+    BMVR_PROF("d3d9 DrawIndexedPrimitive");
     D3D9DeviceLock lock = LockDevice();
 
     if (unlikely(m_state.vertexDecl == nullptr))
@@ -4649,6 +4951,7 @@ namespace dxvk {
     static std::atomic<unsigned> slowBudget{0};
     BmvrSlowScope slowScope("DrawPrimitiveUP", slowBudget);
 
+    BMVR_PROF("d3d9 DrawPrimitiveUP");
     D3D9DeviceLock lock = LockDevice();
 
     if (unlikely(!VertexStreamZeroStride))
@@ -4726,6 +5029,7 @@ namespace dxvk {
           D3DFORMAT        IndexDataFormat,
     const void*            pVertexStreamZeroData,
           UINT             VertexStreamZeroStride) {
+    BMVR_PROF("d3d9 DrawIndexedPrimitiveUP");
     D3D9DeviceLock lock = LockDevice();
 
     if (unlikely(!VertexStreamZeroStride))
@@ -5083,6 +5387,21 @@ namespace dxvk {
       bmvr::Log("ViewProjNormalFix: VS %p turns normals with cViewProj (%u dp3 sources -> c%u-c%u)",
         (void*)vs, bmvrPatched, kBmvrVpnReg, kBmvrVpnReg + 2);
     }
+    {
+      const int mv = BmvrCtabFloatReg(pFunction, "cModelView", 3);
+      const int pr = mv >= 0 ? BmvrCtabFloatReg(pFunction, "cProj", 4) : -1;
+      if (mv >= 0 && pr >= 0) {
+        const bool dp4 = BmvrParticleRegsDp4Only(pFunction, mv, pr);
+        if (dp4) {
+          vs->bmvrParticleModelView = mv;
+          vs->bmvrParticleProj = pr;
+        }
+        static std::atomic<int> s_pl{0};
+        if (s_pl.fetch_add(1) < 16)
+          bmvr::Log("ParticleLevel: VS %p cModelView c%d cProj c%d %s", (void*)vs, mv, pr,
+            dp4 ? "(screen-aligned particles, levelled)" : "(not dp4-only, left alone)");
+      }
+    }
     *ppShader = ref(vs);
 
     return D3D_OK;
@@ -5157,6 +5476,7 @@ namespace dxvk {
           UINT   StartRegister,
     const float* pConstantData,
           UINT   Vector4fCount) {
+    BMVR_PROF("d3d9 SetVertexShaderConstantF");
     D3D9DeviceLock lock = LockDevice();
 
     return SetShaderConstants<
@@ -5544,6 +5864,7 @@ namespace dxvk {
     UINT   StartRegister,
     const float* pConstantData,
     UINT   Vector4fCount) {
+    BMVR_PROF("d3d9 SetPixelShaderConstantF");
     D3D9DeviceLock lock = LockDevice();
 
     return SetShaderConstants <
@@ -6813,6 +7134,11 @@ namespace dxvk {
     if (unlikely(pPresentationParameters == nullptr))
       return D3DERR_INVALIDCALL;
 
+    {
+      D3D9DeviceLock lock = LockDevice();
+      BmvrPayCopyDebt("Reset");
+    }
+
     D3DPRESENT_PARAMETERS local = *pPresentationParameters;
     BmvrStripSwapchainMsaa(&local);
     BmvrKeepDesktopWindowed(&local);
@@ -7311,6 +7637,7 @@ namespace dxvk {
     static std::atomic<unsigned> slowBudget{0};
     BmvrSlowScope slowScope("WaitForResource", slowBudget);
 
+    BMVR_PROF("dxvk wait WaitForResource");
     // Wait for the any pending D3D9 command to be executed
     // on the CS thread so that we can determine whether the
     // resource is currently in use or not.
@@ -7385,7 +7712,11 @@ namespace dxvk {
             DWORD                   Flags) {
     static std::atomic<unsigned> slowBudget{0};
     BmvrSlowScope slowScope("LockImage", slowBudget);
+    BMVR_PROF("d3d9 LockImage");
     D3D9DeviceLock lock = LockDevice();
+
+    if (unlikely(BmvrCopyDebtTouches(pResource)))
+      BmvrPayCopyDebt("lock");
 
     UINT Subresource = pResource->CalcSubresource(Face, MipLevel);
 
@@ -7894,6 +8225,7 @@ namespace dxvk {
           DWORD                   Flags) {
     static std::atomic<unsigned> slowBudget{0};
     BmvrSlowScope slowScope("LockBuffer", slowBudget);
+    BMVR_PROF("d3d9 LockBuffer");
     D3D9DeviceLock lock = LockDevice();
 
     if (unlikely(ppbData == nullptr))
@@ -8309,6 +8641,7 @@ namespace dxvk {
 
 
   void D3D9DeviceEx::EmitCsChunk(DxvkCsChunkRef&& chunk) {
+    BMVR_PROF("dxvk wait EmitCsChunk (CS queue)");
     // Flush init commands so that the CS thread
     // can processe them before the first use.
     m_initializer->FlushCsChunk();
@@ -8330,6 +8663,7 @@ namespace dxvk {
     static std::atomic<unsigned> slowBudget{0};
     BmvrSlowScope slowScope("SynchronizeCsThread", slowBudget);
 
+    BMVR_PROF("dxvk wait SynchronizeCsThread");
     D3D9DeviceLock lock = LockDevice();
 
     // Dispatch current chunk so that all commands
@@ -8767,6 +9101,7 @@ namespace dxvk {
 
 
   void D3D9DeviceEx::Flush() {
+    BMVR_PROF("dxvk Flush (submit)");
     ExecuteFlush<false>();
   }
 
@@ -9359,16 +9694,16 @@ namespace dxvk {
 
     VkSampleCountFlags sampleCount = VK_SAMPLE_COUNT_1_BIT;
     VkExtent2D renderArea = { 0u, 0u };
-    const D3D9CommonTexture* rt0 = GetCommonTexture(m_state.renderTargets[0].ptr());
+    D3D9CommonTexture* rt0 = GetCommonTexture(m_state.renderTargets[0].ptr());
     if (likely(rt0 != nullptr && !rt0->IsNull())) {
-      const DxvkImageCreateInfo& rt0Info = rt0->GetImage()->info();
+      const DxvkImageCreateInfo& rt0Info = rt0->BmvrActiveImage()->info();
       sampleCount = rt0Info.sampleCount;
       renderArea = { rt0Info.extent.width, rt0Info.extent.height };
     }
 
     if (m_state.depthStencil != nullptr) {
-      const D3D9CommonTexture* ds = m_state.depthStencil->GetCommonTexture();
-      const DxvkImageCreateInfo& dsInfo = ds->GetImage()->info();
+      D3D9CommonTexture* ds = m_state.depthStencil->GetCommonTexture();
+      const DxvkImageCreateInfo& dsInfo = ds->BmvrActiveImage()->info();
 
       uint32_t boundRTCount = 0;
       for (uint32_t i = 0; i < m_state.renderTargets.size(); i++) {
@@ -9393,6 +9728,60 @@ namespace dxvk {
         || dsInfo.extent.height < renderArea.height
         || dsInfo.sampleCount != sampleCount;
       const bool bindDS = !mismatch || noRT0Bound || ignoreRT0;
+      // Eye MSAA: a 1x pass (water reflection / refraction) with the 4x eye
+      // depth bound used to lose depth entirely. Give it the eye's 1x depth
+      // image instead (cleared at eye start, like the 1x eye depth was).
+      const bool msDepthFor1x = !bindDS && !ds->BmvrRetired()
+        && dsInfo.sampleCount != VK_SAMPLE_COUNT_1_BIT && sampleCount == VK_SAMPLE_COUNT_1_BIT
+        && ds->Desc()->MultiSample != D3DMULTISAMPLE_NONE
+        && dsInfo.extent.width >= renderArea.width && dsInfo.extent.height >= renderArea.height;
+      if (msDepthFor1x) {
+        if (ds->BmvrStandInClear()) {
+          ds->BmvrSetStandInClear(false);
+          VkClearValue cv = { };
+          cv.depthStencil = { 1.0f, 0u };
+          const Rc<DxvkImageView>& dsv = m_state.depthStencil->GetResolveDepthStencilView(true);
+          const VkImageAspectFlags aspects = dsv->formatInfo()->aspectMask;
+          EmitCs([cView = dsv, cAspects = aspects, cValue = cv] (DxvkContext* ctx) {
+            ctx->clearRenderTarget(cView, cAspects, cValue, 0u);
+          });
+        }
+        // Always the writable view: a later ZWRITEENABLE=1 does not rebind the
+        // framebuffer, and the backend drops depth writes on a read-only view.
+        // A pass whose first draw had depth write off (shadow decal) then drew
+        // everything in painter's order (water refraction, 2026-11-13).
+        attachments.depth.view = m_state.depthStencil->GetResolveDepthStencilView(true);
+        ++g_bmvrMsaaStats.depthStandIns;
+      }
+      // Eye MSAA, the other way round: a draw on the multisampled eye with a
+      // 1x depth bound. Black Mesa's Xog fog volume (`__gbxog1`, a full-screen
+      // quad at the far plane, ZFUNC LESSEQUAL) tests against the 1x G-buffer
+      // depth so it only fogs the sky. Without depth it fogged the whole view
+      // ("fog wall", only while no particle had retired the eye to 1x). The
+      // eye's own multisampled depth holds the same scene depth at that point.
+      bool msEyeDepthFor1xDs = false;
+      if (unlikely(!bindDS && !msDepthFor1x && dsInfo.sampleCount == VK_SAMPLE_COUNT_1_BIT
+          && sampleCount != VK_SAMPLE_COUNT_1_BIT && rt0 != nullptr && rt0->BmvrEyeDepth() != nullptr)) {
+        D3D9Surface* eyeDs = static_cast<D3D9Surface*>(rt0->BmvrEyeDepth());
+        D3D9CommonTexture* eyeTex = eyeDs->GetCommonTexture();
+        const DxvkImageCreateInfo& eyeInfo = eyeTex->BmvrActiveImage()->info();
+        if (eyeInfo.sampleCount == sampleCount
+            && eyeInfo.extent.width >= renderArea.width && eyeInfo.extent.height >= renderArea.height) {
+          attachments.depth.view = eyeDs->GetActiveDepthStencilView(true);
+          msEyeDepthFor1xDs = true;
+          static uint32_t s_eyeDs;
+          if (s_eyeDs++ < 4)
+            bmvr::Log("Eye MSAA: 1x depth on the multisampled eye -> eye depth (%ux%u) #%u",
+              dsInfo.extent.width, dsInfo.extent.height, s_eyeDs);
+        }
+      }
+      if (unlikely(!bindDS && !msDepthFor1x && !msEyeDepthFor1xDs && dsInfo.sampleCount != sampleCount)) {
+        static uint32_t s_dsDrop;
+        if (s_dsDrop++ < 24)
+          bmvr::Log("Eye MSAA: depth dropped (samples ds=%u rt0=%u, ds %ux%u rt0 %ux%u) #%u",
+            uint32_t(dsInfo.sampleCount), uint32_t(sampleCount),
+            dsInfo.extent.width, dsInfo.extent.height, renderArea.width, renderArea.height, s_dsDrop);
+      }
 
       if (likely(bindDS)) {
         if (unlikely(noRT0Bound || ignoreRT0)) {
@@ -9411,7 +9800,7 @@ namespace dxvk {
         // if it has been transitioned to the feedback loop layout.
         readOnly &= !m_state.depthStencil->GetCommonTexture()->HasBeenTransitionedToHazardLayout();
 
-        attachments.depth.view = m_state.depthStencil->GetDepthStencilView(!readOnly);
+        attachments.depth.view = m_state.depthStencil->GetActiveDepthStencilView(!readOnly);
       }
     }
 
@@ -9419,12 +9808,19 @@ namespace dxvk {
       if (!HasRenderTargetBound(i))
         continue;
 
-      const D3D9CommonTexture* rt = m_state.renderTargets[i]->GetCommonTexture();
-      const DxvkImageCreateInfo& rtInfo = rt->GetImage()->info();
+      D3D9CommonTexture* rt = m_state.renderTargets[i]->GetCommonTexture();
+      const DxvkImageCreateInfo& rtInfo = rt->BmvrActiveImage()->info();
       if (unlikely(rtInfo.extent.width != renderArea.width
           || rtInfo.extent.height != renderArea.height
-          || rtInfo.sampleCount != sampleCount))
+          || rtInfo.sampleCount != sampleCount)) {
+        if (rtInfo.sampleCount != sampleCount) {
+          static uint32_t s_rtDrop;
+          if (s_rtDrop++ < 24)
+            bmvr::Log("Eye MSAA: colour RT%u dropped (samples %u vs rt0 %u) #%u",
+              i, uint32_t(rtInfo.sampleCount), uint32_t(sampleCount), s_rtDrop);
+        }
         continue;
+      }
 
       // Check if the render target is also bound as a texture for sampling.
       // If that's the case, check whether we can skip binding the render target
@@ -9450,7 +9846,16 @@ namespace dxvk {
       if (hasHazard && !writtenTo)
         continue;
 
-      attachments.color[i].view = m_state.renderTargets[i]->GetRenderTargetView(srgb);
+      attachments.color[i].view = m_state.renderTargets[i]->GetActiveRenderTargetView(srgb);
+    }
+
+    // Eye MSAA: the engine sets D3DRS_MULTISAMPLEANTIALIAS=0, and with sample
+    // count 1 on a multisampled attachment DXVK rasterises at centred sample
+    // positions (= no edge AA). Only the private eyes are multisampled.
+    const bool msRaster = sampleCount != VK_SAMPLE_COUNT_1_BIT;
+    if (msRaster != m_bmvrMsRaster) {
+      m_bmvrMsRaster = msRaster;
+      m_dirty.set(D3D9DeviceDirtyFlag::RasterizerState);
     }
 
     // Work out feedback loop layouts based on bound render targets
@@ -9554,18 +9959,25 @@ namespace dxvk {
       const bool isNVATOCEnabled  = m_state.renderStates[D3DRS_ADAPTIVETESS_Y] == uint32_t(D3D9Format::ATOC)
                                       && m_state.renderStates[D3DRS_ALPHATESTENABLE] != 0;
       const bool isAMD = m_adapter->GetVendorId() == uint32_t(DxvkGpuVendor::Amd);
-      alphaToCoverageEnabled &= (isAMD && isAMDATOCEnabled) || (!isAMD && isNVATOCEnabled);
+      // BMVR AlphaToCoverage (VR panel): every alpha-tested draw into the
+      // multisampled eye uses alpha to coverage instead (foliage, fences).
+      const bool isBmvrATOC = bmvr::g_AlphaToCoverage && m_state.renderStates[D3DRS_ALPHATESTENABLE] != 0
+        && m_state.renderStates[D3DRS_ALPHABLENDENABLE] == 0;   // blended draws need their alpha as is
+      alphaToCoverageEnabled &= (isAMD && isAMDATOCEnabled) || (!isAMD && isNVATOCEnabled) || isBmvrATOC;
 
       // Check sample count of RT 0
       const D3D9CommonTexture* rt0 = GetCommonTexture(m_state.renderTargets[0].ptr());
       const bool isMultisampled = rt0 != nullptr && (
         rt0->Desc()->MultiSample >= D3DMULTISAMPLE_2_SAMPLES
         || (rt0->Desc()->MultiSample == D3DMULTISAMPLE_NONMASKABLE && rt0->Desc()->MultisampleQuality > 0)
-      );
+      )
+        // Eye MSAA: a retired eye (post chain) draws into its 1x resolve image.
+        && const_cast<D3D9CommonTexture*>(rt0)->BmvrActiveImage()->info().sampleCount != VK_SAMPLE_COUNT_1_BIT;
       alphaToCoverageEnabled &= isMultisampled;
 
       if (m_atocEnabled != alphaToCoverageEnabled) {
         m_dirty.set(D3D9DeviceDirtyFlag::MultiSampleState);
+        m_dirty.set(D3D9DeviceDirtyFlag::AlphaTestState);   // BmvrAlphaSharpen
         m_atocEnabled = alphaToCoverageEnabled;
       }
     }
@@ -9742,7 +10154,7 @@ namespace dxvk {
     state.setFrontFace(VK_FRONT_FACE_CLOCKWISE);
     state.setPolygonMode(DecodeFillMode(D3DFILLMODE(rs[D3DRS_FILLMODE])));
     state.setFlatShading(m_state.renderStates[D3DRS_SHADEMODE] == D3DSHADE_FLAT);
-    state.setSampleCount(m_state.renderStates[D3DRS_MULTISAMPLEANTIALIAS]
+    state.setSampleCount((m_bmvrMsRaster || m_state.renderStates[D3DRS_MULTISAMPLEANTIALIAS])
       ? VkSampleCountFlags(0u)
       : VkSampleCountFlags(VK_SAMPLE_COUNT_1_BIT));
 
@@ -9825,6 +10237,14 @@ namespace dxvk {
       : 0u;
 
     UpdateAlphaTestSpec(alphaOp, precision);
+
+    // BMVR AlphaToCoverage: the alpha test became coverage. Sharpen the
+    // shader's alpha around the reference first (alpha - ref) / fwidth(alpha)
+    // + 0.5, so only the cut-out edge gets partial coverage; with the raw
+    // texture alpha whole leaves went thin and dithered.
+    const bool sharpen = m_atocEnabled && bmvr::g_AlphaToCoverage && rs[D3DRS_ALPHATESTENABLE] != 0;
+    if (m_specInfo.set<SpecBmvrAlphaSharpen>(sharpen ? 1u : 0u))
+      m_dirty.set(D3D9DeviceDirtyFlag::SpecializationEntries);
   }
 
 
@@ -9864,7 +10284,8 @@ namespace dxvk {
       cIsMultiMip = tex && (tex->Desc()->MipLevels > 1u),
       cIsDepth    = bool(m_textureSlotTracking.depth & (1u << Sampler)),
       cView       = std::move(imageView),
-      cBindId     = m_samplerBindCount
+      cBindId     = m_samplerBindCount,
+      cBmvrBias   = m_bmvrLodBias
     ] (DxvkContext* ctx) {
       DxvkSamplerKey key = { };
 
@@ -9904,6 +10325,7 @@ namespace dxvk {
 
         float lodBias = cState.mipLodBias;
         lodBias += m_d3d9Options.samplerLodBias;
+        lodBias += cBmvrBias;   // no effect on single-level textures
 
         if (m_d3d9Options.clampNegativeLodBias)
           lodBias = std::max(lodBias, 0.0f);
@@ -9963,19 +10385,46 @@ namespace dxvk {
       if (!surf)
         return;
       D3D9CommonTexture* tex = surf->GetCommonTexture();
-      if (!tex || tex->Desc()->MultiSample == D3DMULTISAMPLE_NONE)
+      if (!tex || tex->Desc()->MultiSample == D3DMULTISAMPLE_NONE || tex->BmvrRetired())
         return;
+      if (!tex->MsaaNeedsResolve())
+        ++g_bmvrMsaaStats.dirtyMarks;
       tex->MarkMsaaDirty();
     };
-    for (uint32_t i = 0; i < m_state.renderTargets.size(); i++)
+    // Only colour targets this draw really writes: glow visibility queries and
+    // depth/stencil-only passes into the eye left it "dirty", so every later
+    // copy resolved all samples again.
+    const auto& psMasks = PSShaderMasks();
+    for (uint32_t i = 0; i < m_state.renderTargets.size(); i++) {
+      if ((psMasks.rtMask & (1u << i)) == 0 || m_state.renderStates[ColorWriteIndex(i)] == 0)
+        continue;
       note(m_state.renderTargets[i].ptr());
-    note(m_state.depthStencil.ptr());
+    }
+    // Depth is only resolved when sampled; keep marking it on every draw.
+    if (m_state.depthStencil != nullptr) {
+      D3D9CommonTexture* ds = m_state.depthStencil->GetCommonTexture();
+      if (ds && ds->Desc()->MultiSample != D3DMULTISAMPLE_NONE)
+        ds->MarkMsaaDirty();
+    }
   }
 
 
-  void D3D9DeviceEx::BmvrResolveMsaaForSample(D3D9CommonTexture* tex) {
-    if (!tex || !tex->MsaaNeedsResolve())
+  void D3D9DeviceEx::BmvrResolvePendingDepth() {
+    D3D9Surface* dsSurf = m_state.depthStencil.ptr();
+    D3D9CommonTexture* ds = dsSurf ? dsSurf->GetCommonTexture() : nullptr;
+    if (!ds || !ds->BmvrDepthPending())
       return;
+    ds->BmvrSetDepthPending(false);
+    BmvrResolveMsaaForSample(ds, true);
+    ++g_bmvrMsaaStats.depthResolves;
+  }
+
+
+  void D3D9DeviceEx::BmvrResolveMsaaForSample(D3D9CommonTexture* tex, bool force) {
+    if (!tex || (!force && !tex->MsaaNeedsResolve()))
+      return;
+    if (unlikely(BmvrCopyDebtTouches(tex)))
+      BmvrPayCopyDebt("MSAA resolve");
     const Rc<DxvkImage>& srcRef = tex->GetImage();
     if (srcRef == nullptr || srcRef->info().sampleCount == VK_SAMPLE_COUNT_1_BIT) {
       tex->MarkMsaaResolved();
@@ -10013,6 +10462,9 @@ namespace dxvk {
       ctx->resolveImage(cDst, cSrc, cRegion, cFormat, cMode, VK_RESOLVE_MODE_SAMPLE_ZERO_BIT);
     });
     tex->MarkMsaaResolved();
+    ++g_bmvrMsaaStats.sampleResolves;
+    g_bmvrMsaaStats.pixels += uint64_t(region.extent.width) * region.extent.height;
+    BmvrMsaaStatsTick();
   }
 
 
@@ -10030,8 +10482,11 @@ namespace dxvk {
 
     const bool msaa = commonTex != nullptr
       && commonTex->Desc()->MultiSample != D3DMULTISAMPLE_NONE;
-    if (msaa)
+    if (msaa) {
+      if (commonTex->MsaaNeedsResolve())
+        ++g_bmvrMsaaStats.bindResolves;
       BmvrResolveMsaaForSample(commonTex);
+    }
 
     Rc<DxvkImageView> imageView = msaa
       ? commonTex->GetResolveSampleView(srgb)
@@ -10124,6 +10579,14 @@ namespace dxvk {
 
 
   void D3D9DeviceEx::PrepareDraw(D3DPRIMITIVETYPE PrimitiveType, bool UploadVBOs, bool UploadIBO) {
+    if (unlikely(m_bmvrDebtEye != nullptr))
+      BmvrCopyDebtCheckDraw();
+
+    if (unlikely(m_state.depthStencil != nullptr
+        && (m_state.renderStates[D3DRS_ZENABLE] || m_state.renderStates[D3DRS_STENCILENABLE])
+        && m_state.depthStencil->GetCommonTexture()->BmvrDepthPending()))
+      BmvrResolvePendingDepth();
+
     if (unlikely(m_textureSlotTracking.unresolvableHazardRT != 0 || m_textureSlotTracking.unresolvableHazardDS != 0))
       EmitFeedbackLoopBarriers();
 
@@ -10160,6 +10623,23 @@ namespace dxvk {
 
     if (unlikely(m_dirty.test(D3D9DeviceDirtyFlag::ViewportScissor)))
       BindViewportAndScissor();
+
+    // BMVR LodBias (VR panel): mipmapped textures sample a little blurrier in
+    // the 3D views (eyes, water reflection/refraction: RT0 taller than the
+    // 1080 window/HUD), calming texture shimmer. Menus, HUD and the window
+    // keep the stock bias. A change rebinds every sampler.
+    {
+      float bias = 0.0f;
+      if (bmvr::g_LodBias != 0.0f) {
+        const D3D9CommonTexture* rt0 = GetCommonTexture(m_state.renderTargets[0].ptr());
+        if (rt0 != nullptr && rt0->Desc()->Height > 1100u)
+          bias = bmvr::g_LodBias;
+      }
+      if (unlikely(bias != m_bmvrLodBias)) {
+        m_bmvrLodBias = bias;
+        m_textureSlotTracking.samplerStateDirty = ~0u;
+      }
+    }
 
     const uint32_t activeDirtySamplers = m_textureSlotTracking.samplerStateDirty & usedTextureMask;
     if (unlikely(activeDirtySamplers))
@@ -11750,4 +12230,572 @@ namespace dxvk {
       return GpuFlushType::ImplicitWeakHint;
   }
 
+}
+
+
+namespace dxvk {
+  // BMVR foveated rendering (fixed, around the lens centre). Shading rate
+  // image per eye: one R8_UINT texel per m_bmvrFovTexel pixels, rings by
+  // distance from the centre in units of half the eye height:
+  //   < r1 1x1, r1..r2 2x1 / 1x2 (coarse along the axis pointing away from
+  //   the centre), r2..r3 2x2, > r3 4x4 (clamped by the driver to its
+  //   largest supported rate, 2x2 on RDNA4).
+  // Ring layout adapted from HL2VR (OpenVRDirectMode.cpp, VRS map).
+  void D3D9DeviceEx::BmvrFoveationBuild(BmvrFovMap& map, int eyeIndex, uint32_t eyeW, uint32_t eyeH,
+      int32_t cx, int32_t cy, const float r[3], uint32_t level) {
+    const VkExtent2D texel = m_bmvrFovTexel;
+    const uint32_t tw = (eyeW + texel.width - 1u) / texel.width;
+    const uint32_t th = (eyeH + texel.height - 1u) / texel.height;
+
+    // Rebuilt when the eye-tracked centre moves (a few times a second), on
+    // the D3D thread: squared distances, no per-texel sqrt.
+    std::vector<uint8_t> data(size_t(tw) * th);
+    const float halfH = 0.5f * float(eyeH);
+    const float r1 = r[0] * halfH, r2 = r[1] * halfH, r3 = r[2] * halfH;
+    const float r1s = r1 * r1, r2s = r2 * r2, r3s = r3 * r3;
+    const float centreX = (float(cx) + 0.5f) * float(texel.width);
+    const float centreY = (float(cy) + 0.5f) * float(texel.height);
+    uint32_t counts[4] = { };
+
+    for (uint32_t y = 0; y < th; y++) {
+      const float dy = (float(y) + 0.5f) * float(texel.height) - centreY;
+      const float dy2 = dy * dy;
+      uint8_t* row = &data[size_t(y) * tw];
+      for (uint32_t x = 0; x < tw; x++) {
+        const float dx = (float(x) + 0.5f) * float(texel.width) - centreX;
+        const float d2 = dx * dx + dy2;
+        // Rate texel value: (log2(width) << 2) | log2(height)
+        uint8_t v;
+        int ring;
+        if (d2 < r1s)      { v = 0u; ring = 0; }
+        else if (d2 < r2s) { v = dx * dx >= dy2 ? 4u : 1u; ring = 1; }
+        else if (d2 < r3s) { v = 5u; ring = 2; }
+        else               { v = 10u; ring = 3; }
+        row[x] = v;
+        counts[ring]++;
+      }
+    }
+
+    DxvkBufferCreateInfo bufInfo;
+    bufInfo.size   = data.size();
+    bufInfo.usage  = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bufInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    bufInfo.access = VK_ACCESS_TRANSFER_READ_BIT;
+    bufInfo.debugName = "BMVR foveation staging";
+    Rc<DxvkBuffer> staging = m_dxvkDevice->createBuffer(bufInfo,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    std::memcpy(staging->mapPtr(0), data.data(), data.size());
+
+    // Same size: upload into the existing image. The copy is ordered after
+    // the GPU's earlier reads of it by DXVK's barriers (the image's stages
+    // include the shading rate stage), so passes already recorded keep the
+    // old map and later ones get the new one.
+    const bool reuse = map.view != nullptr
+      && map.view->image()->info().extent.width == tw
+      && map.view->image()->info().extent.height == th;
+
+    if (reuse) {
+      EmitCs([
+        cImage   = map.view->image(),
+        cStaging = std::move(staging),
+        cExtent  = VkExtent3D { tw, th, 1u }
+      ] (DxvkContext* ctx) {
+        VkImageSubresourceLayers layers = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u };
+        ctx->copyBufferToImage(cImage, layers, VkOffset3D { 0, 0, 0 }, cExtent,
+          cStaging, 0, 0, 0, VK_FORMAT_R8_UINT);
+      });
+
+      map.cx = cx;
+      map.cy = cy;
+      map.r[0] = r[0];
+      map.r[1] = r[1];
+      map.r[2] = r[2];
+      map.level = level;
+      map.uploads++;
+
+      // Log the first few moves, then only a count (eye-tracked: many)
+      if (map.uploads <= 3u || (map.uploads % 500u) == 0u)
+        bmvr::Log("Foveation map %c re-upload #%u: centre px %.0f,%.0f",
+          eyeIndex == 0 ? 'L' : 'R', map.uploads, centreX, centreY);
+      return;
+    }
+
+    DxvkImageCreateInfo imgInfo;
+    imgInfo.type        = VK_IMAGE_TYPE_2D;
+    imgInfo.format      = VK_FORMAT_R8_UINT;
+    imgInfo.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+    imgInfo.extent      = { tw, th, 1u };
+    imgInfo.numLayers   = 1u;
+    imgInfo.mipLevels   = 1u;
+    imgInfo.usage       = VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                        | VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+    imgInfo.stages      = VK_PIPELINE_STAGE_TRANSFER_BIT
+                        | VK_PIPELINE_STAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+    imgInfo.access      = VK_ACCESS_TRANSFER_WRITE_BIT
+                        | VK_ACCESS_FRAGMENT_SHADING_RATE_ATTACHMENT_READ_BIT_KHR;
+    imgInfo.tiling      = VK_IMAGE_TILING_OPTIMAL;
+    imgInfo.layout      = VK_IMAGE_LAYOUT_GENERAL;
+    imgInfo.debugName   = eyeIndex == 0 ? "BMVR foveation L" : "BMVR foveation R";
+    Rc<DxvkImage> image = m_dxvkDevice->createImage(imgInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    DxvkImageViewKey viewKey;
+    viewKey.viewType   = VK_IMAGE_VIEW_TYPE_2D;
+    viewKey.format     = VK_FORMAT_R8_UINT;
+    viewKey.usage      = VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+    viewKey.aspects    = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewKey.mipIndex   = 0u;
+    viewKey.mipCount   = 1u;
+    viewKey.layerIndex = 0u;
+    viewKey.layerCount = 1u;
+    Rc<DxvkImageView> view = image->createView(viewKey);
+
+    EmitCs([
+      cImage   = image,
+      cStaging = std::move(staging),
+      cExtent  = VkExtent3D { tw, th, 1u }
+    ] (DxvkContext* ctx) {
+      VkImageSubresourceLayers layers = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u };
+      ctx->copyBufferToImage(cImage, layers, VkOffset3D { 0, 0, 0 }, cExtent,
+        cStaging, 0, 0, 0, VK_FORMAT_R8_UINT);
+    });
+
+    map.view  = std::move(view);
+    map.w     = eyeW;
+    map.h     = eyeH;
+    map.cx    = cx;
+    map.cy    = cy;
+    map.r[0]  = r[0];
+    map.r[1]  = r[1];
+    map.r[2]  = r[2];
+    map.level = level;
+
+    const float n = float(tw * th) / 100.f;
+    bmvr::Log("Foveation map %c: eye %ux%u texel %ux%u -> %ux%u, centre px %.0f,%.0f, rings %.2f/%.2f/%.2f, "
+      "1x1 %.0f%% 2x1/1x2 %.0f%% 2x2 %.0f%% 4x4 %.0f%%",
+      eyeIndex == 0 ? 'L' : 'R', eyeW, eyeH, texel.width, texel.height, tw, th, centreX, centreY,
+      r[0], r[1], r[2], counts[0] / n, counts[1] / n, counts[2] / n, counts[3] / n);
+  }
+
+
+  void D3D9DeviceEx::BmvrFoveationSelect(int stereoEye, uint32_t eyeW, uint32_t eyeH, float centreU, float centreV) {
+    D3D9DeviceLock lock = LockDevice();
+
+    const auto& fsrFeatures = m_dxvkDevice->features().khrFragmentShadingRate;
+    Rc<DxvkImageView> want;
+
+    const uint32_t level = bmvr::g_Foveated > 0 ? uint32_t(bmvr::g_Foveated) : 0u;
+
+    if (fsrFeatures.attachmentFragmentShadingRate && level
+     && (stereoEye == 1 || stereoEye == 2) && eyeW >= 64u && eyeH >= 64u) {
+      if (!m_bmvrFovTexel.width) {
+        // Texel size: 16 px (HL2VR's choice), clamped to the device range
+        const auto& props = m_dxvkDevice->properties().khrFragmentShadingRate;
+        const VkExtent2D lo = props.minFragmentShadingRateAttachmentTexelSize;
+        const VkExtent2D hi = props.maxFragmentShadingRateAttachmentTexelSize;
+        m_bmvrFovTexel.width  = std::clamp(16u, std::max(lo.width, 1u),  std::max(hi.width, 1u));
+        m_bmvrFovTexel.height = std::clamp(16u, std::max(lo.height, 1u), std::max(hi.height, 1u));
+        bmvr::Log("Foveation: texel %ux%u (device %ux%u..%ux%u), max fragment %ux%u, MSAA with rates %d",
+          m_bmvrFovTexel.width, m_bmvrFovTexel.height, lo.width, lo.height, hi.width, hi.height,
+          props.maxFragmentSize.width, props.maxFragmentSize.height,
+          int(props.fragmentShadingRateWithCustomSampleLocations));
+      }
+
+      // Radii are tuned on the PS VR2; the scale keeps them the same angle on other headsets.
+      const float ringScale = std::clamp(bmvr::g_FoveatedRingScale, 0.25f, 4.0f);
+      const float r[3] = {
+        std::clamp(bmvr::g_FoveatedInner, 0.05f, 2.0f) * ringScale,
+        std::clamp(std::max(bmvr::g_FoveatedMid, bmvr::g_FoveatedInner), 0.05f, 3.0f) * ringScale,
+        std::clamp(std::max(bmvr::g_FoveatedOuter, bmvr::g_FoveatedMid), 0.05f, 4.0f) * ringScale };
+
+      const int32_t cx = int32_t(std::floor(std::clamp(centreU, 0.f, 1.f) * float(eyeW) / float(m_bmvrFovTexel.width)));
+      const int32_t cy = int32_t(std::floor(std::clamp(centreV, 0.f, 1.f) * float(eyeH) / float(m_bmvrFovTexel.height)));
+
+      BmvrFovMap& map = m_bmvrFovMap[stereoEye - 1];
+      if (map.view == nullptr || map.w != eyeW || map.h != eyeH || map.cx != cx || map.cy != cy
+       || map.r[0] != r[0] || map.r[1] != r[1] || map.r[2] != r[2] || map.level != level)
+        BmvrFoveationBuild(map, stereoEye - 1, eyeW, eyeH, cx, cy, r, level);
+
+      want = map.view;
+    }
+
+    if (m_bmvrFovBoundValid && want == m_bmvrFovBound)
+      return;
+
+    m_bmvrFovBound = want;
+    m_bmvrFovBoundValid = true;
+
+    if (!fsrFeatures.attachmentFragmentShadingRate)
+      return;
+
+    EmitCs([
+      cView  = std::move(want),
+      cTexel = m_bmvrFovTexel
+    ] (DxvkContext* ctx) {
+      ctx->bmvrSetShadingRateImage(cView, cTexel);
+    });
+  }
+}
+
+
+namespace bmvr {
+  // Eye MSAA post switch (see D3D9CommonTexture::BmvrRetired). Retire: resolve
+  // the eye colour (if written) and depth (sample 0) once, then the rest of the
+  // eye's frame runs at 1x. Begin: back to the multisampled images for the
+  // next scene (the caller clears them right after).
+  static void MsaaEyeSet(IDirect3DDevice9* device, IDirect3DSurface9* color, IDirect3DSurface9* depth, bool retire) {
+    if (!device)
+      return;
+    auto* dev = static_cast<dxvk::D3D9DeviceEx*>(device);
+    dev->BmvrSetMsaaEyeRetired(color, depth, retire);
+  }
+  void FoveationSelect(IDirect3DDevice9* device, int stereoEye, uint32_t eyeW, uint32_t eyeH, float centreU, float centreV) {
+    if (!device)
+      return;
+    static_cast<dxvk::D3D9DeviceEx*>(device)->BmvrFoveationSelect(stereoEye, eyeW, eyeH, centreU, centreV);
+  }
+  bool FoveationAvailable(IDirect3DDevice9* device) {
+    if (!device)
+      return false;
+    return static_cast<dxvk::D3D9DeviceEx*>(device)->GetDXVKDevice()->features().khrFragmentShadingRate.attachmentFragmentShadingRate;
+  }
+  void MsaaEyeRetire(IDirect3DDevice9* device, IDirect3DSurface9* color, IDirect3DSurface9* depth) {
+    MsaaEyeSet(device, color, depth, true);
+  }
+  void MsaaEyeBegin(IDirect3DDevice9* device, IDirect3DSurface9* color, IDirect3DSurface9* depth) {
+    MsaaEyeSet(device, color, depth, false);
+  }
+  void MsaaDepthStateText(IDirect3DSurface9* depth, char* out, size_t outSize) {
+    if (!out || !outSize)
+      return;
+    out[0] = 0;
+    if (!depth)
+      return;
+    dxvk::D3D9CommonTexture* tex = static_cast<dxvk::D3D9Surface*>(depth)->GetCommonTexture();
+    if (!tex || tex->Desc()->MultiSample == D3DMULTISAMPLE_NONE)
+      return;
+    std::snprintf(out, outSize, " ms=%u ret=%d pend=%d sic=%d", uint32_t(tex->Desc()->MultiSample),
+      tex->BmvrRetired() ? 1 : 0, tex->BmvrDepthPending() ? 1 : 0, tex->BmvrStandInClear() ? 1 : 0);
+  }
+}
+
+namespace dxvk {
+  void D3D9DeviceEx::BmvrSetMsaaEyeRetired(IDirect3DSurface9* color, IDirect3DSurface9* depth, bool retire) {
+    D3D9DeviceLock lock = LockDevice();
+    bool changed = false;
+    if (color && depth) {
+      D3D9CommonTexture* ctex = static_cast<D3D9Surface*>(color)->GetCommonTexture();
+      D3D9CommonTexture* dtex = static_cast<D3D9Surface*>(depth)->GetCommonTexture();
+      if (ctex && dtex && ctex->Desc()->MultiSample != D3DMULTISAMPLE_NONE
+          && dtex->Desc()->MultiSample == ctex->Desc()->MultiSample && dtex->IsDepthStencil())
+        ctex->BmvrSetEyeDepth(depth);
+    }
+    for (IDirect3DSurface9* s : { color, depth }) {
+      if (!s)
+        continue;
+      D3D9CommonTexture* tex = static_cast<D3D9Surface*>(s)->GetCommonTexture();
+      if (!tex || tex->Desc()->MultiSample == D3DMULTISAMPLE_NONE)
+        continue;
+      if (tex->BmvrRetired() == retire && (retire || !tex->IsDepthStencil()))
+        continue;
+      if (BmvrCopyDebtTouches(tex))
+        BmvrPayCopyDebt("eye MSAA retire/unretire");
+      if (retire) {
+        // Colour: resolve now. Depth (sample 0): only when a later draw tests
+        // or writes depth (see PrepareDraw); otherwise never.
+        if (tex->IsDepthStencil())
+          tex->BmvrSetDepthPending(true);
+        else
+          BmvrResolveMsaaForSample(tex);
+        ++g_bmvrMsaaStats.retires;
+      }
+      if (tex->BmvrRetired() != retire)
+        changed = true;
+      tex->BmvrSetRetired(retire);
+      if (!retire && tex->IsDepthStencil()) {
+        // The 1x depth doubles as the stand-in for this eye's 1x passes: they
+        // start from a cleared buffer, as with the 1x eye depth (cleared in
+        // BindFramebuffer on first use, usually never).
+        tex->BmvrSetDepthPending(false);
+        tex->BmvrSetStandInClear(true);
+      }
+    }
+    if (changed) {
+      m_dirty.set(D3D9DeviceDirtyFlag::Framebuffer);
+      // RT0's active sample count changed: alpha to coverage may switch.
+      UpdateAlphaToCoverangeAndAlphaTest();
+    }
+  }
+}
+
+// BMVR PostCopySwap (see d3d9_device.h). The engine's post chain copies the
+// eye into _rt_FullFrameFB twice per eye (start of post, after
+// engine_post_nxtgen), and each copy is followed by a full-screen opaque draw
+// on the eye. Swapping the storage moves the content without a copy; the eye's
+// old content is only needed if something reads the eye (or writes the FB)
+// before that draw, and then the original copy runs at that point.
+namespace {
+  struct BmvrCopySwapStats {
+    uint32_t swaps = 0, overwritten = 0, paid = 0, refused = 0;
+    const char* lastPay = "";
+    const char* lastRefuse = "";
+    const char* lastKeep = "";
+    uint64_t t0 = 0;
+  } g_bmvrSwapStats;
+  int g_bmvrSwapLog = 0;
+}
+
+namespace dxvk {
+  static bool BmvrSameImageInfo(const Rc<DxvkImage>& a, const Rc<DxvkImage>& b) {
+    const DxvkImageCreateInfo& x = a->info();
+    const DxvkImageCreateInfo& y = b->info();
+    if (x.type != y.type || x.format != y.format || x.flags != y.flags || x.sampleCount != y.sampleCount
+     || x.extent.width != y.extent.width || x.extent.height != y.extent.height || x.extent.depth != y.extent.depth
+     || x.numLayers != y.numLayers || x.mipLevels != y.mipLevels || x.usage != y.usage
+     || x.stages != y.stages || x.access != y.access || x.tiling != y.tiling || x.layout != y.layout
+     || x.shared || y.shared || x.transient != y.transient
+     || x.sharing.mode != DxvkSharedHandleMode::None || y.sharing.mode != DxvkSharedHandleMode::None
+     || x.viewFormatCount != y.viewFormatCount || a->memFlags() != b->memFlags())
+      return false;
+    for (uint32_t i = 0; i < x.viewFormatCount; i++)
+      if (x.viewFormats[i] != y.viewFormats[i])
+        return false;
+    return x.mipLevels == 1u && x.numLayers == 1u && x.sampleCount == VK_SAMPLE_COUNT_1_BIT;
+  }
+
+  void D3D9DeviceEx::BmvrCopyDebtStatsTick() {
+    BmvrCopySwapStats& s = g_bmvrSwapStats;
+    const uint64_t now = GetTickCount64();
+    if (!s.t0)
+      s.t0 = now;
+    // A mode change (panel / cvar A/B) flushes the stats and logs the next decisions again.
+    static int s_mode = -1;
+    const int mode = (bmvr::g_PostCopySwap ? 1 : 0) + 2 * int(bmvr::g_PostCopySwapAlpha + 0.5f);
+    const bool modeChanged = s_mode >= 0 && mode != s_mode;
+    s_mode = mode;
+    if (modeChanged) {
+      g_bmvrSwapLog = 0;
+      bmvr::Log("PostCopySwap: mode now on=%d alpha=%d", mode & 1, mode >> 1);
+    }
+    if (now - s.t0 < 10000 && !modeChanged)
+      return;
+    if (s.swaps || s.refused)
+      bmvr::Log("PostCopySwap (10 s): swaps %u, overwritten (no copy) %u, paid back (copy) %u [last: %s], refused %u [last: %s], kept debt at a draw [last: %s]",
+        s.swaps, s.overwritten, s.paid, s.lastPay, s.refused, s.lastRefuse, s.lastKeep);
+    s = BmvrCopySwapStats{};
+    s.t0 = now;
+  }
+
+  bool D3D9DeviceEx::BmvrTrySwapCopy(D3D9Surface* src, D3D9Surface* dst, const RECT* srcRect, const RECT* dstRect) {
+    if (!bmvr::g_PostCopySwap || bmvr::g_PostSwapArmThread != GetCurrentThreadId())
+      return false;
+    bmvr::g_PostSwapArmThread = 0;   // one copy per arm
+    auto refuse = [&](const char* why) {
+      ++g_bmvrSwapStats.refused;
+      g_bmvrSwapStats.lastRefuse = why;
+      if (g_bmvrSwapLog < 24) {
+        bmvr::Log("PostCopySwap: copy not swapped (%s)", why);
+        ++g_bmvrSwapLog;
+      }
+      BmvrCopyDebtStatsTick();
+      return false;
+    };
+    D3D9CommonTexture* s = src->GetCommonTexture();
+    D3D9CommonTexture* d = dst->GetCommonTexture();
+    if (!s || !d || s == d || s->IsNull() || d->IsNull())
+      return refuse("textures");
+    if (src->GetSubresource() != 0 || dst->GetSubresource() != 0)
+      return refuse("subresource");
+    if (s->IsDepthStencil() || d->IsDepthStencil())
+      return refuse("depth");
+    if (s->Desc()->MultiSample != D3DMULTISAMPLE_NONE && !s->BmvrRetired())
+      return refuse("source multisampled, not retired");
+    if (d->Desc()->MultiSample != D3DMULTISAMPLE_NONE)
+      return refuse("dest multisampled");
+    if (s->Desc()->Format != d->Desc()->Format)
+      return refuse("format");
+    if (s->IsAutomaticMip() || d->IsAutomaticMip() || s->Desc()->Discard || d->Desc()->Discard)
+      return refuse("mips/discard");
+    Rc<DxvkImage> si = s->BmvrActiveImage();
+    Rc<DxvkImage> di = d->GetImage();
+    if (si == nullptr || di == nullptr || si == di)
+      return refuse("images");
+    if (!BmvrSameImageInfo(si, di)) {
+      if (g_bmvrSwapLog < 24) {
+        const DxvkImageCreateInfo& x = si->info();
+        const DxvkImageCreateInfo& y = di->info();
+        bmvr::Log("PostCopySwap: info eye/FB: fmt %d/%d flags 0x%x/0x%x samples %d/%d %ux%u/%ux%u layers %u/%u mips %u/%u usage 0x%x/0x%x stages 0x%x/0x%x access 0x%x/0x%x tiling %d/%d layout %d/%d shared %d/%d views %u/%u mem 0x%x/0x%x",
+          int(x.format), int(y.format), x.flags, y.flags, int(x.sampleCount), int(y.sampleCount),
+          x.extent.width, x.extent.height, y.extent.width, y.extent.height, x.numLayers, y.numLayers,
+          x.mipLevels, y.mipLevels, x.usage, y.usage, x.stages, y.stages, x.access, y.access,
+          int(x.tiling), int(y.tiling), int(x.layout), int(y.layout), int(x.shared), int(y.shared),
+          x.viewFormatCount, y.viewFormatCount, si->memFlags(), di->memFlags());
+      }
+      return refuse("image create info differs");
+    }
+    const VkExtent3D e = si->info().extent;
+    auto full = [&](const RECT* r) {
+      return !r || (r->left == 0 && r->top == 0 && r->right == LONG(e.width) && r->bottom == LONG(e.height));
+    };
+    if (!full(srcRect) || !full(dstRect))
+      return refuse("not a full copy");
+
+    if (m_bmvrDebtEye != nullptr)
+      BmvrPayCopyDebt("new swap");
+
+    const int alphaTest = int(bmvr::g_PostCopySwapAlpha + 0.5f);
+    Rc<DxvkImageView> clearView;
+    if (alphaTest >= 2) {
+      DxvkImageViewKey key;
+      key.viewType = VK_IMAGE_VIEW_TYPE_2D;
+      key.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+      key.format = si->info().format;
+      key.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+      key.mipIndex = 0;
+      key.mipCount = 1;
+      key.layerIndex = 0;
+      key.layerCount = 1;
+      clearView = si->createView(key);
+    }
+    EmitCs([cA = si, cB = di, cView = clearView, cAlpha = alphaTest == 3 ? 1.0f : 0.0f] (DxvkContext* ctx) {
+      ctx->bmvrSwapImageStorage(cA, cB);
+      if (cView != nullptr) {
+        // Test: the eye's owed content becomes a solid colour, so any later
+        // use of the eye's old alpha shows in the image.
+        VkClearValue v = { };
+        v.color.float32[3] = cAlpha;
+        ctx->clearImageView(cView, VkOffset3D { 0, 0, 0 }, cA->info().extent, VK_IMAGE_ASPECT_COLOR_BIT, v);
+      }
+    });
+    m_bmvrDebtEye = src;
+    m_bmvrDebtFb = dst;
+    m_bmvrDebtEyeImage = si;
+    m_bmvrDebtFbImage = di;
+    s->SetNeedsReadback(0, true);
+    d->SetNeedsReadback(0, true);
+    ++g_bmvrSwapStats.swaps;
+    if (g_bmvrSwapLog < 24) {
+      bmvr::Log("PostCopySwap: swapped %ux%u fmt %d (eye %s)", e.width, e.height, int(si->info().format),
+        s->BmvrRetired() ? "1x resolve" : "1x");
+      ++g_bmvrSwapLog;
+    }
+    BmvrCopyDebtStatsTick();
+    return true;
+  }
+
+  void D3D9DeviceEx::BmvrPayCopyDebt(const char* reason) {
+    if (m_bmvrDebtEye == nullptr)
+      return;
+    D3D9CommonTexture* eye = m_bmvrDebtEye->GetCommonTexture();
+    if (eye->BmvrActiveImage() != m_bmvrDebtEyeImage && g_bmvrSwapLog < 24) {
+      bmvr::Log("PostCopySwap: eye image changed before the pay-back (%s)", reason);
+      ++g_bmvrSwapLog;
+    }
+    const VkExtent3D e = m_bmvrDebtEyeImage->info().extent;
+    const VkImageSubresourceLayers layers = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u };
+    EmitCs([
+      cDst = m_bmvrDebtEyeImage,
+      cSrc = m_bmvrDebtFbImage,
+      cLayers = layers,
+      cExtent = e
+    ] (DxvkContext* ctx) {
+      ctx->copyImage(cDst, cLayers, VkOffset3D { 0, 0, 0 },
+        cSrc, cLayers, VkOffset3D { 0, 0, 0 }, cExtent);
+    });
+    eye->SetNeedsReadback(0, true);
+    m_bmvrDebtEye = nullptr;
+    m_bmvrDebtFb = nullptr;
+    m_bmvrDebtEyeImage = nullptr;
+    m_bmvrDebtFbImage = nullptr;
+    ++g_bmvrSwapStats.paid;
+    g_bmvrSwapStats.lastPay = reason;
+    if (g_bmvrSwapLog < 24) {
+      bmvr::Log("PostCopySwap: paid back with a copy (%s)", reason);
+      ++g_bmvrSwapLog;
+    }
+    BmvrCopyDebtStatsTick();
+  }
+
+  // The armed draw must write every pixel of RT0 without reading it.
+  bool D3D9DeviceEx::BmvrFullOverwriteState(const char** why) {
+    const auto& rs = m_state.renderStates;
+    D3D9Surface* rt0 = m_state.renderTargets[0].ptr();
+    if (!rt0) { *why = "no RT0"; return false; }
+    if (rs[D3DRS_ALPHABLENDENABLE]) { *why = "blend on"; return false; }
+    if (rs[D3DRS_ALPHATESTENABLE]) { *why = "alpha test"; return false; }
+    // Source passes keep alpha writes off: RGB-only is a full overwrite when
+    // the eye's alpha is not needed (PostCopySwapAlpha test, see bmvr_flags.h).
+    const DWORD needMask = bmvr::g_PostCopySwapAlpha >= 0.5f ? 0x7u : 0xFu;
+    if ((rs[ColorWriteIndex(0)] & needMask) != needMask) {
+      *why = (rs[ColorWriteIndex(0)] & 0xFu) == 0x7u ? "colour write mask RGB only" : "colour write mask";
+      return false;
+    }
+    if (m_state.depthStencil != nullptr && rs[D3DRS_ZENABLE] && rs[D3DRS_ZFUNC] != D3DCMP_ALWAYS) { *why = "depth test"; return false; }
+    if (m_state.depthStencil != nullptr && rs[D3DRS_STENCILENABLE]) { *why = "stencil test"; return false; }
+    if (rs[D3DRS_CLIPPLANEENABLE]) { *why = "clip planes"; return false; }
+    const VkExtent2D ext = rt0->GetSurfaceExtent();
+    const D3DVIEWPORT9& vp = m_state.viewport;
+    if (vp.X != 0 || vp.Y != 0 || vp.Width < ext.width || vp.Height < ext.height) { *why = "viewport"; return false; }
+    if (rs[D3DRS_SCISSORTESTENABLE]) {
+      const RECT& sc = m_state.scissorRect;
+      if (sc.left > 0 || sc.top > 0 || sc.right < LONG(ext.width) || sc.bottom < LONG(ext.height)) { *why = "scissor"; return false; }
+    }
+    const D3D9CommonShader* ps = GetCommonShader(m_state.pixelShader);
+    if (ps && ps->BmvrUsesKill()) { *why = "pixel shader discards"; return false; }
+    return true;
+  }
+
+  void D3D9DeviceEx::BmvrCopyDebtCheckDraw() {
+    D3D9CommonTexture* eye = m_bmvrDebtEye->GetCommonTexture();
+    D3D9CommonTexture* fb = m_bmvrDebtFb->GetCommonTexture();
+    const auto& psMasks = PSShaderMasks();
+    int eyeSlot = -1;
+    for (uint32_t i = 0; i < m_state.renderTargets.size(); i++) {
+      D3D9CommonTexture* tex = GetCommonTexture(m_state.renderTargets[i].ptr());
+      if (!tex)
+        continue;
+      if (tex == fb)
+        return BmvrPayCopyDebt("FB is a render target");
+      const bool writes = (psMasks.rtMask & (1u << i)) && m_state.renderStates[ColorWriteIndex(i)] != 0;
+      if (tex == eye && writes && eyeSlot < 0)
+        eyeSlot = int(i);
+    }
+    for (uint32_t i = 0; i < m_state.textures->size(); i++) {
+      if (m_state.textures[i] != nullptr && GetCommonTexture(m_state.textures[i]) == eye)
+        return BmvrPayCopyDebt("eye sampled");
+    }
+    if (eyeSlot < 0) {
+      // Draws that do not write the eye's colour (luminance queries) keep the debt.
+      g_bmvrSwapStats.lastKeep = "draw without eye colour writes";
+      return;
+    }
+    const bool armed = bmvr::g_FullOverwriteArmThread == GetCurrentThreadId();
+    const char* why = armed ? "" : "eye drawn (not a marked full-screen pass)";
+    if (armed && eyeSlot == 0 && BmvrFullOverwriteState(&why)) {
+      bmvr::g_FullOverwriteArmThread = 0;
+      m_bmvrDebtEye = nullptr;
+      m_bmvrDebtFb = nullptr;
+      m_bmvrDebtEyeImage = nullptr;
+      m_bmvrDebtFbImage = nullptr;
+      ++g_bmvrSwapStats.overwritten;
+      if (g_bmvrSwapLog < 24) {
+        bmvr::Log("PostCopySwap: eye fully overwritten, no copy needed");
+        ++g_bmvrSwapLog;
+      }
+      BmvrCopyDebtStatsTick();
+      return;
+    }
+    if (armed && eyeSlot != 0)
+      why = "eye drawn as RT1-3";
+    BmvrPayCopyDebt(why);
+  }
+
+  void D3D9DeviceEx::BmvrCopyDebtCheckClear(DWORD Flags) {
+    if (!(Flags & D3DCLEAR_TARGET))
+      return;
+    for (uint32_t i = 0; i < m_state.renderTargets.size(); i++) {
+      D3D9CommonTexture* tex = GetCommonTexture(m_state.renderTargets[i].ptr());
+      if (BmvrCopyDebtTouches(tex))
+        return BmvrPayCopyDebt("clear");
+    }
+  }
 }

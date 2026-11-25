@@ -6,6 +6,7 @@
 #include <atomic>
 #include <deque>
 #include <thread>
+#include "../../../../../src/bmvr_prof.h"
 
 namespace dxvk {
 
@@ -16,6 +17,32 @@ namespace dxvk {
     uint32_t depth = 0;
     std::atomic<uint32_t>* activity = nullptr;
   };
+  // BMVR PerfLog: time a contended device-lock acquisition (kind: 0 plain,
+  // 1 exclusive, 2 Source frame ownership) and the drain of in-flight calls
+  // (kind + 3).
+  inline void BmvrTimedLock(sync::RecursiveSpinlock& mutex, int kind) {
+    if (!::bmvr::g_PerfLog) {
+      mutex.lock();
+      return;
+    }
+    if (mutex.try_lock())
+      return;
+    const uint32_t owner = mutex.owner();
+    const long long t0 = ::bmvr::prof::Now();
+    mutex.lock();
+    ::bmvr::prof::LockWait(kind, ::bmvr::prof::Now() - t0, owner);
+  }
+
+  template<typename Pred>
+  inline void BmvrTimedDrain(Pred busy, int kind) {
+    if (!busy())
+      return;
+    const long long t0 = ::bmvr::g_PerfLog ? ::bmvr::prof::Now() : 0;
+    while (busy())
+      std::this_thread::yield();
+    if (::bmvr::g_PerfLog)
+      ::bmvr::prof::LockWait(kind + 3, ::bmvr::prof::Now() - t0, 0);
+  }
 
   /**
    * \brief Device lock
@@ -33,6 +60,9 @@ namespace dxvk {
 
     D3D9DeviceLock(sync::RecursiveSpinlock& mutex)
       : m_mutex(&mutex) {
+      if (::bmvr::g_PerfLog) {
+      BmvrTimedLock(mutex, 0);
+      } else {
       // The ordinary protected path was not covered by AcquireExclusiveLock's
       // timer. Preserve the normal/reentrant first try without reading a clock;
       // only a failed acquisition needs a duration sample.
@@ -40,6 +70,7 @@ namespace dxvk {
         static std::atomic<unsigned> slowBudget{0};
         BmvrSlowScope slowScope("DeviceMutexWait", slowBudget);
         mutex.lock();
+      }
       }
     }
 
@@ -71,9 +102,10 @@ namespace dxvk {
       // D3D9 calls then join the lock, while calls already executing remain visible
       // through the activity count below.
       exclusiveRequests.fetch_add(1, std::memory_order_acq_rel);
-      mutex.lock();
-      while (activity.load(std::memory_order_acquire) != 0)
-        std::this_thread::yield();
+      BmvrTimedLock(mutex, 1);
+      BmvrTimedDrain([&] { return activity.load(std::memory_order_acquire) != 0; }, 1);
+      if (::bmvr::g_PerfLog)
+        result.m_holdStart = ::bmvr::prof::Now();
 
       return result;
     }
@@ -81,7 +113,8 @@ namespace dxvk {
     D3D9DeviceLock(D3D9DeviceLock&& other)
       : m_mutex(other.m_mutex),
         m_reader(other.m_reader),
-        m_exclusiveRequests(other.m_exclusiveRequests) {
+        m_exclusiveRequests(other.m_exclusiveRequests),
+        m_holdStart(other.m_holdStart) {
       other.Clear();
     }
 
@@ -90,6 +123,7 @@ namespace dxvk {
       m_mutex = other.m_mutex;
       m_reader = other.m_reader;
       m_exclusiveRequests = other.m_exclusiveRequests;
+      m_holdStart = other.m_holdStart;
       other.Clear();
       return *this;
     }
@@ -101,12 +135,15 @@ namespace dxvk {
   private:
 
     void Clear() {
+      m_holdStart = 0;
       m_mutex = nullptr;
       m_reader = nullptr;
       m_exclusiveRequests = nullptr;
     }
 
     void Release() {
+      if (m_holdStart != 0 && ::bmvr::g_PerfLog)
+        ::bmvr::prof::LockHold(1, ::bmvr::prof::Now() - m_holdStart);
       if (m_reader != nullptr && --m_reader->depth == 0)
         m_reader->activity->fetch_sub(1, std::memory_order_release);
       if (m_mutex != nullptr)
@@ -119,6 +156,7 @@ namespace dxvk {
     sync::RecursiveSpinlock* m_mutex = nullptr;
     D3D9ThreadActivity* m_reader = nullptr;
     std::atomic<uint32_t>* m_exclusiveRequests = nullptr;
+    long long m_holdStart = 0;
 
   };
 
@@ -201,15 +239,15 @@ namespace dxvk {
         // Close the reader-registration race before publishing frame ownership.
         // Existing ordinary calls drain; later calls join the recursive device lock.
         m_exclusiveRequests.fetch_add(1, std::memory_order_acq_rel);
-        m_mutex.lock();
-        while (m_unprotectedActivity.load(std::memory_order_acquire) != 0)
-          std::this_thread::yield();
+        BmvrTimedLock(m_mutex, 2);
+        BmvrTimedDrain([&] { return m_unprotectedActivity.load(std::memory_order_acquire) != 0; }, 2);
         m_sourceFrameActive.store(true, std::memory_order_release);
         m_exclusiveRequests.fetch_sub(1, std::memory_order_release);
       }
 
       owner = this;
       depth = 1;
+      FrameHoldStart() = ::bmvr::g_PerfLog ? ::bmvr::prof::Now() : 0;
       return true;
     }
 
@@ -223,6 +261,9 @@ namespace dxvk {
         return true;
 
       owner = nullptr;
+      if (FrameHoldStart() != 0 && ::bmvr::g_PerfLog)
+        ::bmvr::prof::LockHold(2, ::bmvr::prof::Now() - FrameHoldStart());
+      FrameHoldStart() = 0;
       if (!m_protected)
         m_sourceFrameActive.store(false, std::memory_order_release);
       m_mutex.unlock();
@@ -246,6 +287,11 @@ namespace dxvk {
     static D3D9Multithread*& SourceFrameOwner() {
       static thread_local D3D9Multithread* owner = nullptr;
       return owner;
+    }
+
+    static long long& FrameHoldStart() {
+      static thread_local long long t = 0;
+      return t;
     }
 
     static uint32_t& SourceFrameDepth() {

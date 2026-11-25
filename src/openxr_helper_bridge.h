@@ -51,6 +51,8 @@ bool L4D2VR_ReadOpenXrRuntimeViewConfig(L4D2VROpenXrRuntimeViewConfigDesc& confi
 bool L4D2VR_PeekOpenXrVisibilityMaskGeneration(uint32_t* generation);
 bool L4D2VR_ReadOpenXrVisibilityMask(L4D2VROpenXrVisibilityMaskDesc& mask, uint32_t* generation = nullptr);
 bool L4D2VR_ReadOpenXrInputState(L4D2VROpenXrInputStateDesc& inputState, uint32_t* generation = nullptr);
+// Only the eye gaze block of the input state (cheap; any thread).
+bool L4D2VR_ReadOpenXrEyeGaze(L4D2VROpenXrEyeGazeDesc& gaze);
 void L4D2VR_PublishOpenXrGameRenderPose(const L4D2VROpenXrPoseDesc& pose);
 void L4D2VR_PublishOpenXrHapticRequest(uint32_t handIndex, float durationSeconds, float frequency, float amplitude);
 void L4D2VR_PublishOpenXrSharedTexture(uint32_t eyeIndex, const L4D2VROpenXrSharedTextureDesc& texture);
@@ -72,3 +74,5 @@ void L4D2VR_PublishOpenXrMenuQuad(const L4D2VROpenXrMenuQuadDesc& menu);
 // bridge in-process, and hands console commands from VR\cmd.txt to the game.
 void L4D2VR_StartFakeOpenXrHelper(L4D2VROpenXrBridgeState* state, bool gameRendersRuntimeFov);
 bool L4D2VR_FakeHelperPopCommand(char* out, size_t outSize);
+// True once the fake VR runtime (headless harness only) has been started.
+bool L4D2VR_FakeHelperActive();

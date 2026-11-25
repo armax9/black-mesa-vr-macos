@@ -963,6 +963,19 @@ namespace dxvk {
     }
 
 
+    void cmdSetFragmentShadingRate(
+            uint32_t                rate,
+            bool                    useAttachment) {
+      VkExtent2D size = { rate, rate };
+      VkFragmentShadingRateCombinerOpKHR ops[2] = {
+        VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR,
+        useAttachment
+          ? VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR
+          : VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR };
+      m_vkd->vkCmdSetFragmentShadingRateKHR(getCmdBuffer(), &size, ops);
+    }
+
+
     void cmdSetDepthBounds(
             float                   minDepthBounds,
             float                   maxDepthBounds) {

@@ -14,6 +14,7 @@ class IEngineClient;
 class IEngineVGui;
 class IMaterialSystem;
 class IModelInfo;
+class IBaseFileSystemBm;
 class IModelRender;
 class IInput;
 class ISurface;
@@ -41,6 +42,7 @@ public:
     ISurface* m_VguiSurface = nullptr;
     void* m_EngineSound = nullptr;
     void* m_Cvar = nullptr;
+    IBaseFileSystemBm* m_BaseFileSystem = nullptr;
 
     uintptr_t m_BaseEngine = 0;
     uintptr_t m_BaseClient = 0;
@@ -80,6 +82,10 @@ public:
     void EmitPlayerSound(const char* soundName);
     void EmitEntitySound(C_BaseEntity* entity, const char* soundName);
     void PlayUiSound(const char* sample);
+    // Shotgun pump in two parts, cut from the game's own pump.wav on first
+    // use (bms/sound/bmvr/pump_back.wav, pump_forward.wav). Returns the
+    // sample to play, or nullptr if the split is not available.
+    const char* PumpHalfSound(bool forward);
     void ScanWristHudNetVars();
     bool ReadWristHudValues(int& health, int& armor, int& clip, int& reserve, int& secondary, int& air);
     // False only when m_bWearingSuit resolved and reads 0 (pre-HEV intro).
@@ -95,10 +101,13 @@ public:
     // MOVETYPE_* of the local player (9 = ladder), -1 when unavailable.
     int LocalPlayerMoveType();
     int LocalPlayerFlags();
+    int LocalPlayerWaterLevel();
     bool LocalPlayerAbsOrigin(Vector& out);
     // World-space bottom/top mount points of the map's func_useableladders
     // (CFuncLadder; entity list rescanned at most once a second).
     int CollectLadders(Vector* bottoms, Vector* tops, int maxLadders);
+    // gpGlobals->interval_per_tick (seconds), 0.015 when unreadable.
+    float TickInterval();
     // Entity indexes of the props mounted guns turn (50cal / TOW model; the
     // func_50cal / func_tow itself is a brush with no model of its own).
     // Rescanned at most once a second.
@@ -106,6 +115,11 @@ public:
     bool GetEntityAbsOrigin(C_BaseEntity* entity, Vector& out);
     // Client model precache index of a model path, -1 if the map does not use it.
     int ModelPrecacheIndex(const char* name);
+    // Entity lump (BSP lump 0) of maps/<map>.bsp through the engine filesystem
+    // (VPKs included). Returns its size, or a negative code: -1 no filesystem,
+    // -2 open failed, -3 not a BSP, -4 bad lump, -5 short read, -6 compressed.
+    // Reads up to ~1 MB, so call it once per map load, not per frame.
+    int ReadMapEntityLump(const char* map, std::string& out);
     // Entity indexes whose model index is one of modelIndexes (no strings
     // compared; a full entity-list pass, so call it sparingly).
     int CollectEntitiesWithModelIndex(const int* modelIndexes, int modelCount, int* out, int maxOut);
@@ -114,13 +128,26 @@ public:
     // entity is dormant, so check line of sight).
     int VisibleEntityModelIndex(int entityIndex, Vector& origin);
     int RpgLaserOnOffset() const;
+    // True when m_bLaserOn was found in DT_Weapon_RPG (not the fallback offset).
+    bool RpgLaserOnResolved() const;
     int RpgLaserDotOffset() const;
     C_BaseEntity* FindEntityByNetworkNameContains(const char* token);
     // Networked bool at a scanned player offset. Retires the offset if it ever
     // reads a value that is not 0 or 1. Returns -1 when unavailable.
     int ReadPlayerFlagByte(int& offset);
     int ReadWeaponClip(C_BaseEntity* weapon);
+    // The local player's reserve of the weapon's primary ammo (-1 = unknown).
+    int ReadWeaponReserve(C_BaseEntity* weapon);
+    // Single player: set the active weapon's clip on the server (the game's
+    // own count). Only when the server clip equals expectClip. Returns false
+    // (nothing written) when the server weapon cannot be reached safely.
+    bool SetServerActiveWeaponClip(int expectClip, int newClip);
     bool WeaponHasNoAmmo(C_BaseEntity* weapon);
+    // m_nBody (bodygroups) of a client entity; -1 if unknown.
+    int ReadEntityBody(void* entity);
+    bool WriteEntityBody(void* entity, int body);
+    // RPG m_bNeedReload and base m_bInReload (0/1, -1 = unknown).
+    int ReadWeaponReloadFlags(void* weapon, int& needReload, int& inReload);
     const char* GetActiveWeaponModelName();
     const char* GetEntityModelName(C_BaseEntity* entity);
     // Precache/load a client model by path. Null if the file is missing.
@@ -159,8 +186,11 @@ public:
     static void errorMsg(const char* msg);
     // A signature or byte check that no longer matches the game (usually a Black Mesa update), counted
     // once per name so VR can warn in the headset (ShowToast) instead of only in bmvr_log.txt.
-    static void noteMissingOffset(const char* what);
-    static int missingOffsetCount();
+    // debugOnly: the offset only feeds a debug feature (PerfLog stats, profiling, headless logs);
+    // players lose nothing, so it shows on the VR panel's Debug tab only, never in the toast.
+    static void noteMissingOffset(const char* what, bool debugOnly = false);
+    static int missingOffsetCount();        // gameplay offsets (the out-of-date toast)
+    static int missingDebugOffsetCount();   // debug-only offsets (Debug tab)
     static bool InstallVertexFormatWarningFilter() { return false; }
     static void UninstallVertexFormatWarningFilter() {}
 };

@@ -18,7 +18,40 @@
 //   right <x> <y> <z> <pitch> <yaw> <roll>
 //   buttons <name> ...           attack attack2 reload jump duck use recenter pause flashlight
 //                                select back next prev weaponmenu sprint gripleft (pressed = analog 1)
+//   pressraw [<hand>.<input> ...]  physical buttons (protocol 18 rawHands; button
+//                                mapping on): hand left|right, input trigger grip
+//                                face1 face2 stickclick menu. The line alone (no
+//                                inputs) = raw inputs present, nothing pressed.
+//                                Without it rawHands stay invalid = fixed layout,
+//                                so older scripts using `buttons` keep working.
+//                                Sticks: move = left, turn = right.
+//   system <name>                XrSystemProperties.systemName (default "PlayStation VR2")
+//   family <n>                   controller family (L4D2VR_OPENXR_CONTROLLER_FAMILY_*:
+//                                0 unknown, 1 Touch (default), 2 HP G2, 3 Index, 4 Vive)
 //   move <x> <y> / turn <x> <y>  sticks
+//   poserate <hz>                pose updates per second (default 120; ~45 = game at half rate)
+//   throw <id> <dx> <dy> <dz> <seconds> <release>  right hand moves from its pose by
+//                                (dx dy dz) metres over <seconds> (smooth start/stop,
+//                                peak speed pi/2 x distance / seconds at the middle);
+//                                attack is held until <release> (0..1 of the move),
+//                                then let go. A new <id> starts a new throw.
+//                                Optional 7th value <arc>: extra up-and-down bump of
+//                                <arc> metres (sin over the move), so the direction
+//                                changes along the swing like an overhand arc.
+//                                Optional 8th value <roll>: the hand also rolls by
+//                                <roll> degrees over the move (wrist flick).
+//   raw <hmd|gripl|gripr|aiml|aimr> <px> <py> <pz> <qx> <qy> <qz> <qw>
+//                                exact OpenXR pose (metres, x right, y up, -z forward) for that
+//                                slot, as a capture recorded it (VR/capture-*-state.txt); replaces
+//                                the hmd/left/right line for it (grip and aim set separately)
+//   poselag <every> <ms>         every <every>-th pose reports the hand where it was
+//                                <ms> earlier (the PS VR2 Sense on SteamVR: every third
+//                                pose at 90/s barely moves, then the next ones catch up)
+//   msaa <0|2|4>                 eye MSAA, like the VR panel row (live eye recreate)
+//   perflog <0|1>                PerfLog, like the VR panel Debug row (live)
+//   gaze <yaw> <pitch> [tracked] eye gaze relative to the head view, degrees, right/up
+//                                positive (XR_EXT_eye_gaze_interaction); tracked 0 = gaze
+//                                lost (blink). Without the line: no eye tracking.
 // <VR dir>\cmd.txt: console commands, one per line, appended by the test; each new
 // line is run once (ClientCmd_Unrestricted on the engine thread).
 
@@ -52,6 +85,14 @@ namespace
         float x = 0, y = 0, z = 0, pitch = 0, yaw = 0, roll = 0;
     };
 
+    struct RawPose
+    {
+        bool set = false;
+        float pos[3] = {};
+        float quat[4] = { 0, 0, 0, 1 };
+    };
+    enum RawSlot { kRawHmd, kRawGripL, kRawGripR, kRawAimL, kRawAimR, kRawCount };
+
     struct FakeScript
     {
         uint32_t width = 2884, height = 2940;
@@ -61,7 +102,24 @@ namespace
         FakePose left{ 0.30f, 0.20f, 1.25f, 20, 0, 0 };
         FakePose right{ 0.35f, -0.18f, 1.30f, 10, 0, 0 };
         bool buttons[L4D2VR_OPENXR_ACTION_COUNT] = {};
+        bool rawOn = false;
+        uint32_t rawButtons[2] = {};
+        float rawTrigger[2] = {}, rawGrip[2] = {};
+        std::string systemName = "PlayStation VR2";
+        uint32_t family = L4D2VR_OPENXR_CONTROLLER_FAMILY_TOUCH;
         float moveX = 0, moveY = 0, turnX = 0, turnY = 0;
+        int throwId = 0;
+        float throwD[3] = {};
+        float throwSec = 0.2f, throwRelease = 0.5f;
+        float poseRate = 120.f;   // poses per second (game at half rate: ~45)
+        float throwArc = 0.f;
+        float throwRoll = 0.f;
+        int poseLagEvery = 0;
+        float poseLagMs = 0.f;
+        RawPose raw[kRawCount];
+        bool gazeSet = false;
+        float gazeYaw = 0.f, gazePitch = 0.f;
+        int gazeTracked = 1;
     };
 
     std::mutex g_CmdMutex;
@@ -152,7 +210,20 @@ namespace
             return false;
         FakeScript fresh = s;
         std::fill(std::begin(fresh.buttons), std::end(fresh.buttons), false);
+        fresh.rawOn = false;
+        fresh.rawButtons[0] = fresh.rawButtons[1] = 0;
+        fresh.rawTrigger[0] = fresh.rawTrigger[1] = fresh.rawGrip[0] = fresh.rawGrip[1] = 0.f;
         fresh.moveX = fresh.moveY = fresh.turnX = fresh.turnY = 0;
+        fresh.throwId = 0;   // a throw lasts while its line is in the file
+        fresh.poseRate = 120.f;
+        fresh.throwArc = 0.f;
+        fresh.throwRoll = 0.f;
+        fresh.poseLagEvery = 0;
+        fresh.poseLagMs = 0.f;
+        fresh.gazeSet = false;
+        fresh.gazeTracked = 1;
+        for (RawPose& r : fresh.raw)
+            r = RawPose{};
         std::string line;
         while (std::getline(in, line))
         {
@@ -166,8 +237,117 @@ namespace
             else if (key == "size") ss >> fresh.width >> fresh.height;
             else if (key == "fov") ss >> fresh.tanOut >> fresh.tanIn >> fresh.tanUp >> fresh.tanDown;
             else if (key == "ipd") ss >> fresh.ipd;
+            else if (key == "perflog")
+            {
+                // Same as the VR panel's Debug -> DIAGNOSTICS "Performance log" row.
+                int on = 0;
+                ss >> on;
+                bmvr::g_PerfLog = on != 0;
+            }
+            else if (key == "lodbias")
+            {
+                float v = 0.f;
+                ss >> v;
+                bmvr::g_LodBias = v;
+            }
+            else if (key == "a2c")
+            {
+                int on = 0;
+                ss >> on;
+                bmvr::g_AlphaToCoverage = on != 0;
+            }
+            else if (key == "particles1x")
+            {
+                int on = 0;
+                ss >> on;
+                bmvr::g_MsaaParticles1x = on != 0;
+            }
+            else if (key == "refractonce")
+            {
+                int on = 0;
+                ss >> on;
+                bmvr::g_RefractOncePerEye = on != 0;
+            }
+            else if (key == "msaa")
+            {
+                // Same as the VR panel's MSAA row: 0/2/4, applied live.
+                float aa = 0.f;
+                ss >> aa;
+                bmvr::g_MsaaF = aa;
+            }
             else if (key == "move") ss >> fresh.moveX >> fresh.moveY;
             else if (key == "turn") ss >> fresh.turnX >> fresh.turnY;
+            else if (key == "poserate")
+            {
+                ss >> fresh.poseRate;
+                fresh.poseRate = std::clamp(fresh.poseRate, 10.f, 500.f);
+            }
+            else if (key == "throw")
+            {
+                ss >> fresh.throwId >> fresh.throwD[0] >> fresh.throwD[1] >> fresh.throwD[2]
+                   >> fresh.throwSec >> fresh.throwRelease;
+                if (!(ss >> fresh.throwArc))
+                    fresh.throwArc = 0.f;
+                else if (!(ss >> fresh.throwRoll))
+                    fresh.throwRoll = 0.f;
+            }
+            else if (key == "raw")
+            {
+                std::string slot;
+                ss >> slot;
+                const int i = slot == "hmd" ? kRawHmd : slot == "gripl" ? kRawGripL : slot == "gripr" ? kRawGripR
+                    : slot == "aiml" ? kRawAimL : slot == "aimr" ? kRawAimR : -1;
+                RawPose r{};
+                if (i >= 0 && (ss >> r.pos[0] >> r.pos[1] >> r.pos[2] >> r.quat[0] >> r.quat[1] >> r.quat[2] >> r.quat[3]))
+                {
+                    r.set = true;
+                    fresh.raw[i] = r;
+                }
+            }
+            else if (key == "poselag")
+                ss >> fresh.poseLagEvery >> fresh.poseLagMs;
+            else if (key == "gaze")
+            {
+                fresh.gazeSet = true;
+                ss >> fresh.gazeYaw >> fresh.gazePitch;
+                int tr = 1;
+                if (ss >> tr)
+                    fresh.gazeTracked = tr;
+            }
+            else if (key == "pressraw")
+            {
+                fresh.rawOn = true;
+                std::string b;
+                while (ss >> b)
+                {
+                    const size_t dot = b.find('.');
+                    if (dot == std::string::npos)
+                        continue;
+                    const std::string hand = b.substr(0, dot), input = b.substr(dot + 1);
+                    const int h = hand == "left" ? 0 : hand == "right" ? 1 : -1;
+                    if (h < 0)
+                        continue;
+                    if (input == "trigger") fresh.rawTrigger[h] = 1.f;
+                    else if (input == "grip") fresh.rawGrip[h] = 1.f;
+                    else if (input == "face1") fresh.rawButtons[h] |= L4D2VR_RAW_BUTTON_FACE1;
+                    else if (input == "face2") fresh.rawButtons[h] |= L4D2VR_RAW_BUTTON_FACE2;
+                    else if (input == "stickclick") fresh.rawButtons[h] |= L4D2VR_RAW_BUTTON_STICK_CLICK;
+                    else if (input == "menu") fresh.rawButtons[h] |= L4D2VR_RAW_BUTTON_MENU;
+                }
+            }
+            else if (key == "family")
+            {
+                uint32_t f = 1;
+                if (ss >> f)
+                    fresh.family = f;
+            }
+            else if (key == "system")
+            {
+                std::string rest;
+                std::getline(ss, rest);
+                const size_t b = rest.find_first_not_of(" \t");
+                fresh.systemName = b == std::string::npos ? "" : rest.substr(b);
+            }
             else if (key == "buttons")
             {
                 std::string b;
@@ -279,10 +459,21 @@ namespace
         uint32_t loggedDecl = 0;
         L4D2VROpenXrSharedTextureDesc lastDecl[2] = {};
         int64_t t = 0;
+        LARGE_INTEGER qpf{};
+        QueryPerformanceFrequency(&qpf);
+        int activeThrowId = 0;
+        double throwStart = 0.0;
+        FakePose throwBase{};
+        uint64_t poseCount = 0;
         for (;;)
         {
-            Sleep(8); // ~120 Hz like the PS VR2
-            ++t;
+            Sleep((DWORD)std::max(1.f, roundf(1000.f / script.poseRate))); // ~120 Hz like the PS VR2 unless `poserate`
+            // Pose times in nanoseconds like XrTime (the throw code differences
+            // velocity on them).
+            LARGE_INTEGER qpc{};
+            QueryPerformanceCounter(&qpc);
+            const double nowSec = (double)qpc.QuadPart / (double)qpf.QuadPart;
+            t = (int64_t)(nowSec * 1e9);
             const uint64_t st = FileStamp(fakePath);
             if (st != fakeStamp)
             {
@@ -326,6 +517,11 @@ namespace
             hmd.viewStateFlags = 0xF;
             hmd.displayTime = t;
             ToOpenXr(script.hmd, hmd.position, hmd.orientation);
+            if (script.raw[kRawHmd].set)
+            {
+                std::memcpy(hmd.position, script.raw[kRawHmd].pos, sizeof(hmd.position));
+                std::memcpy(hmd.orientation, script.raw[kRawHmd].quat, sizeof(hmd.orientation));
+            }
             std::memcpy(&hmd.reserved0, &script.ipd, sizeof(float));
             ++state->trackingPoseGeneration;
             std::atomic_thread_fence(std::memory_order_release);
@@ -338,8 +534,37 @@ namespace
             in.valid = 1;
             in.featureFlags = L4D2VR_OPENXR_INPUT_FEATURE_CONTROLLERS;
             in.actionCount = L4D2VR_OPENXR_ACTION_COUNT;
-            in.reserved0 = L4D2VR_OPENXR_CONTROLLER_FAMILY_TOUCH; // PS VR2 Sense on SteamVR = Touch emulation
-            const FakePose* hands[2] = { &script.left, &script.right };
+            in.reserved0 = script.family; // default Touch: PS VR2 Sense on SteamVR = Touch emulation
+            FakePose right = script.right;
+            bool throwAttack = false, throwActive = false;
+            if (script.throwId != 0 && script.throwId != activeThrowId)
+            {
+                activeThrowId = script.throwId;
+                throwStart = nowSec;
+                throwBase = script.right;
+                Game::logMsg("fakehelper: throw %d (%.2f %.2f %.2f) m over %.3f s, release at %.2f, peak %.2f m/s",
+                    activeThrowId, script.throwD[0], script.throwD[1], script.throwD[2], script.throwSec,
+                    script.throwRelease, 1.5707963f * sqrtf(script.throwD[0] * script.throwD[0]
+                        + script.throwD[1] * script.throwD[1] + script.throwD[2] * script.throwD[2])
+                        / std::max(0.01f, script.throwSec));
+            }
+            if (activeThrowId != 0 && activeThrowId == script.throwId)
+            {
+                ++poseCount;
+                const bool lagged = script.poseLagEvery > 0 && poseCount % (uint64_t)script.poseLagEvery == 0;
+                const double handSec = nowSec - (lagged ? script.poseLagMs * 1e-3 : 0.0);
+                const float u = (float)std::clamp((nowSec - throwStart) / std::max(0.01f, script.throwSec), 0.0, 1.0);
+                const float uh = (float)std::clamp((handSec - throwStart) / std::max(0.01f, script.throwSec), 0.0, 1.0);
+                const float k = 0.5f * (1.0f - cosf(kPi * uh));
+                right = throwBase;
+                right.x += script.throwD[0] * k;
+                right.y += script.throwD[1] * k;
+                right.z += script.throwD[2] * k + script.throwArc * sinf(kPi * uh);
+                right.roll += script.throwRoll * k;
+                throwActive = u < 1.0f;
+                throwAttack = u < script.throwRelease;
+            }
+            const FakePose* hands[2] = { &script.left, &right };
             for (int h = 0; h < 2; ++h)
             {
                 L4D2VROpenXrControllerPoseDesc p{};
@@ -348,25 +573,87 @@ namespace
                 p.locationFlags = 0xF;
                 p.displayTime = t;
                 ToOpenXr(*hands[h], p.position, p.orientation);
-                in.controllerPoses[h] = p;
-                in.controllerAimPoses[h] = p;
+                L4D2VROpenXrControllerPoseDesc grip = p, aim = p;
+                const RawPose& rg = script.raw[h == 0 ? kRawGripL : kRawGripR];
+                const RawPose& ra = script.raw[h == 0 ? kRawAimL : kRawAimR];
+                if (rg.set && !(throwActive && h == 1))
+                {
+                    std::memcpy(grip.position, rg.pos, sizeof(grip.position));
+                    std::memcpy(grip.orientation, rg.quat, sizeof(grip.orientation));
+                }
+                if (ra.set && !(throwActive && h == 1))
+                {
+                    std::memcpy(aim.position, ra.pos, sizeof(aim.position));
+                    std::memcpy(aim.orientation, ra.quat, sizeof(aim.orientation));
+                }
+                in.controllerPoses[h] = grip;
+                in.controllerAimPoses[h] = aim;
+            }
+            // The real helper keeps its fixed (legacy) bindings on the same
+            // paths next to the raw ones (Touch layout), so menus and the VR
+            // panel see them while the button mapping is suspended.
+            bool rawLegacy[L4D2VR_OPENXR_ACTION_COUNT] = {};
+            if (script.rawOn)
+            {
+                using A = L4D2VROpenXrActionId;
+                const uint32_t lb = script.rawButtons[0], rb = script.rawButtons[1];
+                rawLegacy[(int)A::PrimaryAttack] = script.rawTrigger[1] > 0.5f;
+                rawLegacy[(int)A::Use] = script.rawTrigger[0] > 0.5f;
+                rawLegacy[(int)A::Flashlight] = script.rawGrip[1] > 0.5f;
+                rawLegacy[(int)A::InventoryGripLeft] = script.rawGrip[0] > 0.5f;
+                rawLegacy[(int)A::Reload] = rawLegacy[(int)A::MenuSelect] = (rb & L4D2VR_RAW_BUTTON_FACE1) != 0;
+                rawLegacy[(int)A::SecondaryAttack] = rawLegacy[(int)A::MenuBack] = (rb & L4D2VR_RAW_BUTTON_FACE2) != 0;
+                rawLegacy[(int)A::PrevItem] = (lb & L4D2VR_RAW_BUTTON_FACE1) != 0;
+                rawLegacy[(int)A::Pause] = (lb & (L4D2VR_RAW_BUTTON_FACE2 | L4D2VR_RAW_BUTTON_MENU)) != 0;
+                rawLegacy[(int)A::CustomAction1] = (lb & L4D2VR_RAW_BUTTON_STICK_CLICK) != 0;
+                rawLegacy[(int)A::InventoryQuickSwitch] = rawLegacy[(int)A::ResetPosition]
+                    = (rb & L4D2VR_RAW_BUTTON_STICK_CLICK) != 0;
             }
             for (uint32_t a = 1; a < L4D2VR_OPENXR_ACTION_COUNT; ++a)
             {
                 L4D2VROpenXrDigitalActionDesc& d = in.digitalActions[a];
                 d.active = 1;
-                d.state = script.buttons[a] ? 1 : 0;
-                d.changed = script.buttons[a] != prevButtons[a] ? 1 : 0;
+                bool pressed = script.buttons[a] || rawLegacy[a];
+                if (throwActive && a == (uint32_t)L4D2VROpenXrActionId::PrimaryAttack)
+                    pressed = throwAttack;
+                d.state = pressed ? 1 : 0;
+                d.changed = pressed != prevButtons[a] ? 1 : 0;
                 d.lastChangeTime = t;
-                prevButtons[a] = script.buttons[a];
+                prevButtons[a] = pressed;
                 L4D2VROpenXrAnalogActionDesc& an = in.analogActions[a];
                 an.active = 1;
-                an.x = script.buttons[a] ? 1.f : 0.f;   // pressed = full pull/squeeze
+                an.x = pressed ? 1.f : 0.f;   // pressed = full pull/squeeze
             }
             in.analogActions[(int)L4D2VROpenXrActionId::Walk].x = script.moveX;
             in.analogActions[(int)L4D2VROpenXrActionId::Walk].y = script.moveY;
             in.analogActions[(int)L4D2VROpenXrActionId::Turn].x = script.turnX;
             in.analogActions[(int)L4D2VROpenXrActionId::Turn].y = script.turnY;
+            std::snprintf(in.systemName, sizeof(in.systemName), "%s", script.systemName.c_str());
+            for (int h = 0; h < 2; ++h)
+            {
+                L4D2VROpenXrRawHandDesc& r = in.rawHands[h];
+                r = {};
+                if (!script.rawOn)
+                    continue;
+                r.valid = 1;
+                r.buttons = script.rawButtons[h] | L4D2VR_RAW_BUTTON_FACE1_PRESENT | L4D2VR_RAW_BUTTON_FACE2_PRESENT
+                    | L4D2VR_RAW_BUTTON_STICK_CLICK_PRESENT | L4D2VR_RAW_BUTTON_GRIP_PRESENT;
+                r.trigger = script.rawTrigger[h];
+                r.grip = script.rawGrip[h];
+                r.stick[0] = h == 0 ? script.moveX : script.turnX;
+                r.stick[1] = h == 0 ? script.moveY : script.turnY;
+            }
+            in.eyeGaze.publishTickMs = GetTickCount64();
+            in.eyeGaze.focused = 1;
+            if (script.gazeSet)
+            {
+                const float gy = script.gazeYaw * kPi / 180, gp = script.gazePitch * kPi / 180;
+                in.eyeGaze.valid = 1;
+                in.eyeGaze.tracked = script.gazeTracked != 0 ? 1u : 0u;
+                in.eyeGaze.dir[0] = sinf(gy) * cosf(gp);
+                in.eyeGaze.dir[1] = sinf(gp);
+                in.eyeGaze.dir[2] = -cosf(gy) * cosf(gp);
+            }
             ++state->inputStateGeneration;
             std::atomic_thread_fence(std::memory_order_release);
             state->inputState = in;
@@ -412,14 +699,41 @@ namespace
                 state->status = static_cast<uint32_t>(L4D2VROpenXrBridgeStatus::SubmittedFrame);
                 if (consumedCount == 1 || consumedCount % 600 == 0)
                     Game::logMsg("fakehelper: consumed frame %u (count %u)", frameId, consumedCount);
+                // The real helper shows the frame as a flat 2D quad while the
+                // latched game render pose carries POSE_FLAG_MONO; log every
+                // change so a stuck 2D mode shows up headless.
+                {
+                    const L4D2VROpenXrPoseDesc pose = state->gameRenderPose;
+                    static int s_lastMono = -1;
+                    const int mono = (pose.valid && (pose.reserved1 & L4D2VR_OPENXR_POSE_FLAG_MONO)) ? 1 : 0;
+                    if (consumedCount % 300 == 0)
+                        Game::logMsg("fakehelper: frame %u game render pose (%.4f %.4f %.4f) gen %u, helper hmd pose (%.4f %.4f %.4f) gen %u",
+                            frameId, pose.position[0], pose.position[1], pose.position[2], state->gameRenderPoseGeneration,
+                            state->hmdPose.position[0], state->hmdPose.position[1], state->hmdPose.position[2],
+                            state->trackingPoseGeneration);
+                    if (mono != s_lastMono)
+                    {
+                        s_lastMono = mono;
+                        Game::logMsg("fakehelper: frame %u render pose %s (valid=%u y=%.3f)",
+                            frameId, mono ? "MONO -> helper shows a 2D quad" : "stereo", pose.valid, pose.position[1]);
+                    }
+                }
             }
             state->heartbeatTickMs = GetTickCount64();
         }
     }
 }
 
+static std::atomic<bool> g_FakeHelperActive{ false };
+
+bool L4D2VR_FakeHelperActive()
+{
+    return g_FakeHelperActive.load(std::memory_order_relaxed);
+}
+
 void L4D2VR_StartFakeOpenXrHelper(L4D2VROpenXrBridgeState* state, bool gameRendersRuntimeFov)
 {
+    g_FakeHelperActive.store(true, std::memory_order_relaxed);
     std::thread(FakeHelperThread, state, gameRendersRuntimeFov).detach();
 }
 

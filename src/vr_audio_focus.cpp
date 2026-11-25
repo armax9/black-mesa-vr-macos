@@ -1,6 +1,7 @@
 #include "vr.h"
 #include "game.h"
 #include "sdk.h"
+#include "offsets.h"
 
 #include <Windows.h>
 #include <mmdeviceapi.h>
@@ -9,6 +10,7 @@
 
 #include <cstring>
 #include <cmath>
+#include "bmvr_seh.h"
 
 // One SteamVR user loses all audio on alt-tab and does not get it back.
 // Black Mesa's snd_mute_losefocus (default 1) omits DSBCAPS_GLOBALFOCUS, so
@@ -31,7 +33,6 @@ namespace
     constexpr DWORD kDsLost = 0x00000002;
     constexpr DWORD kDsPlayLooping = 0x00000001;
     // engine.dll image 0x10000000, Play(0,0,DSBPLAY_LOOPING) of the mix buffer.
-    constexpr uintptr_t kMixPlayInsnRva = 0x5FA73; // beta 26234270 (25844216: 0x5FA43)
 
     struct ComUse
     {
@@ -132,8 +133,8 @@ namespace
     {
         if (!g_Game || !g_Game->m_BaseEngine)
             return nullptr;
-        const auto* insn = reinterpret_cast<const uint8_t*>(g_Game->m_BaseEngine + kMixPlayInsnRva);
-        __try
+        const auto* insn = reinterpret_cast<const uint8_t*>(g_Game->m_BaseEngine + Offsets::kMixPlayInsnRva);
+        BMVR_TRY
         {
             if (insn[0] != 0xA1)
                 return nullptr;
@@ -166,7 +167,7 @@ namespace
         DsView v{};
         if (!slot)
             return v;
-        __try
+        BMVR_TRY
         {
             void* buf = *slot;
             if (!buf)
@@ -191,7 +192,7 @@ namespace
     {
         if (!slot)
             return false;
-        __try
+        BMVR_TRY
         {
             void* buf = *slot;
             if (!buf)

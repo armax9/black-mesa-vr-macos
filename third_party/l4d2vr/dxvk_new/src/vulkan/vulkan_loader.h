@@ -288,6 +288,7 @@ namespace dxvk::vk {
     VULKAN_FN(vkCmdSetLineWidth);
     VULKAN_FN(vkCmdSetDepthBias);
     VULKAN_FN(vkCmdSetDepthBias2EXT);
+    VULKAN_FN(vkCmdSetFragmentShadingRateKHR);
     VULKAN_FN(vkCmdSetBlendConstants);
     VULKAN_FN(vkCmdSetDepthBounds);
     VULKAN_FN(vkCmdSetStencilCompareMask);

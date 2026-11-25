@@ -633,6 +633,9 @@ namespace dxvk {
     // Off-centre eyes: shaders that turn normals with cViewProj rows (see d3d9_device.cpp).
     bool BmvrViewProjNormalsBegin(float saved[12]);
     void BmvrViewProjNormalsEnd(const float saved[12]);
+    // Screen-aligned particles stay level with world up (see d3d9_device.cpp).
+    bool BmvrParticleLevelBegin(float saved[28]);
+    void BmvrParticleLevelEnd(const float saved[28]);
 
     HRESULT STDMETHODCALLTYPE SetPixelShaderConstantF(
             UINT   StartRegister,
@@ -1097,7 +1100,51 @@ namespace dxvk {
     void PrepareDraw(D3DPRIMITIVETYPE PrimitiveType, bool UploadVBOs, bool UploadIBOs);
     void BmvrApplyHl2vrMsaa(D3D9_COMMON_TEXTURE_DESC& desc);
     void BmvrNoteMsaaAttachmentsWritten();
-    void BmvrResolveMsaaForSample(D3D9CommonTexture* tex);
+    bool m_bmvrMsRaster = false;
+    float m_bmvrLodBias = 0.0f;   // bmvr::g_LodBias as applied to the bound samplers (0 off the 3D views)
+    void BmvrSetMsaaEyeRetired(IDirect3DSurface9* color, IDirect3DSurface9* depth, bool retire);
+    void BmvrResolveMsaaForSample(D3D9CommonTexture* tex, bool force = false);
+    void BmvrResolvePendingDepth();
+
+    // BMVR PostCopySwap: a full eye -> _rt_FullFrameFB copy armed by the mod
+    // (bmvr::g_PostSwapArmThread) swaps the two images' storage instead. The
+    // eye then "owes" its old content (now in the FB). The debt is dropped
+    // when a full-screen opaque draw armed by the mod overwrites the eye
+    // (bmvr::g_FullOverwriteArmThread, state checked here), and paid with the
+    // original copy before anything else could read the eye or write the FB.
+    bool BmvrTrySwapCopy(D3D9Surface* src, D3D9Surface* dst, const RECT* srcRect, const RECT* dstRect);
+    void BmvrPayCopyDebt(const char* reason);
+    bool BmvrCopyDebtTouches(const D3D9CommonTexture* tex) const {
+      return m_bmvrDebtEye != nullptr && tex != nullptr
+        && (tex == m_bmvrDebtEye->GetCommonTexture() || tex == m_bmvrDebtFb->GetCommonTexture());
+    }
+    void BmvrCopyDebtCheckDraw();
+    void BmvrCopyDebtCheckClear(DWORD Flags);
+    bool BmvrFullOverwriteState(const char** why);
+    void BmvrCopyDebtStatsTick();
+    Com<D3D9Surface, false> m_bmvrDebtEye;
+    Com<D3D9Surface, false> m_bmvrDebtFb;
+    Rc<DxvkImage> m_bmvrDebtEyeImage;   // the eye's active (1x) image at swap time
+    Rc<DxvkImage> m_bmvrDebtFbImage;
+
+    // BMVR foveated rendering: one R8_UINT shading rate image per eye,
+    // built here from the eye size, the lens centre and the ring radii, and
+    // handed to the context for the eye's render passes (bmvr::FoveationSelect).
+    struct BmvrFovMap {
+      Rc<DxvkImageView> view;
+      uint32_t w = 0, h = 0;              // eye size in pixels
+      int32_t  cx = INT32_MIN, cy = 0;    // centre in texels (quantised)
+      float    r[3] = { };                // ring radii (fraction of half eye height)
+      uint32_t level = 0;
+      uint32_t uploads = 0;               // re-uploads into the same image
+    };
+    void BmvrFoveationSelect(int stereoEye, uint32_t eyeW, uint32_t eyeH, float centreU, float centreV);
+    BmvrFovMap        m_bmvrFovMap[2];
+    Rc<DxvkImageView> m_bmvrFovBound;     // last view emitted to the context
+    bool              m_bmvrFovBoundValid = false;
+    VkExtent2D        m_bmvrFovTexel = { };
+    void BmvrFoveationBuild(BmvrFovMap& map, int eyeIndex, uint32_t eyeW, uint32_t eyeH,
+      int32_t cx, int32_t cy, const float r[3], uint32_t level);
 
     void EnsureSamplerLimit();
 

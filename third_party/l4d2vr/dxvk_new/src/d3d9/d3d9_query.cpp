@@ -2,6 +2,7 @@
 #include "d3d9_query.h"
 
 #include "d3d9_device.h"
+#include "bmvr_prof.h"
 
 namespace dxvk {
 
@@ -137,6 +138,7 @@ namespace dxvk {
       : m_queryType == D3DQUERYTYPE_OCCLUSION ? 1u : 2u;
     BmvrSlowScope slowScope(names[kind], slowBudget[kind]);
 
+    BMVR_PROF("d3d9 Query GetData");
     D3D9DeviceLock lock = m_parent->LockDevice();
 
     bool flush = dwGetDataFlags & D3DGETDATA_FLUSH;

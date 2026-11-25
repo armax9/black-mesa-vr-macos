@@ -8,6 +8,9 @@
 #include "dxvk_pipemanager.h"
 #include "dxvk_state_cache.h"
 
+extern "C" volatile long g_BmvrPipelineInstances;
+extern "C" volatile long g_BmvrPipelineCompiles;
+
 namespace dxvk {
 
   VkPrimitiveTopology determineGsInputTopology(
@@ -493,6 +496,13 @@ namespace dxvk {
     }
 
     VkPipelineCreateFlags flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
+
+    // BMVR foveation: every pipeline may run in a render pass with a rate
+    // image, so all carry the flag (no pipeline-key plumbing). Adapted from
+    // HL2VR's DXVK fork (github.com/hl2vr/dxvk, dxvk_graphics.cpp).
+    if (m_device->features().khrFragmentShadingRate.attachmentFragmentShadingRate)
+      flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+
     if (state.feedbackLoop & VK_IMAGE_ASPECT_COLOR_BIT)
       flags |= VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
 
@@ -804,6 +814,10 @@ namespace dxvk {
         dyStates[dyInfo.dynamicStateCount++] = VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_ENABLE_EXT;
         dyStates[dyInfo.dynamicStateCount++] = VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_EXT;
       }
+
+      // BMVR VRS test aid (BMVR_VRS); feature only enabled when set
+      if (device->features().khrFragmentShadingRate.pipelineFragmentShadingRate)
+        dyStates[dyInfo.dynamicStateCount++] = VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR;
     }
 
     if (dyInfo.dynamicStateCount)
@@ -1224,6 +1238,7 @@ namespace dxvk {
     static std::atomic<unsigned> slowBudget{0};
     BmvrSlowScope slowScope("createInstance", slowBudget);
 
+    InterlockedIncrement(&g_BmvrPipelineInstances);
     VkPipeline baseHandle = VK_NULL_HANDLE;
     VkPipeline fastHandle = VK_NULL_HANDLE;
 
@@ -1390,6 +1405,10 @@ namespace dxvk {
 
     VkGraphicsPipelineCreateInfo info = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &libInfo };
     info.flags              = vs.linkFlags | fs.linkFlags;
+
+    if (m_device->features().khrFragmentShadingRate.attachmentFragmentShadingRate)
+      info.flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+
     info.layout             = m_layout.getLayout()->getPipelineLayout(true);
     info.basePipelineIndex  = -1;
 
@@ -1449,6 +1468,7 @@ namespace dxvk {
 
   std::pair<VkResult, VkPipeline> DxvkGraphicsPipeline::createOptimizedPipeline(
     const DxvkGraphicsPipelineFastInstanceKey& key) const {
+    InterlockedIncrement(&g_BmvrPipelineCompiles);
     auto vk = m_device->vkd();
 
     DxvkShaderStageInfo stageInfo(m_device);
@@ -1491,6 +1511,9 @@ namespace dxvk {
     if (key.foState.feedbackLoop & VK_IMAGE_ASPECT_DEPTH_BIT)
       info.flags |= VK_PIPELINE_CREATE_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
     }
+
+    if (m_device->features().khrFragmentShadingRate.attachmentFragmentShadingRate)
+      info.flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
 
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkResult vr = vk->vkCreateGraphicsPipelines(vk->device(), m_device->bmvrPipelineCache(), 1, &info, nullptr, &pipeline);

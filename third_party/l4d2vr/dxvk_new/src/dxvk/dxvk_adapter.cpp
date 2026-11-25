@@ -2,6 +2,7 @@
 #include <unordered_set>
 
 #include "dxvk_adapter.h"
+#include "dxvk_bmvr_vrs.h"
 #include "dxvk_device.h"
 #include "dxvk_instance.h"
 
@@ -448,6 +449,17 @@ namespace dxvk {
       m_deviceFeatures.khrSwapchainMaintenance1.swapchainMaintenance1 &&
       instance->extensions().khrSurfaceMaintenance1;
 
+    // BMVR: fragment shading rate only when wanted: the BMVR_VRS test aid
+    // (pipeline rate) or foveated rendering (pipeline rate + rate image,
+    // config Foveated). Otherwise pipelines stay exactly as before.
+    const bool bmvrFsrWanted = bmvrVrsMode().rate || bmvrFoveationRequested();
+    enabledFeatures.khrFragmentShadingRate.pipelineFragmentShadingRate =
+      m_deviceFeatures.khrFragmentShadingRate.pipelineFragmentShadingRate && bmvrFsrWanted;
+    enabledFeatures.khrFragmentShadingRate.attachmentFragmentShadingRate =
+      m_deviceFeatures.khrFragmentShadingRate.attachmentFragmentShadingRate
+      && m_deviceFeatures.khrFragmentShadingRate.pipelineFragmentShadingRate
+      && bmvrFoveationRequested();
+
     // Enable maintenance features if supported
     enabledFeatures.khrMaintenance5.maintenance5 =
       m_deviceFeatures.khrMaintenance5.maintenance5;
@@ -687,6 +699,10 @@ namespace dxvk {
           enabledFeatures.extVertexAttributeDivisor = *reinterpret_cast<const VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT*>(f);
           break;
 
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR:
+          enabledFeatures.khrFragmentShadingRate = *reinterpret_cast<const VkPhysicalDeviceFragmentShadingRateFeaturesKHR*>(f);
+          break;
+
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR:
           enabledFeatures.khrMaintenance5 = *reinterpret_cast<const VkPhysicalDeviceMaintenance5FeaturesKHR*>(f);
           break;
@@ -892,6 +908,11 @@ namespace dxvk {
       m_deviceInfo.khrMaintenance5.pNext = std::exchange(m_deviceInfo.core.pNext, &m_deviceInfo.khrMaintenance5);
     }
 
+    if (m_deviceExtensions.supports(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME)) {
+      m_deviceInfo.khrFragmentShadingRate.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR;
+      m_deviceInfo.khrFragmentShadingRate.pNext = std::exchange(m_deviceInfo.core.pNext, &m_deviceInfo.khrFragmentShadingRate);
+    }
+
     if (m_deviceExtensions.supports(VK_KHR_MAINTENANCE_7_EXTENSION_NAME)) {
       m_deviceInfo.khrMaintenance7.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_PROPERTIES_KHR;
       m_deviceInfo.khrMaintenance7.pNext = std::exchange(m_deviceInfo.core.pNext, &m_deviceInfo.khrMaintenance7);
@@ -1051,6 +1072,11 @@ namespace dxvk {
     if (m_deviceExtensions.supports(VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME))
       m_deviceFeatures.extLoadStoreOpNone = VK_TRUE;
 
+    if (m_deviceExtensions.supports(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME)) {
+      m_deviceFeatures.khrFragmentShadingRate.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR;
+      m_deviceFeatures.khrFragmentShadingRate.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.khrFragmentShadingRate);
+    }
+
     if (m_deviceExtensions.supports(VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) {
       m_deviceFeatures.khrMaintenance5.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR;
       m_deviceFeatures.khrMaintenance5.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.khrMaintenance5);
@@ -1160,6 +1186,7 @@ namespace dxvk {
       &devExtensions.khrExternalMemoryWin32,
       &devExtensions.khrExternalSemaphoreWin32,
       &devExtensions.extLoadStoreOpNone,
+      &devExtensions.khrFragmentShadingRate,
       &devExtensions.khrMaintenance5,
       &devExtensions.khrMaintenance7,
       &devExtensions.khrPipelineLibrary,
@@ -1325,6 +1352,11 @@ namespace dxvk {
 
     if (devExtensions.extLoadStoreOpNone)
       enabledFeatures.extLoadStoreOpNone = VK_TRUE;
+
+    if (devExtensions.khrFragmentShadingRate) {
+      enabledFeatures.khrFragmentShadingRate.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR;
+      enabledFeatures.khrFragmentShadingRate.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.khrFragmentShadingRate);
+    }
 
     if (devExtensions.khrMaintenance5) {
       enabledFeatures.khrMaintenance5.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR;
@@ -1529,6 +1561,9 @@ namespace dxvk {
       "\n  extension supported                    : " << (features.khrExternalSemaphoreWin32 ? "1" : "0") <<
       "\n" << VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME <<
       "\n  extension supported                    : " << (features.extLoadStoreOpNone ? "1" : "0") <<
+      "\n" << VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME <<
+      "\n  pipelineFragmentShadingRate            : " << (features.khrFragmentShadingRate.pipelineFragmentShadingRate ? "1" : "0") <<
+      "\n  attachmentFragmentShadingRate          : " << (features.khrFragmentShadingRate.attachmentFragmentShadingRate ? "1" : "0") <<
       "\n" << VK_KHR_MAINTENANCE_5_EXTENSION_NAME <<
       "\n  maintenance5                           : " << (features.khrMaintenance5.maintenance5 ? "1" : "0") <<
       "\n" << VK_KHR_MAINTENANCE_7_EXTENSION_NAME <<

@@ -493,6 +493,39 @@ namespace dxvk {
         LogConstantBatchMetrics(dst, metrics);
     }
 
+    // BMVR: set the captured float constants that differ from the device's
+    // current ones, coalescing consecutive registers into one call.
+    template <bool Vs, typename Mask, typename Reg>
+    void BmvrApplyChangedF(D3D9DeviceEx* dst, Mask& mask, const Reg* src, const Reg* cur) {
+      uint32_t runStart = 0, runLen = 0;
+      auto flush = [&]() {
+        if (!runLen)
+          return;
+        if constexpr (Vs)
+          dst->SetVertexShaderConstantF(runStart, reinterpret_cast<const float*>(&src[runStart]), runLen);
+        else
+          dst->SetPixelShaderConstantF(runStart, reinterpret_cast<const float*>(&src[runStart]), runLen);
+        runLen = 0;
+      };
+      for (uint32_t i = 0; i < mask.dwordCount(); i++) {
+        for (uint32_t bitIdx : bit::BitMask(mask.dword(i))) {
+          const uint32_t idx = i * 32 + bitIdx;
+          if (std::memcmp(&src[idx], &cur[idx], sizeof(Reg)) == 0) {
+            flush();
+            continue;
+          }
+          if (runLen && runStart + runLen == idx)
+            runLen++;
+          else {
+            flush();
+            runStart = idx;
+            runLen = 1;
+          }
+        }
+      }
+      flush();
+    }
+
     template <D3D9StateFunction Func, bool IgnoreStreamOffset>
     void ApplyOrCapture() {
       if      constexpr (Func == D3D9StateFunction::Apply)

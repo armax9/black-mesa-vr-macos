@@ -1,6 +1,7 @@
 #include "bmvr_flags.h"
 #include "bmvr_version.h"
 #include "openxr_bridge_protocol.h"
+#include "vr_button_map.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -19,6 +20,7 @@
 #include <string.h>
 #include <string>
 #include <vector>
+#include "bmvr_seh.h"
 
 extern "C" volatile int g_BmvrFlashlightMatrixFix;
 
@@ -83,14 +85,27 @@ namespace bmvr
     float g_SeatedHeightOffsetMeters = 0.f;
     bool g_AutoMatQueueMode = false;
     bool g_MulticoreMode = true;
-    uint32_t g_Msaa = 0; // >= 2 switches FXAA off and only reaches the lighting buffers
+    uint32_t g_Msaa = 0; // eye MSAA 0/2/4 (private eye targets only; FXAA stays on next to it)
+    bool g_MsaaPostSwitch = true;
+    bool g_PostCopySwap = true;
+    bool g_ShadowsOncePerFrame = true;
+    int g_StereoPairSeq = 0;
+    bool g_ShadowsOnceTestSkipAll = false;
+    float g_CpuSampleSeconds = 0.f;
+    float g_PostCopySwapAlpha = 1.f;
+    volatile unsigned long g_PostSwapArmThread = 0;
+    volatile unsigned long g_FullOverwriteArmThread = 0;
+    bool g_MsaaParticles1x = true;   // no-op while Msaa is 0
+    float g_MsaaF = 0.f;
+    bool g_AlphaToCoverage = true;   // no-op while Msaa is 0
+    float g_LodBias = 0.f;
+    bool g_RefractOncePerEye = true;   // also on at 0x: no visible cost there, big saving with MSAA
     bool g_MsaaAllowed = true;
     bool g_Haptics = true;
     bool g_HideCrosshair = true;
     bool g_MatchHmdHz = false;
     bool g_DisableViewBob = true;
     bool g_LeftHanded = false;
-    bool g_RecenterResetsYaw = true;
     bool g_AutoRecenterOnResume = true;
     bool g_HideLocalPlayerModel = true;
     bool g_HideViewmodelArms = true;
@@ -99,6 +114,14 @@ namespace bmvr
     float g_VrHandsModelScale = 0.85f;
     bool g_VrHandsDebugBoxes = false;
     bool g_HandHud = true;
+    bool g_DamageFlash = true;
+    float g_DamageFlashStrength = 0.6f;
+    float g_HandHudSize = 2.5f;
+    float g_HandHudUp = 2.2f;
+    float g_HandHudForward = -0.55f;
+    float g_HandHudSide = 0.3f;
+    float g_HandHudTilt = -18.f;
+    float g_HandHudRoll = 14.f;
     bool g_VrCrosshair = true;
     float g_VrCrosshairScale = 1.f;
     int g_VrCrosshairEye = 0;
@@ -116,17 +139,28 @@ namespace bmvr
     bool g_VrShootFromMuzzle = true;
     bool g_TwoHandHoldWhileGrip = true;
     bool g_TwoHandGripToggle = false;
-    bool g_FlashlightLeftHand = false;
+    bool g_VrPistolSemiAuto = false;
+    bool g_VrGlockRapidAlt = false;
+    float g_FlashlightFrom = 0.f;
+    static bool g_FlashlightFromSeen = false;
+    bool g_FlashlightOnSquare = false;
     float g_PauseMenuAlphaPasses = 3.f;
     bool g_PauseMenuColourFromFrame = true;
+    unsigned long g_DebugCaptureAt = 0;
+    unsigned long g_ScreenshotAt = 0;
     float g_DebugBlankEye = 0.f;
-    float g_FrameCapMode = 2.f;
+    float g_DebugHideXog = 0.f;
+    bool g_FlareLog = false;
+    bool g_FreezeHead = false;
+    float g_FrameCapMode = 1.f;
     bool g_VrHandThrow = true;
-    float g_ThrowScale = 3.75f;
+    float g_MountedGunGain = 1.75f;
+    float g_ThrowScale = 5.5f;
+    float g_SnarkThrowScale = 0.7f;
     bool g_VrSkipMotionBlur = true;
     bool g_VrSkipScreenEffects = true;
-    float g_EnvmapScaleWorld = 1.f;
-    float g_EnvmapScaleModels = 1.f;
+    float g_EnvmapScaleWorld = 0.4f;
+    float g_EnvmapScaleModels = 0.8f;
     bool g_StereoEnginePost = true;
     uint32_t g_MaxEyeSize = 4096;
     float g_ReflectionRtScale = 0.5f;
@@ -135,30 +169,103 @@ namespace bmvr
     int g_RefractCopyRtW = 0;
     int g_RefractCopyRtH = 0;
     bool g_GpuPassTiming = false;
+    bool g_GpuPassDetail = false;
+    float g_Foveated = 2.f;   // eye-tracked; lens centre (= fixed) without eye tracking
+    bool g_FoveatedAtStart = false;
+    float g_FoveatedInner = 0.25f;
+    float g_FoveatedMid = 0.65f;
+    float g_FoveatedOuter = 0.8f;
+    float g_FoveatedRingScale = 1.f;
+    float g_FoveatedGazeStep = 0.02f;
+    bool g_PerfLog = false;
     int g_ReflectionRtH = 0;
     int g_PassTraceFrames = 0;
     bool g_SprintAimedPose = true;
+    bool g_SkipDrawAnim = true;
+    bool g_DeltaSeqIdle = true;
+    bool g_ScopeClipIdle = true;
+    bool g_TwoHandNoLower = true;
+    bool g_CrowbarHitDrawnBar = true;
+    bool g_TwoHandLoweredFollow = true;
+    bool g_ThrowStroke = false;
+    bool g_MuteFidgetSounds = true;
     // Optional features: off unless enabled in VR/config.txt.
-    bool g_ShoulderGestures = true;
+    static bool g_ShoulderGestures = true;   // old switches, read only for the migration
+    static bool g_HipGestures = true;
+    static bool g_OldGestureKeysSeen = false;
+    float g_GestureLeftShoulder = 0.f;
+    float g_GestureWeaponShoulder = 0.f;
+    float g_GestureWeaponHipRight = 1.f;
+    float g_GestureWeaponHipLeft = 3.f;
+    namespace
+    {
+        struct GestureWeapon { const char* name; const char* parts[4]; };
+        const GestureWeapon kGestureWeapons[kGestureWeaponCount] =
+        {
+            { "crowbar", { "crowbar", "wrench", nullptr } },
+            { "pistol", { "glock", nullptr } },
+            { ".357", { "357", "python", nullptr } },
+            { "mp5", { "mp5", nullptr } },
+            { "shotgun", { "shotgun", nullptr } },
+            { "crossbow", { "crossbow", nullptr } },
+            { "rpg", { "rpg", nullptr } },
+            { "tau", { "tau", "gauss", nullptr } },
+            { "gluon", { "gluon", "egon", nullptr } },
+            { "hivehand", { "hivehand", "hgun", nullptr } },
+            { "grenade", { "frag", "grenade", nullptr } },
+        };
+    }
+    const char* GestureWeaponName(int index)
+    {
+        return (index >= 0 && index < kGestureWeaponCount) ? kGestureWeapons[index].name : "crowbar";
+    }
+    const char* const* GestureWeaponParts(int index)
+    {
+        return kGestureWeapons[(index >= 0 && index < kGestureWeaponCount) ? index : 0].parts;
+    }
     bool g_SettingsTriangleHold = true;
     bool g_WeaponMenuSettingsGear = true;
     bool g_WeaponMenuTilt = true;
-    bool g_CrouchStickHold = false;
+    bool g_CrouchStickHold = true;
     float g_StickJumpCrouchThreshold = 0.8f;
+    float g_StickJumpCrouchAngle = 30.f;
     bool g_TurnBlocksJumpCrouch = true;
-    bool g_SprintToggle = false;
+    float g_ButtonHoldMs = 500.f;
+    bool g_ButtonMapping = true;
+    bool g_ControlsPicture = true;
+    bool g_SprintToggle = true;
     bool g_VrSettingsPause = true;
     bool g_HideHandsWithoutSuit = true;
     bool g_ScopeUsesHmdAim = true;
     float g_ScopeZoomFovScale = 0.28f;
+    bool g_ScopeKeepsAimOffset = true;
+    bool g_ScopeFollowsGun = true;
+    float g_ScopeGunSmoothSec = 0.10f;
+    bool g_ScopeRaiseToZoom = true;
+    float g_ScopeRaiseMeters = 0.30f;
     int g_ScopeEye = 2;
+    bool g_ScopeMonoZoom = true;
     float g_LeftEyeCullPad = 0.f;
     bool g_MenuCursorHook = true;
     bool g_DebugDumps = false;
     bool g_RightEyeFirst = false;
+    bool g_McFrameReset = true;
+    bool g_PoseFlagsNoBlink = true;
     bool g_OcclusionTrackerPerEye = true;
     bool g_PixelVisPerEye = true;
+    bool g_GlowCountDepthFix = true;
+    // MulticoreMode: hands/laser of both eyes drawn from one per-frame snapshot (VR::HandDrawSnap).
+    bool g_McHandSnapshot = true;
+    bool g_SkyWaterPerEye = true;
+    bool g_EyeUnderwaterWorld = true;
+    bool g_WaterLineClipFix = true;
+    bool g_ScreenSpaceModelFix = true;
+    bool g_XenGlobalFogOff = true;
     bool g_FlareEyeAxis = true;
+    bool g_FlareLevel = true;
+    bool g_SpriteLevel = true;
+    bool g_ParticleLevel = true;
+    bool g_ViewmodelFxCatchUp = true;
     bool g_LightCullEyeView = true;
     bool g_FlareSharedLayout = true;
     float g_FlareHazeScale = 0.f;
@@ -168,11 +275,20 @@ namespace bmvr
     float g_FlareLightScale = 1.f;
     bool g_ViewProjNormalFix = true;
     bool g_EyeBloom = true;
-    bool g_FxaaApply = false;
+    bool g_FxaaApply = true;
     float g_FxaaSubpixel = 0.25f;
     float g_FxaaEdgeThreshold = 0.166f;
     float g_FxaaEdgeThresholdMin = 0.0833f;
     float g_GlowHold = 0.f;
+    float g_GlowSmooth = 0.15f;
+    float g_GlowHideMs = 20.f;
+    bool g_LoadingCard = true;
+    bool g_TitleLevel = true;
+    bool g_ParticlesLast = true;
+    float g_GlowProxyScale = 1.5f;
+    float g_PoseHoldDeg = 0.f;
+    float g_PoseHoldMm = 0.f;
+    float g_GlowTraceSeconds = 0.f;
     bool g_FollowScriptedCamera = true;
     bool g_OccluderViewPerEye = true;
     float g_ScopeZoomSmoothSec = 0.16f;
@@ -181,6 +297,8 @@ namespace bmvr
     float g_VrHandsPoseRotZ = 0.f;
     float g_VrHandsIndexRollDeg = 90.f;
     float g_VrHandsRollDeg = 90.f;
+    bool g_VrHandsClassicPose = false;
+    bool g_PanelDevRows = false;
     float g_VrHandsGunGripRight = 1.2f;
     float g_VrHandsGunGripUp = 0.f;
     float g_VrHandsGunGripForward = 0.f;
@@ -215,8 +333,81 @@ namespace bmvr
     float g_VrHandsRightGripRotY = 0.f;
     float g_VrHandsRightGripRotZ = -180.f;
     bool g_VrHandsUseHevGloves = true;
+    bool g_VrHandsBlackMesa = true;
+    bool g_VrGunRightHand = true;
+    bool g_VrStockHandPose = true;
+    bool g_VrSupportHandLock = true;
+    bool g_VrHandLightRaw = false;
+    bool g_VrSatchelHands = true;
+    bool g_VrGrenadeWristAlign = true;
+    // Gun fists sit ~10 cm behind the controller origin, a little low ("fist vs controller" log).
+    float g_VrSatchelFist[3] = { -10.f, 0.5f, -1.5f };
+    bool g_HudHealthOnGun = true;
+    bool g_VrSupportHandForce = false;
+    // Side (key) pinch: thumb pad on the half-bent index (headless, bare
+    // hands from the thumb side, 2026-11-18; 0.6/0.55 was a fist).
+    float g_VrPinchThumb = 0.50f;
+    float g_VrPinchIndex = 0.30f;
+    bool g_VrPinchForce = false;
+    bool g_PhysicalWeapons = false;
+    bool g_VrMagReload = true;
+    bool g_VrGrenadePin = true;
+    bool g_VrReloadHints = true;
+    bool g_VrClipHandPose = true;
+    bool g_VrClipHandSnap = true;
+    bool g_VrClipHandRpg = true;
+    bool g_VrClipHandRpgFlip = true;
+    bool g_VrMagDiscard = true;
+    float g_VrNearZ = 4.f;
+    bool g_VrRecoil = false;
+    bool g_PhysicalLadders = false;
+    float g_VmTunePitch = 0.f, g_VmTuneYaw = 0.f, g_VmTuneRoll = 0.f, g_VmTuneSupportCm = 0.f;
+    float g_VmTuneSeatCm = 6.f, g_VmTuneSeatDeg = 45.f;
+    bool g_PhysicalLadderSmooth = true;
+    bool g_LadderBodyFollowsArms = true;
+    float g_LadderGunHand = 1.f;
+    bool g_LadderStickClimb = false;
+    float g_LadderHandBack = 1.5f;   // user 2026-11-20 (was 3)
+    bool g_LadderHandWrap = true;
+    float g_LadderGripCurl = 0.7f;
+    float g_LadderTuneOutCm = 0.f, g_LadderTuneUpCm = 0.f, g_LadderTuneCurl = 0.7f;
+    float g_SatchelGripCurl = 0.75f;
+    float g_SatchelBagDepth = 1.5f;
+    // User's headset tuning 2026-11-20 (was curl 0.45, out 2, rest 0).
+    float g_RpgFistCurl = 0.f, g_RpgFistOutCm = 0.f;
+    // User 2026-11-20 (headset): glock magazine in the hand.
+    float g_GlockMagTurn = 30.f, g_GlockMagRoll = -55.f, g_GlockMagSpin = -90.f, g_GlockMagFwdCm = -2.f, g_GlockMagUpCm = 0.f, g_GlockMagSideCm = 0.f, g_GlockThumbCurl = 20.f, g_GlockThumbBase = 25.f;
+    float g_RpgHandTurn = -15.f, g_RpgHandRoll = 0.f, g_RpgHandSpin = 15.f, g_RpgHandFwdCm = 6.f, g_RpgHandUpCm = 15.f, g_RpgHandSideCm = -12.5f;
+    // User's tuning in the headset 2026-11-19: turn 0, roll 0, spin 90, in -3.5, up 13.5, side 14.5.
+    float g_SatchelBagTurn = 0.f, g_SatchelBagInCm = -3.5f, g_SatchelBagUpCm = 13.5f;
+    float g_SatchelBagRoll = 0.f, g_SatchelBagSpin = 90.f, g_SatchelBagSideCm = 14.5f;
+    float g_GunHandCuff = 1.5f;
+    bool g_TripmineFaceAim = true;
+    bool g_PauseCaptureArm = false;
+    bool g_DesktopMouseGuard = true;
+    bool g_GunHandCuffCap = true;
+    float g_PauseSkipPaints = 0.f;
+    float g_VrRecoilScale = 1.f;
+    float g_VrRecoilTwoHand = 0.3f;
+    bool g_RpgRocketShown = true;
+    float g_DebugVmSeq = -1.f;
+    float g_DebugVmCycle = 0.f;
+    bool g_DebugDumpHandPose = false;
+    float g_VrMagHandForward = 0.f;
+    float g_VrMagHandUp = 0.f;
+    float g_VrShellOut = 0.3f;
+    bool g_VrShellFlip = false;
+    bool g_Vr357Flick = true;
+    float g_Vr357FlickSpeed = 400.f;
+    bool g_Vr357Tilt = true;
+    float g_Vr357TiltPitch = 30.f;
+    bool g_Vr357FireBeamHide = true;
+    float g_VrBoltGrabRadius = 7.f;
+    float g_VrHandsBlackMesaScale = 0.8f;
     bool g_IsBlueShift = false;
     bool g_IsAzureSheep = false;
+    bool g_IsAzureSheepReborn = false;
+    bool g_IsBmMilitary = false;
     uint32_t g_FullFrameActualWidth = 0;
     uint32_t g_FullFrameActualHeight = 0;
     uint32_t g_GbActualWidth = 0;
@@ -461,6 +652,10 @@ namespace bmvr
         return raw;
     }
 
+    // FlashlightOnSquare / SettingsTriangleHold / CrouchStickHold were in
+    // config.txt (turned into Bind.* mappings once, see InitFromDisk).
+    static bool g_LegacyBindKeysSeen = false;
+
     static void ReadUserConfig(const std::wstring& path)
     {
         std::string text = ReadConfigFileText(path);
@@ -510,6 +705,18 @@ namespace bmvr
                 const float s = static_cast<float>(atof(val));
                 if (s >= 0.5f && s <= 2.0f)
                     g_RenderScale = s;
+            }
+            else if (std::strncmp(n, "Bind.", 5) == 0)
+                SetBindFromConfig(n + 5, val);
+            else if (std::strcmp(n, "ButtonMapping") == 0)
+                g_ButtonMapping = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "ControlsPicture") == 0)
+                g_ControlsPicture = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "ButtonHoldMs") == 0)
+            {
+                const float ms = static_cast<float>(atof(val));
+                if (ms >= 200.f && ms <= 1500.f)
+                    g_ButtonHoldMs = ms;
             }
             else if (std::strcmp(n, "TurnSpeed") == 0)
             {
@@ -579,7 +786,10 @@ namespace bmvr
             else if (std::strcmp(n, "FlashlightShadowMatrixFix") == 0)
                 g_BmvrFlashlightMatrixFix = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0) ? 1 : 0;
             else if (std::strcmp(n, "Msaa") == 0 || std::strcmp(n, "msaa") == 0)
+            {
                 g_Msaa = NormalizeMsaa(atoi(val));
+                g_MsaaF = static_cast<float>(g_Msaa);
+            }
             else if (std::strcmp(n, "Haptics") == 0)
                 g_Haptics = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "HideCrosshair") == 0)
@@ -591,7 +801,7 @@ namespace bmvr
             else if (std::strcmp(n, "LeftHanded") == 0)
                 g_LeftHanded = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "RecenterResetsYaw") == 0)
-                g_RecenterResetsYaw = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+                ;   // retired 2026-11-11: recenter never resets the turn direction
             else if (std::strcmp(n, "AutoRecenterOnResume") == 0)
                 g_AutoRecenterOnResume = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "HideLocalPlayerModel") == 0)
@@ -612,6 +822,22 @@ namespace bmvr
                 g_VrHandsDebugBoxes = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "VrHandHud") == 0)
                 g_HandHud = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "DamageFlash") == 0)
+                g_DamageFlash = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "DamageFlashStrength") == 0)
+                g_DamageFlashStrength = std::clamp(static_cast<float>(atof(val)), 0.f, 1.f);
+            else if (std::strcmp(n, "HandHudSize") == 0)
+                g_HandHudSize = std::clamp(static_cast<float>(atof(val)), 1.f, 6.f);
+            else if (std::strcmp(n, "HandHudUp") == 0)
+                g_HandHudUp = std::clamp(static_cast<float>(atof(val)), -4.f, 8.f);
+            else if (std::strcmp(n, "HandHudForward") == 0)
+                g_HandHudForward = std::clamp(static_cast<float>(atof(val)), -8.f, 8.f);
+            else if (std::strcmp(n, "HandHudSide") == 0)
+                g_HandHudSide = std::clamp(static_cast<float>(atof(val)), -6.f, 6.f);
+            else if (std::strcmp(n, "HandHudTilt") == 0)
+                g_HandHudTilt = std::clamp(static_cast<float>(atof(val)), -90.f, 90.f);
+            else if (std::strcmp(n, "HandHudRoll") == 0)
+                g_HandHudRoll = std::clamp(static_cast<float>(atof(val)), -90.f, 90.f);
             else if (std::strcmp(n, "VrCrosshair") == 0)
                 g_VrCrosshair = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "VrCrosshairEye") == 0)
@@ -634,41 +860,102 @@ namespace bmvr
             else if (std::strcmp(n, "VrShotOriginFix") == 0)
                 g_VrShotOriginFix = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "CrouchStickHold") == 0)
+            {
                 g_CrouchStickHold = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+                g_LegacyBindKeysSeen = true;
+            }
             else if (std::strcmp(n, "StickJumpCrouchThreshold") == 0)
             {
                 const float t = static_cast<float>(atof(val));
                 if (t >= 0.3f && t <= 0.95f)
                     g_StickJumpCrouchThreshold = t;
             }
+            else if (std::strcmp(n, "StickJumpCrouchAngle") == 0)
+            {
+                const float a = static_cast<float>(atof(val));
+                if (a >= 10.f && a <= 45.f)
+                    g_StickJumpCrouchAngle = a;
+            }
             else if (std::strcmp(n, "TurnBlocksJumpCrouch") == 0)
                 g_TurnBlocksJumpCrouch = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "SprintToggle") == 0)
+            {
                 g_SprintToggle = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+                g_LegacyBindKeysSeen = true;
+            }
             else if (std::strcmp(n, "VrSettingsPause") == 0)
                 g_VrSettingsPause = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "VrShootFromMuzzle") == 0)
                 g_VrShootFromMuzzle = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "ShoulderGestures") == 0)
+            {
                 g_ShoulderGestures = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+                g_OldGestureKeysSeen = true;
+            }
+            else if (std::strcmp(n, "HipGestures") == 0)
+            {
+                g_HipGestures = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+                g_OldGestureKeysSeen = true;
+            }
+            else if (std::strcmp(n, "GestureLeftShoulder") == 0)
+            {
+                const int v = atoi(val);
+                if (v >= -1 && v <= 1)
+                    g_GestureLeftShoulder = static_cast<float>(v);
+            }
+            else if (std::strcmp(n, "GestureWeaponShoulder") == 0 || std::strcmp(n, "GestureWeaponHipRight") == 0
+                || std::strcmp(n, "GestureWeaponHipLeft") == 0)
+            {
+                const int w = atoi(val);
+                if (w >= -1 && w < kGestureWeaponCount)
+                    (n[13] == 'S' ? g_GestureWeaponShoulder : n[16] == 'R' ? g_GestureWeaponHipRight : g_GestureWeaponHipLeft)
+                        = static_cast<float>(w);
+            }
             else if (std::strcmp(n, "SettingsTriangleHold") == 0)
+            {
                 g_SettingsTriangleHold = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+                g_LegacyBindKeysSeen = true;
+            }
             else if (std::strcmp(n, "WeaponMenuSettingsGear") == 0)
                 g_WeaponMenuSettingsGear = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "WeaponMenuTilt") == 0)
                 g_WeaponMenuTilt = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "TwoHandGripToggle") == 0)
                 g_TwoHandGripToggle = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrPistolSemiAuto") == 0)
+                g_VrPistolSemiAuto = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrGlockRapidAlt") == 0)
+                g_VrGlockRapidAlt = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "PauseMenuColourFromFrame") == 0)
                 g_PauseMenuColourFromFrame = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "PauseMenuAlphaPasses") == 0)
                 g_PauseMenuAlphaPasses = static_cast<float>(atof(val));
             else if (std::strcmp(n, "FlashlightLeftHand") == 0)
-                g_FlashlightLeftHand = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            {
+                // Old switch: true = left hand, unless FlashlightFrom is set too.
+                if (!g_FlashlightFromSeen && (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0))
+                    g_FlashlightFrom = 1.f;
+            }
+            else if (std::strcmp(n, "FlashlightFrom") == 0)
+            {
+                const int v = atoi(val);
+                if (v >= 0 && v <= 2)
+                {
+                    g_FlashlightFrom = static_cast<float>(v);
+                    g_FlashlightFromSeen = true;
+                }
+            }
+            else if (std::strcmp(n, "FlashlightOnSquare") == 0)
+            {
+                g_FlashlightOnSquare = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+                g_LegacyBindKeysSeen = true;
+            }
             else if (std::strcmp(n, "FrameCap") == 0)
                 g_FrameCapMode = static_cast<float>(atof(val));
             else if (std::strcmp(n, "VrHandThrow") == 0)
                 g_VrHandThrow = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "MountedGunGain") == 0)
+                g_MountedGunGain = std::clamp(static_cast<float>(atof(val)), 0.5f, 4.f);
             else if (std::strcmp(n, "ThrowScale") == 0)
                 g_ThrowScale = static_cast<float>(atof(val));
             else if (std::strcmp(n, "TwoHandHoldWhileGrip") == 0)
@@ -683,8 +970,36 @@ namespace bmvr
                 g_EnvmapScaleModels = std::clamp(static_cast<float>(atof(val)), 0.f, 1.f);
             else if (std::strcmp(n, "StereoEnginePost") == 0)
                 g_StereoEnginePost = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "RefractOncePerEye") == 0)
+                g_RefractOncePerEye = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "GpuPassTiming") == 0)
                 g_GpuPassTiming = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "GpuPassDetail") == 0)
+                g_GpuPassDetail = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "Foveated") == 0)
+                g_Foveated = static_cast<float>(std::clamp(atoi(val), 0, 2));
+            else if (std::strcmp(n, "FoveatedInner") == 0)
+                g_FoveatedInner = std::clamp(static_cast<float>(atof(val)), 0.05f, 2.f);
+            else if (std::strcmp(n, "FoveatedMid") == 0)
+                g_FoveatedMid = std::clamp(static_cast<float>(atof(val)), 0.05f, 3.f);
+            else if (std::strcmp(n, "FoveatedGazeStep") == 0)
+                g_FoveatedGazeStep = std::clamp(static_cast<float>(atof(val)), 0.f, 0.2f);
+            else if (std::strcmp(n, "FoveatedOuter") == 0)
+                g_FoveatedOuter = std::clamp(static_cast<float>(atof(val)), 0.05f, 4.f);
+            else if (std::strcmp(n, "LodBias") == 0)
+                g_LodBias = std::clamp(static_cast<float>(atof(val)), -1.f, 2.f);
+            else if (std::strcmp(n, "AlphaToCoverage") == 0)
+                g_AlphaToCoverage = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "MsaaParticles1x") == 0)
+                g_MsaaParticles1x = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "MsaaPostSwitch") == 0)
+                g_MsaaPostSwitch = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "PostCopySwap") == 0)
+                g_PostCopySwap = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "ShadowsOncePerFrame") == 0)
+                g_ShadowsOncePerFrame = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "PerfLog") == 0)
+                g_PerfLog = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "ReflectionRtScale") == 0)
             {
                 const float v = static_cast<float>(atof(val));
@@ -702,6 +1017,22 @@ namespace bmvr
             }
             else if (std::strcmp(n, "SprintAimedPose") == 0)
                 g_SprintAimedPose = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "SkipDrawAnim") == 0)
+                g_SkipDrawAnim = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "DeltaSeqIdle") == 0)
+                g_DeltaSeqIdle = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "CrowbarHitDrawnBar") == 0)
+                g_CrowbarHitDrawnBar = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "TwoHandNoLower") == 0)
+                g_TwoHandNoLower = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "TwoHandLoweredFollow") == 0)
+                g_TwoHandLoweredFollow = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "ScopeClipIdle") == 0)
+                g_ScopeClipIdle = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "ThrowStroke") == 0)
+                g_ThrowStroke = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "MuteFidgetSounds") == 0)
+                g_MuteFidgetSounds = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "MirrorBothEyes") == 0)
                 g_MirrorBothEyes = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "VRRuntimeBackend") == 0)
@@ -715,10 +1046,22 @@ namespace bmvr
                 g_HideHandsWithoutSuit = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "VrScopeUsesHmdAim") == 0)
                 g_ScopeUsesHmdAim = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "ScopeKeepsAimOffset") == 0)
+                g_ScopeKeepsAimOffset = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "ScopeFollowsGun") == 0)
+                g_ScopeFollowsGun = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "ScopeGunSmoothSec") == 0)
+                g_ScopeGunSmoothSec = std::clamp(static_cast<float>(atof(val)), 0.f, 0.5f);
+            else if (std::strcmp(n, "ScopeRaiseToZoom") == 0)
+                g_ScopeRaiseToZoom = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "ScopeRaiseMeters") == 0)
+                g_ScopeRaiseMeters = std::clamp(static_cast<float>(atof(val)), 0.1f, 0.6f);
             else if (std::strcmp(n, "ScopeZoomFovScale") == 0)
                 g_ScopeZoomFovScale = static_cast<float>(atof(val));
             else if (std::strcmp(n, "ScopeEye") == 0)
                 g_ScopeEye = std::strcmp(val, "left") == 0 ? 1 : (std::strcmp(val, "center") == 0 ? 0 : 2);
+            else if (std::strcmp(n, "ScopeMonoZoom") == 0)
+                g_ScopeMonoZoom = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "MenuCursorHook") == 0)
                 g_MenuCursorHook = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "OcclusionTrackerPerEye") == 0)
@@ -735,6 +1078,20 @@ namespace bmvr
                 g_FlareSharedLayout = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "FlareHazeScale") == 0)
                 g_FlareHazeScale = std::clamp(static_cast<float>(atof(val)), 0.f, 1.f);
+            else if (std::strcmp(n, "GlowSmooth") == 0)
+                g_GlowSmooth = std::clamp(static_cast<float>(atof(val)), 0.f, 0.5f);
+            else if (std::strcmp(n, "GlowHideMs") == 0)
+                g_GlowHideMs = std::clamp(static_cast<float>(atof(val)), 0.f, 500.f);
+            else if (std::strcmp(n, "GlowProxyScale") == 0)
+                g_GlowProxyScale = std::clamp(static_cast<float>(atof(val)), 1.f, 8.f);
+            else if (std::strcmp(n, "ParticlesLast") == 0)
+                g_ParticlesLast = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "TitleLevel") == 0)
+                g_TitleLevel = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "PoseHoldDeg") == 0)
+                g_PoseHoldDeg = std::clamp(static_cast<float>(atof(val)), 0.f, 1.f);
+            else if (std::strcmp(n, "PoseHoldMm") == 0)
+                g_PoseHoldMm = std::clamp(static_cast<float>(atof(val)), 0.f, 20.f);
             else if (std::strcmp(n, "FlareFadeAngle") == 0)
                 g_FlareFadeAngle = std::clamp(static_cast<float>(atof(val)), 0.f, 90.f);
             else if (std::strcmp(n, "FlareLightScale") == 0)
@@ -743,12 +1100,30 @@ namespace bmvr
                 g_FlareGhostScale = std::clamp(static_cast<float>(atof(val)), 0.f, 1.f);
             else if (std::strcmp(n, "FlareHazeMinSize") == 0)
                 g_FlareHazeMinSize = std::clamp(static_cast<float>(atof(val)), 0.05f, 4.f);
+            else if (std::strcmp(n, "SkyWaterPerEye") == 0)
+                g_SkyWaterPerEye = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "EyeUnderwaterWorld") == 0)
+                g_EyeUnderwaterWorld = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "XenGlobalFogOff") == 0)
+                g_XenGlobalFogOff = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "WaterLineClipFix") == 0)
+                g_WaterLineClipFix = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "ScreenSpaceModelFix") == 0)
+                g_ScreenSpaceModelFix = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "LightCullEyeView") == 0)
                 g_LightCullEyeView = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "FlareLevel") == 0)
+                g_FlareLevel = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "SpriteLevel") == 0)
+                g_SpriteLevel = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "ParticleLevel") == 0)
+                g_ParticleLevel = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "FlareEyeAxis") == 0)
                 g_FlareEyeAxis = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "PixelVisPerEye") == 0)
                 g_PixelVisPerEye = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "GlowCountDepthFix") == 0)
+                g_GlowCountDepthFix = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "ViewProjNormalFix") == 0)
                 g_ViewProjNormalFix = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "EyeBloom") == 0)
@@ -793,6 +1168,10 @@ namespace bmvr
                 g_VrHandsGunGripUp = std::clamp(static_cast<float>(atof(val)), -8.f, 8.f);
             else if (std::strcmp(n, "VrHandsGunGripForward") == 0)
                 g_VrHandsGunGripForward = std::clamp(static_cast<float>(atof(val)), -12.f, 12.f);
+            else if (std::strcmp(n, "VrPanelDevRows") == 0)
+                g_PanelDevRows = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrHandsClassicPose") == 0)
+                g_VrHandsClassicPose = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "VrHandsRollDeg") == 0)
             {
                 const float s = static_cast<float>(atof(val));
@@ -861,6 +1240,76 @@ namespace bmvr
             }
             else if (std::strcmp(n, "VrHandsUseHevGloves") == 0)
                 g_VrHandsUseHevGloves = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "RpgRocketShown") == 0)
+                g_RpgRocketShown = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "PhysicalLadders") == 0)
+                g_PhysicalLadders = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "LadderBodyFollowsArms") == 0)
+                g_LadderBodyFollowsArms = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "PhysicalLadderSmooth") == 0)
+                g_PhysicalLadderSmooth = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "LadderStickClimb") == 0)
+                g_LadderStickClimb = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "LadderHandWrap") == 0)
+                g_LadderHandWrap = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "LadderHandBack") == 0)
+            {
+                const float v = static_cast<float>(atof(val));
+                if (v >= 0.f && v <= 10.f)
+                    g_LadderHandBack = v;
+            }
+            else if (std::strcmp(n, "LadderGunHand") == 0)
+            {
+                const int v = atoi(val);
+                if (v >= 0 && v <= 2)
+                    g_LadderGunHand = static_cast<float>(v);
+            }
+            else if (std::strcmp(n, "VrRecoil") == 0)
+                g_VrRecoil = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrRecoilScale") == 0)
+            {
+                const float v = static_cast<float>(atof(val));
+                if (v >= 0.25f && v <= 3.f)
+                    g_VrRecoilScale = v;
+            }
+            else if (std::strcmp(n, "VrRecoilTwoHand") == 0)
+            {
+                const float v = static_cast<float>(atof(val));
+                if (v >= 0.f && v <= 1.f)
+                    g_VrRecoilTwoHand = v;
+            }
+            else if (std::strcmp(n, "PhysicalWeapons") == 0)
+                g_PhysicalWeapons = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrMagReload") == 0)
+                g_VrMagReload = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrGrenadePin") == 0)
+                g_VrGrenadePin = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrNearZ") == 0)
+                g_VrNearZ = static_cast<float>(std::atof(val));
+            else if (std::strcmp(n, "VrMagDiscard") == 0)
+                g_VrMagDiscard = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrReloadHints") == 0)
+                g_VrReloadHints = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrClipHandPose") == 0)
+                g_VrClipHandPose = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrClipHandSnap") == 0)
+                g_VrClipHandSnap = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrClipHandRpg") == 0)
+                g_VrClipHandRpg = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrClipHandRpgFlip") == 0)
+                g_VrClipHandRpgFlip = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrGunRightHand") == 0)
+                g_VrGunRightHand = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrStockHandPose") == 0)
+                g_VrStockHandPose = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrSatchelHands") == 0)
+                g_VrSatchelHands = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrSupportHandLock") == 0)
+                g_VrSupportHandLock = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrHandLightRaw") == 0)
+                g_VrHandLightRaw = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrHandsBlackMesaScale") == 0)
+                g_VrHandsBlackMesaScale = static_cast<float>(std::atof(val));
             else if (std::strcmp(n, "CompositorPostPresentHandoff") == 0)
                 g_CompositorPostPresentHandoff = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "DesktopLeftoverRender") == 0)
@@ -1387,7 +1836,7 @@ namespace bmvr
         for (int i = 0; i < count; ++i)
         {
             DWORD v = 0;
-            __try
+            BMVR_TRY
             {
                 v = stk[i];
             }
@@ -1548,6 +1997,16 @@ namespace bmvr
         return g_IsAzureSheep;
     }
 
+    bool IsBmMilitary()
+    {
+        return g_IsBmMilitary;
+    }
+
+    bool IsAzureSheepReborn()
+    {
+        return g_IsAzureSheepReborn;
+    }
+
     bool UseBlueHud()
     {
         return g_IsBlueShift || g_IsAzureSheep;
@@ -1570,6 +2029,8 @@ namespace bmvr
     {
         g_IsBlueShift = false;
         g_IsAzureSheep = false;
+        g_IsAzureSheepReborn = false;
+        g_IsBmMilitary = false;
         const wchar_t* p = GetCommandLineW();
         if (!p)
             return;
@@ -1614,6 +2075,19 @@ namespace bmvr
             {
                 g_IsAzureSheep = true;
                 Log("Azure Sheep session (-game asheep)");
+                return;
+            }
+            if (PathLeafEquals(tok, L"bmmilitary"))
+            {
+                g_IsBmMilitary = true;
+                Log("Black Mesa: Military session (-game bmmilitary)");
+                return;
+            }
+            if (PathLeafEquals(tok, L"asheep_reborn"))
+            {
+                g_IsAzureSheep = true;
+                g_IsAzureSheepReborn = true;
+                Log("Azure Sheep: Reborn session (-game asheep_reborn)");
                 return;
             }
         }
@@ -1724,7 +2198,63 @@ namespace bmvr
         InstallCrashHandler();
         StartWatchdog();
         DetectCampaignSession();
+        CapturePanelDefaults();   // before config.txt: the panel saves only values that differ
         ReadUserConfig(ExeDir() + L"\\VR\\config.txt");
+        // Old grab-zone switches (user 2026-11-19: one row per zone, Off as a
+        // choice): off = those zones off. Written once, old keys dropped.
+        if (g_OldGestureKeysSeen)
+        {
+            std::vector<std::pair<std::string, std::string>> set;
+            if (!g_ShoulderGestures)
+            {
+                g_GestureLeftShoulder = -1.f;
+                g_GestureWeaponShoulder = -1.f;
+                set.emplace_back("GestureLeftShoulder", "-1");
+                set.emplace_back("GestureWeaponShoulder", "-1");
+            }
+            if (!g_HipGestures)
+            {
+                g_GestureWeaponHipRight = -1.f;
+                g_GestureWeaponHipLeft = -1.f;
+                set.emplace_back("GestureWeaponHipRight", "-1");
+                set.emplace_back("GestureWeaponHipLeft", "-1");
+            }
+            const bool ok = WriteVrConfigValues(set, { "ShoulderGestures", "HipGestures" });
+            Log("Grab zones: old ShoulderGestures=%d HipGestures=%d migrated (%zu value%s), %s",
+                g_ShoulderGestures ? 1 : 0, g_HipGestures ? 1 : 0, set.size(), set.size() == 1 ? "" : "s", ok ? "ok" : "FAILED");
+        }
+        // Panel rows removed in the 2026-11-19 review: their values are fixed
+        // at the defaults, whatever an older config.txt still says.
+        g_PhysicalLadderSmooth = true;
+        g_VrHandsGunGripRight = 1.2f;
+        g_VrHandsGunGripUp = 0.f;
+        g_VrHandsGunGripForward = 0.f;
+        g_VrGmanGesture = true;
+        g_VrMagReload = true;            // manual reloads = the Physical weapons switch itself
+        g_VrStockHandPose = true;        // support hand pose + lock and satchel hands:
+        g_VrSupportHandLock = true;      // always on, beta switch or not
+        g_VrSatchelHands = true;
+        g_ScopeFollowsGun = true;
+        g_ScopeRaiseToZoom = true;
+        g_FxaaApply = true;              // stock FXAA = the "Stock" preset
+        g_ParticleLevel = true;
+        g_SpriteLevel = true;
+        g_ScopeMonoZoom = true;
+        g_VrHandLightRaw = false;
+        g_TitleLevel = true;
+        // Old switches that picked button defaults become mappings, once
+        // (user, 2026-11-18: one place to change a button). Kept while the
+        // fixed layout is in use (ButtonMapping=false), which still reads them.
+        if (g_LegacyBindKeysSeen && g_ButtonMapping)
+        {
+            std::vector<std::pair<std::string, std::string>> set;
+            MigrateLegacyBindSettings(g_FlashlightOnSquare, g_SettingsTriangleHold, g_CrouchStickHold, g_SprintToggle, set);
+            const std::vector<std::string> drop = { "FlashlightOnSquare", "SettingsTriangleHold", "CrouchStickHold", "SprintToggle" };
+            const bool ok = WriteVrConfigValues(set, drop);
+            Log("Button map: old button switches migrated (%zu mapping%s), removed from config.txt: %s",
+                set.size(), set.size() == 1 ? "" : "s", ok ? "ok" : "FAILED");
+        }
+        g_FoveatedAtStart = g_Foveated > 0.f;
         ClearSkipsOnBuildChange();
         ReadSkipFile(SkipPath());
         ReadSkipFile(ModuleDir() + L"\\bmvr_skip.txt");
@@ -2205,12 +2735,38 @@ namespace bmvr
         return hwnd;
     }
 
+    // Thread that refreshes the cached client size (the RenderView / main
+    // thread, set every frame). Other threads (the render thread calls this
+    // from per-constant d3d9 hooks thousands of times a frame) only read the
+    // cache: under Wine both QueryPerformanceCounter (a syscall in 32-bit
+    // processes) and GetClientRect (wineserver, 1.5-3 ms spikes) were on the
+    // render thread's hot path (~6 % of it, 2026-11-16 CPU sampler).
+    static std::atomic<DWORD> g_ClientSizeRefreshTid{ 0 };
+
+    void InvalidateClientSizeCache()
+    {
+        g_ClientSizeQpc.store(0, std::memory_order_release);
+    }
+
+    void NoteClientSizeRefreshThread()
+    {
+        g_ClientSizeRefreshTid.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    }
+
     bool QueryWindowClientSize(uint32_t& width, uint32_t& height)
     {
-        LARGE_INTEGER t{};
-        QueryPerformanceCounter(&t);
-        const int64_t last = g_ClientSizeQpc.load(std::memory_order_acquire);
-        if (last != 0 && (t.QuadPart - last) < 4 * QpcTicksPerMs())
+        const int64_t last = g_ClientSizeQpc.load(std::memory_order_acquire);  // GetTickCount64 ms of the last refresh
+        const DWORD refresher = g_ClientSizeRefreshTid.load(std::memory_order_relaxed);
+        const bool mayRefresh = refresher == 0 || refresher == GetCurrentThreadId();
+        int64_t now = 0;
+        bool fresh = last != 0;
+        if (fresh)
+        {
+            // Non-refreshing threads use the cache unless it is very old (main thread not calling, e.g. menus).
+            now = static_cast<int64_t>(GetTickCount64());
+            fresh = (now - last) < (mayRefresh ? 100 : 1000);
+        }
+        if (fresh)
         {
             const uint64_t packed = g_ClientSizePacked.load(std::memory_order_relaxed);
             if (packed == 0)
@@ -2219,6 +2775,8 @@ namespace bmvr
             height = static_cast<uint32_t>(packed & 0xffffffffu);
             return true;
         }
+        if (!now)
+            now = static_cast<int64_t>(GetTickCount64());
         uint64_t packed = 0;
         HWND hwnd = GameWindow();
         RECT rc{};
@@ -2230,7 +2788,7 @@ namespace bmvr
                 packed = (static_cast<uint64_t>(w) << 32) | h;
         }
         g_ClientSizePacked.store(packed, std::memory_order_relaxed);
-        g_ClientSizeQpc.store(t.QuadPart ? t.QuadPart : 1, std::memory_order_release);
+        g_ClientSizeQpc.store(now ? now : 1, std::memory_order_release);
         if (packed == 0)
             return false;
         width = static_cast<uint32_t>(packed >> 32);
@@ -2356,30 +2914,55 @@ namespace bmvr
     // engine's frame buffer size. Divisors are the engine's own ratios for these
     // targets. Targets not listed and not grown elsewhere keep the engine's
     // window-based size (_rt_Hud, _rt_DofBlur).
+    namespace
+    {
+        struct EyeRtEntry { const char* name; uint32_t divisor; EyeRtClass cls; };
+        // Render targets sized from the eye by exact name (size-authority plan,
+        // docs/plans/bmvr-size-authority.md). Names compare case-insensitively:
+        // CreateNamedRT gets the engine's spelling, ITexture::GetName the
+        // lower-case one.
+        const EyeRtEntry kEyeRtTable[] = {
+            { "_rt_Small2FB0", 2, EyeRtClass::Bloom }, { "_rt_Small2FB1", 2, EyeRtClass::Bloom },
+            { "_rt_SmallFB0", 4, EyeRtClass::Bloom }, { "_rt_SmallFB1", 4, EyeRtClass::Bloom },
+            { "_rt_SmallFB2", 4, EyeRtClass::Bloom }, { "_rt_SmallFB3", 4, EyeRtClass::Bloom },
+            { "_rt_Small8FB0", 8, EyeRtClass::Bloom }, { "_rt_Small8FB1", 8, EyeRtClass::Bloom },
+            { "_rt_Small16FB0", 16, EyeRtClass::Bloom }, { "_rt_Small16FB1", 16, EyeRtClass::Bloom },
+            { "_rt_Small32FB0", 32, EyeRtClass::Bloom }, { "_rt_Small32FB1", 32, EyeRtClass::Bloom },
+            // CSM sun shadow gather, one value per screen pixel, read back by the
+            // lit passes at the eye's screen position. At the engine's window
+            // size the D3D hook took it for the backbuffer and sent the gather
+            // into the eye image: white sky, shadows read from an empty buffer.
+            { "_rt_CSMShadowBuffer", 1, EyeRtClass::Scene },
+        };
+
+        const EyeRtEntry* FindEyeRt(const char* name)
+        {
+            if (!name || !name[0])
+                return nullptr;
+            for (const EyeRtEntry& entry : kEyeRtTable)
+                if (_stricmp(name, entry.name) == 0)
+                    return &entry;
+            return nullptr;
+        }
+    }
+
+    EyeRtClass EyeScaledRtClass(const char* name)
+    {
+        const EyeRtEntry* entry = FindEyeRt(name);
+        return entry ? entry->cls : EyeRtClass::None;
+    }
+
     bool EyeScaledRtSize(const char* name, uint32_t& width, uint32_t& height)
     {
-        struct Entry { const char* name; uint32_t divisor; };
-        static const Entry kTable[] = {
-            { "_rt_Small2FB0", 2 }, { "_rt_Small2FB1", 2 },
-            { "_rt_SmallFB0", 4 }, { "_rt_SmallFB1", 4 }, { "_rt_SmallFB2", 4 }, { "_rt_SmallFB3", 4 },
-            { "_rt_Small8FB0", 8 }, { "_rt_Small8FB1", 8 },
-            { "_rt_Small16FB0", 16 }, { "_rt_Small16FB1", 16 },
-            { "_rt_Small32FB0", 32 }, { "_rt_Small32FB1", 32 },
-        };
-        if (!name)
+        const EyeRtEntry* entry = FindEyeRt(name);
+        if (!entry)
             return false;
-        for (const Entry& entry : kTable)
-        {
-            if (std::strcmp(name, entry.name) != 0)
-                continue;
-            uint32_t eyeW = 0, eyeH = 0;
-            if (!ComputeGrownWorldFramebuffer(eyeW, eyeH))
-                return false;
-            width = eyeW / entry.divisor;
-            height = eyeH / entry.divisor;
-            return true;
-        }
-        return false;
+        uint32_t eyeW = 0, eyeH = 0;
+        if (!ComputeGrownWorldFramebuffer(eyeW, eyeH))
+            return false;
+        width = eyeW / entry->divisor;
+        height = eyeH / entry->divisor;
+        return true;
     }
 
     bool ComputeGrownWorldGbuffer(uint32_t& width, uint32_t& height)

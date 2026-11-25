@@ -4,6 +4,7 @@
 #include <utility>
 
 #include "dxvk_device.h"
+#include "dxvk_bmvr_vrs.h"
 #include "dxvk_context.h"
 #include "framepacer/dxvk_framepacer.h"
 
@@ -1605,6 +1606,72 @@ namespace dxvk {
       m_common->memoryManager().lockResourceGpuAddress(image->storage());
 
     image->resetTracking();
+  }
+
+
+  void DxvkContext::bmvrSetShadingRateImage(
+    const Rc<DxvkImageView>&        view,
+          VkExtent2D                texelSize) {
+    if (!m_device->features().khrFragmentShadingRate.attachmentFragmentShadingRate)
+      return;
+
+    if (m_state.om.bmvrRateView == view
+     && m_state.om.bmvrRateTexel.width == texelSize.width
+     && m_state.om.bmvrRateTexel.height == texelSize.height)
+      return;
+
+    m_state.om.bmvrRateView = view;
+    m_state.om.bmvrRateTexel = texelSize;
+
+    // Re-begin the render pass so the attachment follows the change
+    if (m_flags.test(DxvkContextFlag::GpRenderPassBound)
+     && (m_state.om.bmvrRateBound || view != nullptr))
+      m_flags.set(DxvkContextFlag::GpRenderPassNeedsFlush);
+  }
+
+
+  void DxvkContext::bmvrSwapImageStorage(
+    const Rc<DxvkImage>&            a,
+    const Rc<DxvkImage>&            b) {
+    // Bring both images to their default layout first (as invalidateImage
+    // does for one), so each storage is in the layout the other expects.
+    for (const Rc<DxvkImage>* p : { &a, &b }) {
+      const Rc<DxvkImage>& image = *p;
+      VkImageUsageFlags usage = image->info().usage;
+
+      if (usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT))
+        m_descriptorState.dirtyViews(image->getShaderStages());
+
+      if (usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
+        bool found = false;
+
+        for (uint32_t i = 0; i < m_state.om.framebufferInfo.numAttachments() && !found; i++)
+          found = m_state.om.framebufferInfo.getAttachment(i).view->image() == image;
+
+        if (found) {
+          m_flags.set(DxvkContextFlag::GpDirtyRenderTargets);
+
+          spillRenderPass(true);
+
+          prepareImage(image, image->getAvailableSubresources());
+        }
+      }
+
+      if (resourceHasAccess(*image, image->getAvailableSubresources(), DxvkAccess::Write, DxvkAccessOp::None)) {
+        spillRenderPass(true);
+
+        flushBarriers();
+      }
+    }
+
+    Rc<DxvkResourceAllocation> storageA = a->storage();
+    Rc<DxvkResourceAllocation> storageB = b->storage();
+
+    m_cmd->track(a->assignStorage(std::move(storageB)));
+    m_cmd->track(b->assignStorage(std::move(storageA)));
+
+    a->resetTracking();
+    b->resetTracking();
   }
 
 
@@ -6077,6 +6144,35 @@ namespace dxvk {
       renderingInheritance.stencilAttachmentFormat = depthStencilFormat;
     }
 
+    // BMVR foveation: attach the rate image when it covers this render pass
+    // exactly (eye-sized targets only; shadow maps, bloom, HUD, copies stay
+    // full rate). Approach adapted from HL2VR's DXVK fork
+    // (github.com/hl2vr/dxvk, dxvk_context.cpp); the size gate is ours.
+    m_state.om.bmvrRateBound = false;
+
+    if (unlikely(m_state.om.bmvrRateView != nullptr) && fbSize.layers == 1u) {
+      const auto& rateView = m_state.om.bmvrRateView;
+      VkExtent3D rateExtent = rateView->mipLevelExtent(0u);
+      VkExtent2D texel = m_state.om.bmvrRateTexel;
+
+      if (texel.width && texel.height
+       && (fbSize.width  + texel.width  - 1u) / texel.width  == rateExtent.width
+       && (fbSize.height + texel.height - 1u) / texel.height == rateExtent.height) {
+        // Make the upload visible; the image's default layout is GENERAL
+        flushPendingAccesses(*rateView->image(), rateView->imageSubresources(), DxvkAccess::Read);
+
+        auto& rateInfo = m_state.om.renderingInfo.shadingRate;
+        rateInfo = { VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR };
+        rateInfo.imageView = rateView->handle();
+        rateInfo.imageLayout = rateView->image()->info().layout;
+        rateInfo.shadingRateAttachmentTexelSize = texel;
+        rateInfo.pNext = std::exchange(renderingInfo.pNext, &rateInfo);
+
+        m_cmd->track(rateView->image(), DxvkAccess::Read);
+        m_state.om.bmvrRateBound = true;
+      }
+    }
+
     // Reset render area tracking, will be adjusted when drawing with viewports.
     m_state.om.renderAreaLo = VkOffset2D { int32_t(fbSize.width), int32_t(fbSize.height) };
     m_state.om.renderAreaHi = VkOffset2D { 0, 0 };
@@ -6097,6 +6193,13 @@ namespace dxvk {
       if (!m_device->perfHints().preferPrimaryCmdBufs)
         useSecondaryCmdBuffer |= depthStencilAspects || colorInfoCount > 1u || !hasMipmappedRt;
     }
+
+    // BMVR foveation: draws recorded into a secondary command buffer do not
+    // see the rate attachment of the render pass they run in (the inheritance
+    // info has no shading rate image), so passes with the rate image begin
+    // rendering on the primary buffer.
+    if (m_state.om.bmvrRateBound && bmvrFoveationPrimary())
+      useSecondaryCmdBuffer = false;
 
     if (useSecondaryCmdBuffer) {
       // Begin secondary command buffer on tiling GPUs so that subsequent
@@ -6407,6 +6510,23 @@ namespace dxvk {
       m_cmd->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer,
         VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineInfo.handle);
       m_lastBoundGraphicsPipeline = pipelineInfo.handle;
+    }
+
+    // BMVR fragment shading rate. startRenderPass dirties the pipeline, so
+    // this also runs after every render target change. BMVR_VRS test aid
+    // (foveated Phase 1): fixed rate for the whole target. Foveation: 1x1
+    // pipeline rate, the rate image replaces it where attached.
+    if (unlikely(m_device->features().khrFragmentShadingRate.pipelineFragmentShadingRate)) {
+      const BmvrVrsMode& vrs = bmvrVrsMode();
+      uint32_t rate = vrs.rate ? vrs.rate : 1u;
+
+      if (vrs.eyeOnly) {
+        DxvkFramebufferSize fbSize = m_state.om.framebufferInfo.size();
+        if (fbSize.width < 2400u || fbSize.height < 2400u)
+          rate = 1u;
+      }
+
+      m_cmd->cmdSetFragmentShadingRate(rate, m_state.om.bmvrRateBound && !vrs.rate);
     }
 
     // Independent pipeline layout affects all resource updates

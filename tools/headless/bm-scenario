@@ -10,6 +10,8 @@
 #   unfake <key>                      removes that line
 #   shot <name>                       screenshot of the game window -> <outdir>/<name>.png
 #   log                               copy the mod log now
+#   waitlog <regex> [seconds]         wait until the mod log has a line matching <regex> (default 60 s; fails the run if not)
+#   capture                           what the VR panel's "Capture debug frame" button does (eyes, audit, water consts + RTs)
 #   audit [frames]                    render-target audit: per draw/copy/clear the RT written (size, viewport) and the RT
 #                                     textures sampled, with the eye/frame that last wrote each (OTHER-EYE, PREV-FRAME, UNSEEN flags)
 #   trace [frames]                    mod logs every render pass (RT push/pop, copies, viewports, screen rects) for N frames
@@ -26,7 +28,11 @@ out=$(realpath -m "$2")
 shift 2
 [[ -e $out ]] && { echo "$out exists; use a fresh dir" >&2; exit 1; }
 mkdir -p "$out/VR"
-CONSOLE=$out/overlay/upper/bms/console.log   # the game's console.log lands in the overlay; bm-run starts it empty
+gamedir=bms   # -game <mod>: its console.log is in the mod folder
+args=("$@")
+for ((i = 0; i + 1 < ${#args[@]}; i++)); do [[ ${args[i]} == -game ]] && gamedir=${args[i + 1]}; done
+CONSOLE=$out/overlay/upper/$gamedir/console.log   # the game's console.log lands in the overlay; bm-run starts it empty
+[[ -L ~/.local/share/Steam/steamapps/common/"Black Mesa"/$gamedir ]] && CONSOLE=$out/overlay/mod-upper/console.log  # mod's own overlay (bm-run)
 "$here/bm-test" "$out" -condebug "$@" >"$out/bm-test.out" 2>&1 &
 runner=$!
 trap 'kill $runner 2>/dev/null || true; wait $runner 2>/dev/null || true' EXIT
@@ -45,6 +51,8 @@ echo "ready after ${i}s"
 
 set_fake() {
 	local key=${1%% *}
+	# "raw <slot> ...": one line per slot (hmd, gripl, gripr, aiml, aimr)
+	[[ $key == raw ]] && key="raw $(awk '{print $2}' <<< "$1")"
 	grep -v "^$key " "$out/VR/fake.txt" > "$out/VR/fake.tmp" || true
 	echo "$1" >> "$out/VR/fake.tmp"
 	mv "$out/VR/fake.tmp" "$out/VR/fake.txt"
@@ -83,14 +91,14 @@ projcheck() {
 verify_settings() {
 	local exp=$out/expected-settings.cfg cv want got bad=0 reasons=
 	[[ -f $exp && -z ${BMVR_FLAT:-} ]] || return 0
-	for cv in cl_csm_enabled cl_csm_qualitymode cl_csm_memoryusage np_gr_quality mat_motion_blur_enabled mat_fxaa_enabled r_occlusion mat_hdr_level; do
+	for cv in cl_csm_enabled cl_csm_qualitymode cl_csm_memoryusage np_gr_quality mat_motion_blur_enabled mat_fxaa_enabled r_occlusion mat_hdr_level nr_lights_quality nr_shadow_quality nr_shadow_res nr_shadow_filter_quality; do
 		want=$(tr -d '\r' < "$exp" | sed -n "s/^$cv \"\(.*\)\"\$/\1/p" | head -1)
 		[[ -n $want ]] || continue
 		echo "$cv" >> "$out/VR/cmd.txt"
 		got=
 		for _ in $(seq 1 120); do   # the game may still be loading: up to 60 s
 			sleep 0.5
-			got=$(tr -d '\r' < "$CONSOLE" | grep -aoE "\"$cv\" = \"[^\"]*\"" | tail -1 | sed 's/.* = "//; s/"$//')   # other output can share the line
+			got=$(tr -d '\r' < "$CONSOLE" | grep -aoE "\"$cv\" = \"[^\"]*\"" | tail -1 | sed 's/.* = "//; s/"$//' || true)   # other output can share the line; no answer yet must not trip set -e
 			[[ -n $got ]] && break
 		done
 		echo "$cv want=$want got=${got:-no answer}" >> "$out/effective-settings.txt"
@@ -99,6 +107,19 @@ verify_settings() {
 			reasons+="  $cv: profile wants '$want', game has '${got:-no answer}'"$'\n'
 		fi
 	done
+	# What startup built: the cvars above can be right now while the G-buffer/lighting tier was built at startup from
+	# other values (2026-11-09: VR runs with the flat G-buffer). The game prints the tier it built; compare with the
+	# profile: "Light Quality Settings: <nr_lights_quality> - ...", "Shadows Quality Settings: <quality> <res> <filter>".
+	local pv lq sq sr sf light shadow
+	pv() { tr -d '\r' < "$exp" | sed -n "s/^$1 \"\(.*\)\"\$/\1/p" | head -1; }
+	lq=$(pv nr_lights_quality) sq=$(pv nr_shadow_quality) sr=$(pv nr_shadow_res) sf=$(pv nr_shadow_filter_quality)
+	light=$(tr -d '\r' < "$CONSOLE" | grep -a '^Light Quality Settings:' | tail -1 | awk '{print $4}')
+	shadow=$(tr -d '\r' < "$CONSOLE" | grep -a '^Shadows Quality Settings:' | tail -1 | awk '{print $4, $5, $6}')
+	echo "startup tier: light=${light:-none} shadow=${shadow:-none} (profile light=$lq shadow=$sq $sr $sf)" >> "$out/effective-settings.txt"
+	if [[ -n $lq && $light != "$lq" ]] || [[ -n $sq && -n $sr && -n $sf && $shadow != "$sq $sr $sf" ]]; then
+		bad=1
+		reasons+="  startup tier: game built light=${light:-none} shadow=${shadow:-none}, profile wants light=$lq shadow=$sq $sr $sf"$'\n'
+	fi
 	[[ -s $out/effective-settings.txt ]] || { bad=1; reasons+="  no cvar could be checked: $exp lists none of them"$'\n'; }
 	if (( bad )); then
 		{
@@ -125,6 +146,14 @@ while IFS= read -r line || [[ -n $line ]]; do
 			sleep 1 ;;
 		audit) echo "${arg:-2}" > "$out/VR/audit.txt"   # render-target audit (sizes, viewports, which eye wrote each sampled RT) + trace for <arg> Presents
 			sleep 1 ;;
+		waitlog) re=${arg% *}; secs=60
+			[[ $arg =~ \ ([0-9]+)$ ]] && secs=${BASH_REMATCH[1]} || re=$arg
+			ok=0
+			for _ in $(seq 1 $((secs * 2))); do grep -qE "$re" "$out/bmvr_log.txt" 2>/dev/null && { ok=1; break; }; sleep 0.5; done
+			if (( ok )); then echo "waitlog '$re'"; else echo "waitlog '$re': TIMEOUT after ${secs}s"; failed=1; fi ;;
+		capture) : > "$out/VR/capture.txt"   # = VR panel "Capture debug frame": eyes + audit + water/fog consts/RTs as VR/capture-*
+			for _ in $(seq 1 40); do [[ -e $out/VR/capture.txt ]] || break; sleep 0.25; done
+			[[ -e $out/VR/capture.txt ]] && echo "capture: not picked up" || echo "capture" ;;
 		dump) echo "$arg" > "$out/VR/dump.txt"   # mod writes VR/<arg>-left/right/hud.bmp (published eyes + overlay)
 			for _ in $(seq 1 40); do [[ -e $out/VR/dump.txt ]] || break; sleep 0.25; done
 			[[ -e $out/VR/dump.txt ]] && echo "dump $arg: not picked up" || echo "dump $arg" ;;
